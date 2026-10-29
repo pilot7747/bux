@@ -69,6 +69,13 @@ def gathered(cache: torch.Tensor, table: torch.Tensor, length: int) -> torch.Ten
     return cache[blocks, 0, at % size]
 
 
+def sampled(last: torch.Tensor, tokens: int) -> torch.Tensor:
+    """The step's rows the pointer reads for each request's last token, `last`, of a
+    step of `tokens` rows, int64: clamped into them, as vLLM's dummy and capture runs
+    give padded requests rows past the step's, whose results nothing reads."""
+    return last.long().clamp(0, max(tokens - 1, 0))
+
+
 def pointed(
     q: torch.Tensor,
     sink: torch.Tensor,
@@ -77,10 +84,12 @@ def pointed(
     position: torch.Tensor,
     vocab: int,
     fp8: torch.dtype | None,
+    length: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The pointer's distribution over the vocabulary, and its sink's share, for
     each request's query: its attention to the request's positions before the
-    query's, and to the sink, in float32.
+    query's, and to the sink, in float32. It reads the first `length` positions of
+    every request, a count fixed on the host, so that a CUDA graph captures it.
 
     Args:
         q: The queries, (R, c): RMS-normed, times the gain.
@@ -90,12 +99,13 @@ def pointed(
         position: Each query's position; its keys are those before it, (R,).
         vocab: The vocabulary's size.
         fp8: The FP8 dtype of an FP8 cache's keys; None for the model's dtype.
+        length: The positions it reads of each request, `max_model_len`: as many
+            as any query has before it.
 
     Returns:
         p_copy, (R, vocab), and a_sink, (R,).
     """
     r, dim = q.shape
-    length = max(int(position.max()), 1) if r else 1
     keys, tokens = decode(gathered(cache, table, length), dim, fp8)
     scores = torch.einsum("rc,rlc->rl", q.float(), keys) * dim**-0.5
     seen = torch.arange(length, device=q.device) < position[:, None]

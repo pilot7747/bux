@@ -2995,7 +2995,7 @@ def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture() -> None:
     assert blocks * size == 12
     for i in range(12):
         p_copy, a_sink = copying.pointed(
-            q[i : i + 1], sink[i : i + 1], cache, table, torch.tensor([i]), 64, None
+            q[i : i + 1], sink[i : i + 1], cache, table, torch.tensor([i]), 64, None, 12
         )
         got = copying.mixed(logits[i : i + 1], p_copy, a_sink, 63)[0].numpy()
         finite = np.isfinite(want[i])
@@ -3016,3 +3016,32 @@ def test_rows_past_the_pointer_s_buffers_take_the_softmax_but_copy() -> None:
     want = logits[:, :9].log_softmax(-1)
     np.testing.assert_allclose(got[4:, :9].numpy(), want[4:].numpy(), rtol=1e-5)
     assert torch.isneginf(got[:, 9]).all()
+
+
+def test_the_pointer_s_pytorch_path_reads_nothing_on_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What a CUDA graph cannot capture, a host read of a device tensor, raises
+    here: the op's PyTorch path and the logits' mixture take none, and padded
+    requests' rows past the step are clamped into it."""
+
+    def no(*args: Any) -> Any:
+        raise AssertionError("a host read of a device tensor")
+
+    cache = torch.zeros(4, 1, 4, copying.row_width(8))
+    rows = copying.encode(torch.randn(6, 8), torch.arange(6), torch.float32, None)
+    cache.view(-1, rows.shape[-1])[:6] = rows[:, 0]
+    table = torch.tensor([[0, 1], [2, 3], [0, 0]])  # a padded request last
+    last = copying.sampled(torch.tensor([3, 5, -1]), 6)
+    assert last.tolist() == [3, 5, 0]
+    for name in ("item", "tolist", "cpu", "nonzero", "__int__", "__bool__"):
+        monkeypatch.setattr(torch.Tensor, name, no)
+    q, sink = torch.randn(3, 8), torch.randn(3)
+    p_copy, a_sink = copying.pointed(
+        q, sink, cache, table, torch.tensor([3, 2, 0]), 10, None, 8
+    )
+    rows_, sinks = copying.rows_of(p_copy, a_sink, 5)
+    copying.mixed(torch.randn(5, 10), rows_, sinks, 9)
+    monkeypatch.undo()
+    assert torch.allclose(p_copy.sum(-1) + a_sink, torch.ones(3))
+    assert a_sink[2] == 1  # nothing before position 0

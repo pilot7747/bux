@@ -124,6 +124,7 @@ class PointerCache(nn.Module, AttentionLayerBase):
     def __init__(self, dim: int, vllm_config: Any, prefix: str):
         super().__init__()
         self.dim, self.prefix = dim, prefix
+        self.longest = vllm_config.model_config.max_model_len  # positions a query sees
         self.dtype, self.fp8 = sparse.cache_dtype(vllm_config, "a copy pointer", True)
         self.kv_cache = torch.tensor([])
         ops = vllm_config.compilation_config.splitting_ops
@@ -178,7 +179,7 @@ def copy_pointer(
     # Every request's, but past the buffers' rows, which vLLM's runs within
     # max_num_seqs never reach.
     requests = min(steps.last.shape[0], p_copy.shape[0])
-    last = steps.last[:requests].long()
+    last = copying.sampled(steps.last[:requests], q.shape[0])
     table = steps.block_table_tensor[:requests]
     if q.dtype == torch.float32:
         copy, share = copying.pointed(
@@ -189,6 +190,7 @@ def copy_pointer(
             steps.position[:requests],
             p_copy.shape[1],
             cache.fp8,
+            cache.longest,
         )
         p_copy[:requests].copy_(copy)
         a_sink[:requests].copy_(share)

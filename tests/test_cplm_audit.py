@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from flax import nnx
+from jaxtyping import Float, Int
 
 from bux.architecture import Model
 from bux.architecture.copy import log_probs
@@ -70,19 +71,19 @@ def rows(ids, positions=None, mask=None) -> Batch:
     return Batch(ids, np.asarray(positions, np.int32), np.asarray(mask, bool))
 
 
-def tokens(seed: int, alphabet: int = 8) -> np.ndarray:
+def tokens(seed: int, alphabet: int = 8) -> Int[np.ndarray, "b t"]:
     """Rows of a small alphabet, so that targets repeat earlier tokens."""
     return np.random.default_rng(seed).integers(0, alphabet, (2, T))
 
 
-def gate(model: Model, batch: Batch) -> np.ndarray:
+def gate(model: Model, batch: Batch) -> Float[np.ndarray, "*s"]:
     """The softmax's mass on <copy> at each position."""
     logits = np.asarray(forward(model, batch)[0].logits(), np.float64)
     e = np.exp(logits - logits.max(-1, keepdims=True))
     return e[..., COPY] / e.sum(-1)
 
 
-def per_position_nll(model: Model, batch: Batch) -> np.ndarray:
+def per_position_nll(model: Model, batch: Batch) -> Float[np.ndarray, "*s"]:
     """Each position's term of the training loss, by the loss's own path
     (HeadOutput.sums, the pointer's chunked mixture), one position at a time."""
     out = forward(model, batch)[0]
@@ -115,7 +116,7 @@ def test_1_the_mixture_at_t_reads_nothing_after_t(t0):
     assert not np.array_equal(nll[0][:, t0 + 1 :], nll[1][:, t0 + 1 :])  # it moves
 
 
-def every_token_nll(out, each) -> np.ndarray:
+def every_token_nll(out, each) -> Float[np.ndarray, "*s"]:
     """The loss path's negative log-likelihood of every real token y, as the
     target of each position that `each` weighs alone."""
 
@@ -231,7 +232,7 @@ def test_1_p_copy_is_over_the_tokens_before_the_query_alone():
 # --- 2. documents -----------------------------------------------------------------------
 
 
-def packed() -> tuple[np.ndarray, np.ndarray]:
+def packed() -> tuple[Int[np.ndarray, "b t"], Int[np.ndarray, "b t"]]:
     """A row of three documents, as best_fit packs them: positions start again at 0."""
     lengths = (7, 10, 7)
     positions = np.concatenate([np.arange(n) for n in lengths])[None].repeat(2, 0)
@@ -285,7 +286,9 @@ def test_2_the_pointer_never_crosses_a_document():
 # --- 4. accounting ----------------------------------------------------------------------
 
 
-def reference_nll(out, ids: np.ndarray, positions: np.ndarray) -> np.ndarray:
+def reference_nll(
+    out, ids: Int[np.ndarray, "b t"], positions: Int[np.ndarray, "b t"]
+) -> Float[np.ndarray, "*s"]:
     """-log(p_lm (1 - a (1 - a_sink)) + a p_copy) of each true next token, from the
     head's raw outputs, in numpy float64: its logits, the pointer's queries, keys and
     sink logits, and the row's tokens and documents."""
@@ -376,7 +379,7 @@ def test_4_copy_carries_no_mass_and_the_mixture_sums_to_one():
     assert tok.vocab_size <= 50304 - 1  # the timeline's vocab_size; <copy> is 50303
 
 
-def dense_nll(out, ids, positions) -> jax.Array:
+def dense_nll(out, ids, positions) -> Float[jax.Array, "*s"]:
     """The mixture's negative log-likelihood of each true next token, in plain jax
     from the head's raw outputs (logits, the pointer's queries, keys and sink), all
     t by t at once, for autodiff: the reference the custom gradient must match."""
@@ -452,12 +455,12 @@ model = embed block^2 norm {head}
 """
 
 
-def unique_rows(rng, b: int, t: int) -> np.ndarray:
+def unique_rows(rng, b: int, t: int) -> Int[np.ndarray, "b t"]:
     """Each row a document of distinct tokens: nothing to copy."""
     return np.stack([rng.permutation(NEG_V - 1)[:t] for _ in range(b)])
 
 
-def repeated_rows(rng, b: int, t: int) -> np.ndarray:
+def repeated_rows(rng, b: int, t: int) -> Int[np.ndarray, "b t"]:
     """Each row a random sequence of 16 tokens, four times over."""
     return np.stack(
         [np.tile(rng.integers(0, NEG_V - 1, 16), t // 16) for _ in range(b)]
