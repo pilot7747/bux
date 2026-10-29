@@ -247,6 +247,7 @@ one, `y = o exp(lse - L)` with `L = logaddexp(lse, sink)`, the backward run with
 |---|---|
 | `flash.TOKAMAX` | tokamax's kernels (its VJP, given the residuals `(lse, 1)`) |
 | `flash.JNP` | the same in jnp, all t by s logits at once, which a CPU runs: with `flash.TOKAMAX = flash.JNP` the tests check `tokamax`'s and `auto`'s paths too |
+| `flash.CHUNKS` | XLA's, a chunk of queries at a time (`flash.query_chunks`), FlashAttention-2's backward from the logsumexp: for heads no flash kernel takes |
 | `flash.CUDNN` | cuDNN's causal kernels, for whole rows with no first keys |
 | `fa4.kernel(window)` | FlashAttention-4's kernels, for whole rows or the documents of each query's first key, within a window ([below](#attention-fa4)) |
 
@@ -277,7 +278,14 @@ For rows of documents, cuDNN runs whole rows only, in its packed layout:
   channels of each document's room.
 - `context.documents_bound` makes room for up to t / 256 documents, and up to 2^30
   such numbers: 16 for 8 rows of 4096, or for one of 32k.
-- A `lax.cond` gives a batch with a row of more documents to tokamax.
+- A `lax.cond` gives a batch with a row of more documents to tokamax, or, in heads
+  wider than tokamax's 192 channels (Qwen3-Next's 256), to `flash.CHUNKS`: XLA, a
+  chunk of queries at a time, at most 2^27 logits each. Both branches of the
+  `lax.cond` hold their memory, so `xla`'s t by t logits there would take hundreds of
+  GiB in rows of 16k (325 GiB for 12 rows of 16k of 6 heads) whether or not a batch
+  ever needs them. On a B300, `flash.CHUNKS` takes 47.5 ms forward and backward for 2
+  rows of 16k of 8 heads (2 kv heads) of 256, in 2.0 GiB, and 75.3 ms for 3 rows
+  (2026-10-29).
 
 In rows of 4096 that `lax.cond` costs as much as cuDNN gains: the 1.3B trains at 145k
 tok/s on a B300 either way. So where FlashAttention-4's kernels do not run, `auto` takes cuDNN

@@ -366,10 +366,12 @@ def _fallback(
     q: Float[Array, "b t h dk"], args: AttentionArgs
 ) -> Callable[..., Float[Array, "b t h dv"]]:
     """Return what attends a batch of more documents than a kernel has room for:
-    tokamax's kernel, else `xla`."""
+    tokamax's kernel, else XLA's a chunk of queries at a time (`flash.CHUNKS`), whose
+    logits take as much memory at any length: not `xla`'s t by t, which in rows of
+    16k is hundreds of GiB, and which a lax.cond holds even where the batch fits."""
     if flash.tokamax_takes(q):
         return partial(_flash, flash.TOKAMAX, args=args)
-    return partial(xla, args=args)
+    return partial(_flash, flash.CHUNKS, args=args)
 
 
 def _fa4(

@@ -5,7 +5,10 @@ of ``chunkwise``'s time on a B300, keeping only their inputs for the backward pa
 One decay a head (Gated DeltaNet, DeltaNet) runs by Frost's GDN kernel, which takes
 each pair's decay as the exp of a difference of summed log decays, never positive: it
 runs any gate. cudnn-frontend gives it no JAX call, so a `buffer_callback` runs
-cuDNN's graph of it on XLA's stream (`_graph_call`).
+cuDNN's graph of it on XLA's stream (`_graph_call`). A graph compiles and loads its
+kernels the first time it runs on a device, which on a GPU of several waits for its
+peers: so each graph runs once on every device of the run before any step does
+(`warm`), while nothing else runs.
 
 A decay per key channel (KDA) runs by Frost's KDA kernel, through cudnn-frontend's
 own JAX call. It factors each decay through the start of a tile of 16 positions, so it
@@ -30,10 +33,12 @@ and heads. They take heads of 64 or 128, and every position of a row: not
 import functools
 import threading
 from collections.abc import Callable
+from concurrent import futures
 from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, Shaped
 
@@ -218,6 +223,9 @@ def _like(x: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
 # --- Gated DeltaNet: Frost's GDN kernel by cuDNN's graph, on XLA's stream -------------
 
 
+Shapes = tuple[tuple[tuple[int, ...], str], ...]  # a graph's inputs' shapes and dtypes
+
+
 def _graph_call(
     op: str, results: list[jax.ShapeDtypeStruct], *xs: Shaped[Array, "..."]
 ) -> tuple[Shaped[Array, "..."], ...]:
@@ -234,11 +242,84 @@ def _graph_call(
         with _ONE_AT_A_TIME:
             graph = _graph(op, shapes, device)
             pack = dict(zip(graph.ports, (*ins, *outputs), strict=True))
-            handle = _handle(device, ctx.stream)
+            handle = _handle(device, ctx)
             graph.execute(pack, workspace=workspace, handle=handle)
 
     call = jax_internals.buffer_callback(run, (*results, scratch))
+    warm(op, shapes, call)
     return tuple(call(*xs)[:-1])
+
+
+def warm(op: str, shapes: Shapes, call: Callable[..., Any]) -> None:
+    """Run `call`, the callback of the graph of `op`, once on each device of the run,
+    on inputs of `shapes`, while nothing else runs: once a process for each graph, as
+    a step that runs it traces.
+
+    A graph's first execute on a device compiles its kernels and loads them, which
+    waits for the device's peers. Inside a step on several GPUs, a peer may then be
+    waiting in a collective that this device joins only after the callback returns:
+    the step hangs, the device's thread holding `_ONE_AT_A_TIME`, one GPU busy and
+    its peer idle. Where the peers wait at a collective's first call instead, XLA
+    gives up after 40 seconds of the devices compiling one after another."""
+    devices = _run_devices()
+    key = (op, shapes)
+    if len(devices) < 2 or key in _WARM:
+        return
+    with _WARMING:
+        if key not in _WARM:
+            _in_a_thread(functools.partial(_warm_on, devices, op, shapes, call))
+            _WARM.add(key)
+
+
+_WARM: set[tuple[str, Shapes]] = set()  # the graphs every device of the run has run
+_WARMING = threading.Lock()
+
+
+def _warm_on(
+    devices: list[Any], op: str, shapes: Shapes, call: Callable[..., Any]
+) -> None:
+    """Run `call` on each of `devices`, one at a time, once what runs has finished:
+    a step whose callbacks are taking turns, which then needs no warm-up's."""
+    jax.block_until_ready(jax.live_arrays())
+    for device in devices:
+        for inputs in _warm_inputs(op, shapes):
+            placed = [jax.device_put(x, device) for x in inputs]
+            jax.block_until_ready(jax.jit(call)(*placed))
+
+
+def _in_a_thread(f: Callable[[], None]) -> None:
+    """Run `f` in a thread of its own, outside whatever the caller traces, and return
+    when it has; raise what it raised."""
+    with futures.ThreadPoolExecutor(1, thread_name_prefix="bux-warm") as pool:
+        pool.submit(f).result()
+
+
+def _run_devices() -> list[Any]:
+    """Return the devices of the run's mesh, this process's: none outside one."""
+    on = parallel.active()
+    devices = getattr(on.mesh, "devices", None) if on is not None else None
+    if devices is None:
+        return []
+    return [
+        d for d in np.asarray(devices).flat if d.process_index == jax.process_index()
+    ]
+
+
+def _warm_inputs(op: str, shapes: Shapes) -> list[list[Shaped[np.ndarray, "..."]]]:
+    """Return the inputs of each warm-up run of `op`'s graph: zeros, as one sequence
+    of every token; and for GDN-2, also decays steep enough to take its exact path."""
+    names = NODES[op][0]
+    zeros = [np.zeros(shape, jnp.dtype(dtype)) for shape, dtype in shapes]
+    cu = names.index("cu_seqlens")
+    tokens = shapes[0][0][0]
+    zeros[cu] = np.full(shapes[cu][0], tokens, np.int32)
+    zeros[cu][0] = 0
+    if not op.startswith("gdn2"):
+        return [zeros]
+    steep = list(zeros)
+    g = names.index("g")
+    steep[g] = np.full(shapes[g][0], -100.0, jnp.dtype(shapes[g][1]))
+    return [zeros, steep]
 
 
 # XLA calls each device's callback from that device's thread. Two threads must not
@@ -296,10 +377,10 @@ def _handles(device: int) -> Any:
         return cudnn.create_handle()
 
 
-def _handle(device: int, stream: int) -> Any:
-    """Return `device`'s cuDNN handle, set to run on `stream`."""
+def _handle(device: int, ctx: Any) -> Any:
+    """Return `device`'s cuDNN handle, set to run on the stream of XLA's call `ctx`."""
     handle = _handles(device)
-    cudnn.set_stream(handle=handle, stream=stream)
+    cudnn.set_stream(handle=handle, stream=ctx.stream)
     return handle
 
 

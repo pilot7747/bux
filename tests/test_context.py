@@ -4,6 +4,7 @@
 tokamax's, so tokamax's is jnp's here (bux.parallel.flash.JNP), which has its
 interface; scripts/gpu_smoke/attention.py runs the GPU kernels."""
 
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -21,7 +22,7 @@ from jaxtyping import Array, Float, Int
 from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile
-from bux.parallel import flash, methods
+from bux.parallel import context, flash, methods
 from bux.parallel.context import SCAN_ROWS, AttentionArgs, document_starts
 from bux.train import config as tcfg
 from bux.train.data import Batch
@@ -347,6 +348,51 @@ def test_cudnn_s_causal_kernels_take_whole_causal_rows_alone():
     q, k, v, _, _ = attention(Case(2, 2))
     with pytest.raises(ValueError, match="whole causal rows"):
         flash.CUDNN.forward(q, k, v[..., :D], flash.Keys(True, IDS), 1.0, None)
+
+
+@pytest.mark.parametrize("case", CASES.values(), ids=CASES.keys())
+def test_chunks_of_queries_attend_and_differentiate_as_jnp_does(monkeypatch, case):
+    """flash.CHUNKS, several chunks of queries a row here, against all the logits at
+    once: documents, windows as first keys, soft caps and sinks."""
+    monkeypatch.setattr(flash, "CHUNK_LOGITS", B * case.heads * 4 * T)  # 4 queries
+    assert flash.query_chunks(B, T, case.heads, T) == T // 4
+    q, k, v, sinks, cotangent = attention(case)
+    args = case.visibility(sinks)
+
+    def grads(kernel):
+        def loss(q, k, v, sinks):
+            out = context._flash(kernel, q, k, v, args._replace(sinks=sinks))
+            return (out * cotangent).sum()
+
+        return jax.grad(loss, argnums=(0, 1, 2, 3))(q, k, v, args.sinks)
+
+    for chunked, whole in zip(grads(flash.CHUNKS), grads(flash.JNP), strict=True):
+        if whole is not None:
+            np.testing.assert_allclose(chunked, whole, atol=1e-5, rtol=1e-5)
+
+
+def test_past_cudnns_room_heads_tokamax_lacks_go_by_chunks_of_queries(monkeypatch):
+    """Qwen3-Next's heads of 256 in rows of more documents than cuDNN's packed layout
+    has room for: by XLA a chunk of queries at a time, whose logits take as much at
+    any length, not by `xla`'s t by t, which a lax.cond holds even where cuDNN runs."""
+    monkeypatch.setattr(flash, "tokamax_takes", lambda x: False)
+    monkeypatch.setattr(flash, "CHUNK_LOGITS", 1 << 18)
+    b, t, h, d = 1, 4096, 2, 256
+    q, k, v = (jnp.ones((b, t, h, d), jnp.bfloat16) for _ in range(3))
+    args = AttentionArgs(jnp.zeros((b, t), jnp.int32), None, d**-0.5, None, None)
+    fallback = context._fallback(q, args)
+    assert isinstance(fallback, partial)
+    assert fallback.func is context._flash and fallback.args == (flash.CHUNKS,)
+
+    def temp(attend):
+        loss = lambda q, k, v: attend(q, k, v).astype(jnp.float32).sum()
+        step = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(q, k, v).compile()
+        memory = step.memory_analysis()
+        assert memory is not None
+        return memory.temp_size_in_bytes
+
+    logits = b * h * t * t * 4
+    assert temp(fallback) < logits // 2 < logits < temp(partial(context.xla, args=args))
 
 
 # --- In a model --------------------------------------------------------------------
