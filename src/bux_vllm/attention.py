@@ -23,7 +23,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from . import kv, picks, sparse
+from . import keyed, kv, picks, sparse
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -60,7 +60,10 @@ class Attention(Layer):
     With ``k_eq_v`` (Gemma 4's global layers) its values are its keys as
     projected, after the conv, RMS-normalized without a gain: as vLLM's Gemma 4
     does, bux's key projection loads into both the k and the v shard of the
-    projection, whose v output goes unused, and the KV cache holds both.
+    projection, whose v output goes unused. Where each key is its value times the
+    key norm's gain (`bux_vllm.kv.keys_from_values`), the KV cache holds the values
+    alone, read as both by vLLM's Triton attention (`bux_vllm.keyed`), and the
+    gain goes on the queries; else it holds both.
 
     Each call of the layer keeps a KV cache of its own, a conv state beside it with
     ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
@@ -89,6 +92,7 @@ class Attention(Layer):
         self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
         self.c, self.scale = c, (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
         self.k_eq_v = c["k_eq_v"] and not self.reads_kv  # values from the keys
+        self.keyed = kv.keys_from_values(c, site.ports)  # one vector a token cached
         self._projections(c, width, site)
         self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
@@ -165,9 +169,14 @@ class Attention(Layer):
         self, c: dict, site: Site, names: list[str], shares: list[str | None]
     ) -> None:
         """Make each call's vLLM attention layer, with its KV cache, or attending
-        to the KV cache it `shares`, a writer's through the ``kv`` port."""
+        to the KV cache it `shares`, a writer's through the ``kv`` port: one of a
+        vector a token (`bux_vllm.keyed`) where the keys are the values times the
+        key norm's gain."""
+        layer, backend = PagedAttention, None
+        if self.keyed:
+            layer, backend = keyed.KeyedAttention, keyed.KeyedTritonBackend
         self.caches = nn.ModuleList(
-            PagedAttention(
+            layer(
                 self.h,
                 self.dk,
                 self.scale,
@@ -179,6 +188,7 @@ class Attention(Layer):
                 sinks=self.sinks,
                 head_size_v=self.dv,
                 kv_sharing_target_layer_name=share,
+                attn_backend=backend,
             )
             for name, share in zip(names, shares, strict=True)
         )
@@ -355,6 +365,8 @@ class Attention(Layer):
             return self.o(self._gated(x, out).reshape(t, -1))
         q, k, v = self._project(x, call)
         v = self._v_port(v, ctx)
+        if self.keyed:
+            return self.o(self._gated(x, self._keyed(q, v, call, ctx)).reshape(t, -1))
         q, k = self._queries(q, ctx), self._normed(k, self.k_norm, self.g)
         if self.rope is not None:
             k = self.rope(k, ctx.positions)
@@ -366,6 +378,22 @@ class Attention(Layer):
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
             out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
         return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _keyed(
+        self, q: torch.Tensor, v: torch.Tensor, call: int, ctx: Ctx
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending over a cache of the values
+        alone (`bux_vllm.keyed`): each key is its value times the key norm's gain,
+        which goes on the queries instead."""
+        assert self.k_norm is not None
+        gain = self.k_norm.weight
+        if gain is not None and self.k_norm.zero_centered:
+            gain = 1 + gain
+        q = self._queries(q, ctx)
+        q = q if gain is None else q * gain.to(q.dtype)
+        t, v = q.shape[0], v.contiguous()
+        out = self.caches[call](q.reshape(t, -1).contiguous(), v, v)
+        return out.view(t, self.h, self.dv)
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The projected queries, (T, h dk), as heads, (T, h, dk): QK-norm then RoPE

@@ -13,6 +13,8 @@ runs (`sources`), as vLLM's cross-layer KV sharing needs it.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 #: The ports a ``gqa`` layer runs in vLLM.
@@ -113,6 +115,24 @@ def mix_values(
         return 0.5 * v + 0.5 * v1
     a, b = (w[0], w[1]) if kind == "learned" else (w, 1 - w)
     return (a * v.float() + b * v1.float()).to(v.dtype)
+
+
+def keys_from_values(c: dict, ports: list) -> bool:
+    """Whether every key of the ``gqa`` layer `c` is its value times its key norm's
+    gain, so that one cached vector a token serves as both, the gain on the queries
+    (`bux_vllm.keyed`): values from the keys (``k_eq_v``), the keys' norm an RMSNorm
+    of each head, without a bias, at the values' eps, no RoPE, and no port that
+    mixes other values in (``v`` and ``ve`` read) or shares the cache (``kv``).
+    ``BUX_VLLM_K_EQ_V_CACHE=both`` keeps keys and values apart all the same."""
+    qk = c["qk_norm"]
+    norm = qk is not None and qk["type"] == "rmsnorm" and not qk["bias"]
+    plain = norm and not qk["scale_input"] and not c["qk_norm_all_heads"]
+    others = any(reads(ports, n) for n in ("v", "ve", "kv", "index")) or writes(
+        ports, "kv"
+    )
+    own = not (c["indexer"] or c["relative_bias"] or c["rope"] or others)
+    keyed = os.environ.get("BUX_VLLM_K_EQ_V_CACHE", "keys") == "keys"
+    return bool(c["k_eq_v"] and plain and own and keyed)
 
 
 def value_norm(qk: dict | None) -> dict:

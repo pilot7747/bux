@@ -1033,6 +1033,42 @@ def test_values_from_the_keys_are_normalized_as_bux_and_convolved_alone() -> Non
     assert kv.conv_channels(conv | {"k_eq_v": False}, 64, 2) == 16 + 16
 
 
+KEYED = {
+    "nope": ({}, (), True),
+    "zero-centered gain": ({"qk_norm": {"zero_centered": True}}, (), True),
+    "writes v": ({}, (["v", "v1", "write"],), True),
+    "rope": ({"rope": cfg.RoPEConfig()}, (), False),
+    "reads v": ({}, (["v", "v1", "read"],), False),
+    "writes kv": ({}, (["kv", "kv", "write"],), False),
+    "layernorm": ({"qk_norm": {"type": "layernorm"}}, (), False),
+}
+
+
+@pytest.mark.parametrize(("change", "ports", "keyed"), KEYED.values(), ids=KEYED)
+def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
+    change: dict, ports: tuple, keyed: bool
+) -> None:
+    """bux's keys are its values times the key norm's gain wherever the plugin
+    caches the values alone, and puts the gain on the queries instead."""
+    qk = {"type": "rmsnorm", "eps": 1e-5} | change.pop("qk_norm", {})
+    c = cfg.GQAConfig.model_validate(
+        {"num_heads": 4, "num_kv_heads": 2, "k_eq_v": True, "qk_norm": qk} | change
+    )
+    assert kv.keys_from_values(c.model_dump(mode="json"), list(ports)) == keyed
+    if not keyed:
+        return
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.k_norm is not None and attn.k_norm.scale is not None
+    attn.k_norm.scale[...] = jax.random.normal(jax.random.key(2), (16,))
+    k, v = attn._keys_as_values(
+        jax.random.normal(jax.random.key(1), (1, 8, 32)), None, Taps()
+    )
+    gain = attn.k_norm.scale[...] + (1 if attn.k_norm.zero_centered else 0)
+    np.testing.assert_allclose(
+        np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
+    )
+
+
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
     ports = [["v", "v1", "pop"], ["v", "v2", "write"], ["v", "v3", "write"]]
     assert kv.reads(ports, "v") == ("v1", True)

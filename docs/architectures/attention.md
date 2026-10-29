@@ -99,7 +99,9 @@ Each head's projected key $k$, after the conv with `kv_conv_size`, is the value
 $v = k / \mathrm{rms}(k)$: an RMSNorm without a gain, at the eps of `qk_norm` (1e-6
 without one), and not rotated. The keys go on through `qk_norm` and RoPE. The
 values' head is the keys', so `v_head_dim` stays unset. A `v` port mixes and pushes
-these values as any others.
+these values as any others. Without RoPE, and with a QK RMSNorm, every key is its
+value times the norm's gain, so vLLM can cache one vector a token for the layer
+([Values from the keys](../export/vllm.md#values-from-the-keys)).
 
 ## `mla`: multi-head latent attention
 
