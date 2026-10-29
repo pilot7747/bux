@@ -1076,6 +1076,8 @@ SPLIT = {
         "gqa(num_heads=4, num_kv_heads=2, differential=true, sinks=true, gated=true,"
         " exclusive=true)"
     ),
+    # Paired heads: head j with j + 2, a sequence of twice the length
+    "paired": "gqa(num_heads=4, num_kv_heads=2, paired=true, rope=rope(), gated=true)",
     # HyGA: per-head matrices of the gate, and a gate of each head from all of them
     "hyga": (
         "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_input_rank=4,"
@@ -1130,7 +1132,18 @@ def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
 
 
 @pytest.mark.parametrize(
-    "layer", ["gqa", "power_scale", "xsa", "hyga", "differential", "mla", "msa", "csa"]
+    "layer",
+    [
+        "gqa",
+        "power_scale",
+        "xsa",
+        "hyga",
+        "differential",
+        "paired",
+        "mla",
+        "msa",
+        "csa",
+    ],
 )
 def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
     trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)

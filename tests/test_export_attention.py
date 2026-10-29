@@ -96,6 +96,12 @@ GQA_SETTINGS = {
     "hyga, xsa, output norm": GQA + ", gated=true, gate_input_rank=4,"
     " gate_cross_head=true, exclusive=learned, output_norm=rmsnorm)",
     "differential": GQA + ", differential=true)",
+    "paired": GQA + ", paired=true)",
+    "paired, window, gated, qk norm, conv": GQA
+    + ", paired=true, sliding_window_size=5,"
+    " gated=true, qk_norm=rmsnorm, kv_conv_size=2)",
+    "paired, mha, no rope, hyga, softcap": "gqa(num_heads=4, num_kv_heads=4, paired=true,"
+    " gated=true, gate_cross_head=true, softcap=3.0)",
     "differential, sinks, window, fused, all heads": GQA + ", differential=true,"
     " sinks=true, sliding_window_size=3, fused_qkv=true, qk_norm=rmsnorm,"
     " qk_norm_all_heads=true)",
@@ -154,6 +160,15 @@ PORTS = {
         " differential=true, exclusive=true)",
         "attn(v=@v1)",
         "attn(v=$v1)",
+    ),
+    "value residual, paired": wired(
+        "gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
+        " paired=true)",
+        "attn(v=@v1)",
+        "attn(v=$v1)",
+    ),
+    "kv sharing, paired": wired(
+        GQA + ", paired=true)", "attn(kv=@kv)", "attn(kv=$kv!)"
     ),
     "kv sharing, differential": wired(
         GQA + ", differential=true)", "attn(kv=@kv)", "attn(kv=$kv!)"

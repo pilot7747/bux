@@ -252,6 +252,63 @@ def test_hyga_s_gates_take_the_gate_and_are_new_parameters_alone():
         gqa(gated=True, gate_per_head=True, gate_output_rank=4)
 
 
+def paired_reference(
+    attn: Attention, x: Float[Array, "b t d"], window: int | None
+) -> Float[np.ndarray, "b t d"]:
+    """Paired-head attention as record 58 describes it, one query at a time: head
+    j's and head j + h/2's queries, of token n at rows 2n and 2n + 1, see kv head m's
+    and m + g/2's keys at rows 2s and 2s + 1, m their group's, causally and within
+    the window of rows; RoPE turns head i at 2n + (i mod 2)."""
+    assert attn.q is not None and attn.k is not None and attn.v is not None
+    b, t, _ = x.shape
+    h, g, dk = H, 2, D // H
+    pos = jnp.broadcast_to(jnp.arange(t), (b, t))
+
+    def turned(y, n):
+        assert attn.rope is not None
+        parts = [
+            rotate(y[:, :, i : i + 1], attn.rope, 2 * pos + i % 2) for i in range(n)
+        ]
+        return np.asarray(jnp.concatenate(parts, 2))
+
+    q = turned(attn.q(x).reshape(b, t, h, dk), h)
+    k = turned(attn.k(x).reshape(b, t, g, dk), g)
+    v = np.asarray(attn.v(x).reshape(b, t, g, dk))
+    out = np.zeros((b, t, h, dk))
+    for i in range(h):
+        a, j = divmod(i, h // 2)  # its half, and its pair
+        m = j // (h // g)  # the pair's kv heads: m and m + g/2
+        for n in range(t):
+            keys, values = [], []
+            for s_ in range(t):
+                for c in (0, 1):
+                    row = (2 * n + a) - (2 * s_ + c)
+                    if row >= 0 and (window is None or row < window):
+                        keys.append(k[:, s_, m + c * g // 2])
+                        values.append(v[:, s_, m + c * g // 2])
+            logits = np.einsum("bd,kbd->bk", q[:, n, i], np.stack(keys)) * dk**-0.5
+            probs = np.exp(logits - logits.max(-1, keepdims=True))
+            probs /= probs.sum(-1, keepdims=True)
+            out[:, n, i] = np.einsum("bk,kbd->bd", probs, np.stack(values))
+    return np.asarray(attn.o(jnp.asarray(out, jnp.float32).reshape(b, t, -1)))
+
+
+@pytest.mark.parametrize("window", [None, 5])
+def test_paired_heads_attend_as_record_58(window):
+    rope = cfg.RoPEConfig()
+    attn = gqa(paired=True, rope=rope, sliding_window_size=window)
+    x = jax.random.normal(jax.random.key(1), (2, 6, D))
+    want = paired_reference(attn, x, window)
+    assert np.allclose(attn(x, Taps()), want, atol=1e-5)
+    positions = jnp.concatenate([jnp.arange(2), jnp.arange(4)])[None].repeat(2, 0)
+    packed = attn(x, Taps(segments=Segments.of(positions)))
+    assert jnp.allclose(packed[:, 2:], attn(x[:, 2:], Taps()), atol=1e-5)
+    with pytest.raises(ValueError, match="paired takes an even number"):
+        cfg.GQAConfig(num_heads=4, num_kv_heads=1, paired=True)
+    with pytest.raises(ValueError, match="paired with exclusive"):
+        gqa(paired=True, exclusive=True)
+
+
 def test_differential_attention_subtracts_each_pairs_second_map():
     """DIFF V2: 2h query heads, heads 2i and 2i + 1 a pair in one kv head's group,
     and output head i a1 - sigmoid(x W)_i a2: as a 2h-head layer of the same
