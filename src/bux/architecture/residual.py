@@ -370,7 +370,12 @@ class GatedResidual(nnx.Module):
         assert self.body is not None and self.write is not None
         b, t, n, d = x.shape
         r = self.norm(x)
-        y = self.body(self._read(r), taps)
+        # Without barriers around f, XLA's algebraic simplifier rewrites across it,
+        # from the mean over the streams to the broadcast back over them, and on GPUs
+        # computes the branch wrong (jax 0.12: half its value, and gradients unlike
+        # the true ones in every layer before it).
+        h = jax.lax.optimization_barrier(self._read(r))
+        y = jax.lax.optimization_barrier(self.body(h, taps))
         weight = 2 * jax.nn.sigmoid(self.write(r.reshape(b, t, n * d)) / n)
         return shard_stream(x + weight[..., None] * y[:, :, None])
 
