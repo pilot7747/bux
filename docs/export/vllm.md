@@ -713,6 +713,11 @@ latent, which doubles the layer's cache.
   the op's output: in a bfloat16 model, at heads of a power of two of dims, in
   groups of 4 query heads or more, without sinks or a softcap. Other layers attend
   by the plugin's Triton kernel, and MLA's latents by PyTorch.
+- **Shared picks.** A layer that reads its `index` port (GLM-5.2's IndexShare)
+  attends over the picks it reads by the same kernel, where the kernel takes the
+  layer and it has no window of its own: its cache takes blocks of 64 tokens too,
+  and keeps no indexer keys. The picks are read whole, as the writer may not have
+  its valid ones first.
 - **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
   values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
   layer that reads its `index` port. The attention kernel reads them as they are,
@@ -942,6 +947,7 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 2.0 |
 | `dsa-native` | DSA on vLLM's DSA kernels: an indexer of 4 heads of 64, its top 16, one layer that reads its picks | - | 3.8 (4.9) | 3.8 |
 | `dsa-hybrid` | the same on the hybrid's global layer (QK-norm, a gate, the conv on keys and values), beside KDA | - | 0.66 (0.53) | 0.41 |
+| `dsa-share-native` | GLM-5.2's IndexShare on the hybrid's global layer: one indexer's picks read by two later layers, all on vLLM's sparse GQA attention (groups of 4), the `v` port, beside KDA | TBD | TBD | TBD |
 | `qsa-native` | QSA on vLLM's DSA kernels: blocks of 4, 4 heads of 64, partial RoPE | - | 3.1 (5.1) | 3.1 |
 | `msa-native` | MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head | - | 0.088 (0.094) | 0.067 |
 | `mla-dsa-native` | sparse MLA with its indexer on vLLM's DSA kernels (`BUX_VLLM_SPARSE_KERNELS=native`) | - | 3.1 (3.5) | - |

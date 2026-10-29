@@ -230,7 +230,9 @@ def test_patterns_expand_one_letter_definitions():
 
 
 def test_a_block_repeated_zero_times_is_left_out():
-    a = build("A = [attn]\nF = [ffn]\nn = 1\nmodel = embed A^(n - 1) (F A^0)^2 F^n head")
+    a = build(
+        "A = [attn]\nF = [ffn]\nn = 1\nmodel = embed A^(n - 1) (F A^0)^2 F^n head"
+    )
     assert unlabeled(a.graph) == "(embed F^2 F head)"
     assert unlabeled(build("model = embed [attn^0] head").graph) == "(embed [_] head)"
     assert "0 or more" in error("model = embed [attn]^(0 - 1) head").message

@@ -345,6 +345,42 @@ def test_vllm_s_sparse_gqa_attention_takes_plain_bfloat16_groups() -> None:
     assert not dsa.attends(sunk, q, kv)
 
 
+def test_a_layer_reading_its_picks_attends_as_the_one_that_picked() -> None:
+    """A layer that reads its picks from its ``index`` port (GLM-5.2's IndexShare)
+    attends over them by vLLM's own sparse GQA attention where it takes the layer:
+    in a bfloat16 model, without a window of its own, as the layer whose indexer
+    picked them."""
+    from bux_vllm import dsa, picks
+
+    def reader(window=None, sinks=None, latent=0) -> picks.Sparse:
+        return picks.Sparse(
+            0,
+            1,
+            False,
+            False,
+            False,
+            window,
+            0.125,
+            None,
+            64,
+            (0, 2),
+            sinks,
+            latent=latent,
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dsa, "available", lambda: True)
+        assert dsa.reads(reader(), (64, 64), 4, torch.bfloat16)
+        assert not dsa.reads(reader(), (64, 64), 2, torch.bfloat16)
+        assert not dsa.reads(reader(), (64, 64), 4, torch.float32)
+        assert not dsa.reads(reader(), (64, 32), 4, torch.bfloat16)
+        assert not dsa.reads(reader(), (48, 48), 4, torch.bfloat16)
+        assert not dsa.reads(reader(window=16), (64, 64), 4, torch.bfloat16)
+        assert not dsa.reads(reader(sinks=torch.ones(8)), (64, 64), 4, torch.bfloat16)
+        mp.setattr(dsa, "CHOICE", "triton")
+        assert not dsa.reads(reader(), (64, 64), 4, torch.bfloat16)
+
+
 def test_msa_takes_minimax_s_settings_alone() -> None:
     """vLLM's MiniMax-M3 kernels take MSA of blocks of 128, an unweighted index head
     a kv head, plain dots, heads of a power of two of dims and fewer than 64 blocks
@@ -2925,6 +2961,7 @@ OWN_CACHES = {
     **dict.fromkeys(("dsa", "dsa-conv", "msa", "qsa"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-share", "msa-share"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-native", "dsa-hybrid", "qsa-native"), "gqa with an indexer"),
+    "dsa-share-native": "gqa with an indexer",
     "msa-native": "gqa with an indexer",
     "relbias": "gqa with a relative bias",
     **dict.fromkeys(("mla-dsa", "mla-share"), "mla with an indexer"),
@@ -2970,6 +3007,15 @@ def test_native_dsa_takes_an_fp8_kv_cache(
     want = [(True, e4m3, 2), (True, e4m3, 2), (False, e4m3, 0)]
     assert [(c.native, c.fp8, c.slots) for c in caches] == want
     assert all(c.dtype is torch.uint8 and c.share == 0 for c in caches)
+    assert not any(c.reads_natively for c in caches)  # groups of 2 query heads
+    source = vllm_parity.CASES["dsa-share-native"]
+    model = built(source, tmp_path / "share", stood_in, None, "fp8")
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    want = [(True, False, 3), (False, True, 0), (False, True, 0)]  # 68 bytes of 32
+    assert [(c.native, c.reads_natively, c.slots) for c in caches] == want
+    assert all(c.fp8 is e4m3 for c in caches)
+    backends = [c.get_attn_backend().get_name() for c in caches]
+    assert backends == ["BUX_PAGED_DSA", "BUX_PAGED_PICKED", "BUX_PAGED_PICKED"]
     model = built(
         vllm_parity.CASES["qsa-native"], tmp_path / "qsa", stood_in, None, "fp8"
     )

@@ -387,6 +387,20 @@ def attends(spec: Sparse, q: torch.Tensor, kv: torch.Tensor) -> bool:
     return q.dtype == torch.bfloat16 and dims and cache and plain and group >= 4
 
 
+def reads(spec: Sparse, dims: tuple[int, int], group: int, dtype: torch.dtype) -> bool:
+    """Whether vLLM's own sparse GQA attention (`attend`) attends a layer of `spec`
+    that reads its picks from its ``index`` port, as it does the layer that picked
+    them (by `CHOICE`): heads of `dims` keys and values, `group` query heads a kv
+    head, a bfloat16 model, and no window of its own, which the kernel would not
+    apply (`attends` checks the rest at each call)."""
+    on = CHOICE is None or CHOICE == "native"
+    dk, dv = dims
+    fits = dk == dv and dk >= 16 and dk & (dk - 1) == 0 and group >= 4
+    plain = spec.window is None and spec.sinks is None and spec.softcap is None
+    alone = plain and not spec.latent and dtype == torch.bfloat16
+    return on and fits and alone and available()
+
+
 def attend(
     spec: Sparse,
     q: torch.Tensor,
@@ -396,15 +410,17 @@ def attend(
     prompt: bool,
     scales: tuple[float, float],
     out: torch.Tensor | None = None,
+    whole: bool | None = None,
 ) -> torch.Tensor:
     """Each query's heads' outputs, (Q, h, d), over its `picked` keys, (Q, K) int32
     positions with -1 for none, by vLLM's own sparse GQA attention (Qwen4's QSA
     kernel), which reads the paged `kv`, (blocks, g, block_size, 2 d), in place by
     the block table `rows`: one request's, (1, blocks), for a prompt's queries,
     else each one's; into `out` where given. DSA's picks have their valid ones
-    first, as the kernel bounds a query's tiles by their count; QSA's are read
-    whole (`bux_vllm.caching.packed`). Its output gate is passed open, and a scale
-    other than ``d ** -0.5`` goes on the queries."""
+    first, as the kernel bounds a query's tiles by their count; QSA's, and those
+    read `whole` (another layer's, from the ``index`` port), are read whole
+    (`bux_vllm.caching.packed`). Its output gate is passed open, and a scale other
+    than ``d ** -0.5`` goes on the queries."""
     from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 
     from . import caching
@@ -412,7 +428,8 @@ def attend(
     dk = q.shape[2]
     if spec.scale != dk**-0.5:
         q = (q.float() * (spec.scale * dk**0.5)).to(q.dtype)
-    indices, req = caching.packed(picked.to(torch.int32), not prompt, spec.mean)
+    whole = spec.mean if whole is None else whole
+    indices, req = caching.packed(picked.to(torch.int32), not prompt, whole)
     nhd = kv.transpose(1, 2)
     k, v = nhd[..., :dk], nhd[..., dk:]
     fp8 = (scales[0], scales[1]) if kv.dtype == FP8 else (None, None)

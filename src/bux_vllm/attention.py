@@ -24,7 +24,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from . import keyed, kv, outputs, picks, sparse
+from . import dsa, keyed, kv, outputs, picks, sparse
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -57,7 +57,8 @@ class Attention(Layer):
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
     op over vLLM's paged caches (`bux_vllm.sparse`). The ``index`` port passes the
     picks on: a layer that reads it attends to the keys another's indexer picked,
-    of those its own window sees, and runs no indexer. With a relative bias, each
+    of those its own window sees, and runs no indexer, on vLLM's own sparse GQA
+    attention where it takes the layer, as the layer that picked them does. With a relative bias, each
     query attends to every key it sees, the bias and the length scale on its
     logits, by the plugin's op over a paged cache of its own.
 
@@ -226,6 +227,7 @@ class Attention(Layer):
         dtype = site.vllm_config.model_config.dtype
         dims, heads = (self.dk, self.dv), c["num_kv_heads"]
         native, blocked, fp8 = sparse.paths(spec, ix, dims, dtype, heads)
+        natively = ix is None and dsa.reads(spec, dims, self.hq // self.g, dtype)
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -237,6 +239,7 @@ class Attention(Layer):
             native,
             fp8,
             blocked,
+            natively,
         )
 
     def _biased_caches(

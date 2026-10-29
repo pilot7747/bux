@@ -550,6 +550,17 @@ CASES = {
     + NATIVE.replace("rope=rope()", "kv_conv_size=4, qk_norm=rmsnorm, gated=true")
     + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
     + LINEAR_HYBRID,
+    # GLM-5.2's IndexShare on the hybrid's global layer: one layer's indexer picks
+    # the keys the next two global layers attend over, on vLLM's own sparse GQA
+    # attention, as it does the first's: groups of 4 query heads, at TP2 too.
+    "dsa-share-native": HEAD
+    + FFN
+    + "attn = gqa(num_heads=8, num_kv_heads=2, kv_conv_size=4, qk_norm=rmsnorm,"
+    f" gated=true, {NATIVE_INDEXER})\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(index=@topk, v=@v1)]"
+    " [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(index=$topk, v=$v1)]"
+    " [rmsnorm ffn] [rmsnorm attn(index=$topk!, v=$v1!)] [rmsnorm ffn] rmsnorm head",
     # MSA's picks, of blocks and per kv head's group, shared likewise.
     "msa-share": HEAD
     + FFN
