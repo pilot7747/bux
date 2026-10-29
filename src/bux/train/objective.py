@@ -21,14 +21,16 @@ An eval measures the first head as sums over a batch (`held_out`), whose means o
 many batches weigh each target alike.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Bool, Float, Int, Real, Shaped
+from jaxtyping import Array, Bool, Float, Int, Integer, Real, Shaped
 
 from bux.architecture import observe
 from bux.architecture.common.segments import Segments
@@ -44,6 +46,8 @@ Metrics = dict[str, Float[Array, ""]]
 #: batches is the sum of the first over the sum of the second.
 Ratio = tuple[Float[Array, ""], Real[Array, ""]]
 Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logits
+#: The share of the run's steps done, inside a training step (`Objective.at`).
+_PROGRESS: ContextVar[Float[Array, ""] | None] = ContextVar("progress", default=None)
 
 
 class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
@@ -62,6 +66,7 @@ class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
         self.outputs, self.batch = list(outputs), batch
         self._logits: dict[int, Float[Array, "b t vocab"]] = {}
         self._sums: dict[tuple[int, int, bool], Sums] = {}
+        self._prefixes: dict[int, Float[Array, ""]] = {}
 
     def __len__(self) -> int:
         return len(self.outputs)
@@ -97,6 +102,23 @@ class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
             )
         return self._sums[i, offset, z]
 
+    def prefix_sum(self, table: Int[Array, " vocab"], offset: int) -> Float[Array, ""]:
+        """Return the first head's cross-entropy of each target's prefix token
+        (`table`'s, -1 for none) at the positions whose target has one, summed by the
+        weights of a mean over all the targets, as the cross-entropy takes them, by
+        the run's `methods.loss`."""
+        if offset not in self._prefixes:
+            out, targets = self.outputs[0], targets_ahead(self.batch, offset)
+            prefix = table[targets]
+            weights = mean_weights(self.batch, offset) * (prefix >= 0)
+            prefix = jnp.maximum(prefix, 0)
+            self._prefixes[offset] = (
+                out.sums(prefix, weights, False)
+                if isinstance(out, HeadOutput)
+                else Scores.of(out, prefix).sums(weights, False)
+            ).ce
+        return self._prefixes[offset]
+
 
 class Term(NamedTuple):
     """A term of the objective: its weight, and the function that computes it from
@@ -131,6 +153,17 @@ class Objective:
     terms: dict[str, Term]
     offset: int = 1
     observed: dict[str, Term] = field(default_factory=dict)
+    steps: int | None = None  #: The run's steps, which `at` takes a share of.
+
+    @contextmanager
+    def at(self, step: Integer[Array, ""]) -> Generator[None]:
+        """Run a training step's objective at `step`, of the run's `steps`: a term
+        that a schedule weighs (``loss(prefix=...)``) reads its share (`progress`)."""
+        token = _PROGRESS.set(None if self.steps is None else step / self.steps)
+        try:
+            yield
+        finally:
+            _PROGRESS.reset(token)
 
     def __call__(
         self, outputs: Sequence[Output], batch: Batch, aux_losses: Sequence[Loss] = ()
@@ -177,10 +210,28 @@ def reported(losses: Sequence[Loss]) -> list[Loss]:
     return [a for a in losses if not observe.is_observed(a.name)]
 
 
-def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
+def progress() -> Float[Array, ""]:
+    """Return the share of the run's steps done before the training step running,
+    0 outside one (`Objective.at`)."""
+    share = _PROGRESS.get()
+    return jnp.zeros(()) if share is None else jnp.asarray(share, jnp.float32)
+
+
+def objective(
+    config: tcfg.LossConfig,
+    arch: ir.Architecture,
+    *,
+    steps: int | None = None,
+    prefixes: Int[np.ndarray, " vocab"] | None = None,
+) -> Objective:
     """Return the loss of `config` for a model of `arch`: the first head's
     cross-entropy as `loss`, its `z_loss`, and as `mtp` the mean loss of the heads
     that predict further ahead.
+
+    With ``config.prefix``, `prefix_loss` is the first head's cross-entropy of each
+    target's prefix token (`prefixes`), unweighted, and `prefix` the term the loss
+    adds: it times its weight at the step's share of the run's `steps`
+    (`prefix_weight`).
 
     `z_loss` is a term only where ``config.z`` is not 0, and `mtp` only where the
     model has more than one head. With more than one, every head's cross-entropy is
@@ -191,6 +242,10 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     Args:
         config: The run's ``loss`` setting.
         arch: The model, whose ``nextn`` layers say how far ahead each head predicts.
+        steps: The run's steps, for a term a schedule weighs; None: its weight at
+            the start.
+        prefixes: Each id's prefix token, -1 for none (``Tokenizer.prefix_tokens``),
+            for ``config.prefix``; None: none has one.
 
     Returns:
         The objective, whose terms a script may add to or replace.
@@ -222,7 +277,45 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
         terms["mtp"] = Term(config.mtp, mtp)
         terms |= {f"lm_loss/{a}": Term(0.0, _ce(i, o, z and not i)) for i, o, a in each}
     observed = {f"z_loss/{a}": Term(0.0, _z(i, o, z and not i)) for i, o, a in each}
-    return Objective(terms, offsets[0], observed)
+    if config.prefix is not None:
+        terms |= _prefix_terms(config.prefix, prefixes, arch.vocab_size, offsets[0])
+    return Objective(terms, offsets[0], observed, steps)
+
+
+def _prefix_terms(
+    c: tcfg.PrefixConfig,
+    prefixes: Int[np.ndarray, " vocab"] | None,
+    vocab: int | None,
+    offset: int,
+) -> dict[str, Term]:
+    """Return prefix-token prediction's terms: `prefix_loss`, the first head's
+    cross-entropy of the targets' prefix tokens, and `prefix`, the loss's, it times
+    its scheduled weight."""
+    given = 0 if prefixes is None else len(prefixes)
+    table = np.full(max(vocab or 0, given), -1, np.int32)  # -1 past the tokenizer's
+    if prefixes is not None:
+        table[:given] = prefixes
+    ids = jnp.asarray(table)
+
+    def ce(heads: Heads, _: Batch) -> Float[Array, ""]:
+        return heads.prefix_sum(ids, offset)
+
+    def scheduled(heads: Heads, batch: Batch) -> Float[Array, ""]:
+        return prefix_weight(c, progress()) * ce(heads, batch)
+
+    return {"prefix_loss": Term(0.0, ce), "prefix": Term(1.0, scheduled)}
+
+
+def prefix_weight(
+    c: tcfg.PrefixConfig, share: Float[Array, "*n"]
+) -> Float[Array, "*n"]:
+    """Return prefix-token prediction's weight at `share` of the run's steps: its
+    weight for the first `hold` of them, falling linearly to 0 over the next
+    `decay`, then 0."""
+    if c.decay == 0:
+        return jnp.where(share <= c.hold, c.weight, 0.0)
+    falling = jnp.clip(1 - (share - c.hold) / c.decay, 0.0, 1.0)
+    return c.weight * jnp.where(share <= c.hold, 1.0, falling)
 
 
 def _ahead_of(offsets: Sequence[int]) -> list[tuple[int, int, str]]:

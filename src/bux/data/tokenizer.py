@@ -112,6 +112,28 @@ class Tokenizer:
             out.append(self.encoder.decode(run) if name is None else name * len(run))
         return "".join(out)
 
+    def prefix_tokens(self) -> Int32[np.ndarray, " vocab"]:
+        """Return each id's prefix token: the id whose bytes are the longest proper
+        prefix of its bytes that the vocabulary has, as modded-nanogpt's prefix-token
+        prediction looks them up; -1 where none is, as for a single byte, and for a
+        special token. Of ids with the same bytes, the first stands for them."""
+        specials = set(self.specials.values())
+        vocab = {i: b for i, b in self.encoder.vocab.items() if i not in specials}
+        ids: dict[bytes, int] = {}
+        for i in sorted(vocab):
+            ids.setdefault(vocab[i], i)
+        table = np.full(self.vocab_size, -1, np.int32)
+        for i, piece in vocab.items():
+            table[i] = next(
+                (
+                    ids[piece[:k]]
+                    for k in range(len(piece) - 1, 0, -1)
+                    if piece[:k] in ids
+                ),
+                -1,
+            )
+        return table
+
     def token_bytes(self) -> Int32[np.ndarray, " vocab"]:
         """Return the bytes of text each id stands for, its UTF-8 bytes; 0 for a
         special token, which stands for none. Bits per byte divide by them."""
