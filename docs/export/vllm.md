@@ -366,16 +366,26 @@ vLLM's Gemma 4 loads the key projection into both the k and the v shard of its
 its FP8 scale is the keys'. The values are each head's key, after the conv on the
 keys alone, RMS-normalized without a gain.
 
-- **One vector a token.** Where each key is its value times the key norm's gain,
-  the layer's KV cache holds the values alone, half the bytes of keys and values,
-  and the gain goes on the queries. That holds for a layer with no RoPE, a QK
-  RMSNorm of each head without a bias, and no port that mixes other values in (a
-  `v` or `ve` read) or shares its cache (`kv`). vLLM's Triton attention runs it
-  (its kernels, metadata and CUDA graphs), with the one paged slab as both its key
-  and its value cache, in FP8 too under `--kv-cache-dtype fp8`. Beside layers of larger
-  pages, vLLM gives it more tokens a block, so that its page matches theirs.
-- **Keys and values.** Any other `k_eq_v` layer caches both, by vLLM's attention
-  as for any `gqa` layer. So does every one under `BUX_VLLM_K_EQ_V_CACHE=both`.
+- **Keys and values.** By default the layer's KV cache holds both, by vLLM's
+  attention as for any `gqa` layer, on the backend vLLM picks for it.
+- **One vector a token.** Under `BUX_VLLM_K_EQ_V_CACHE=keys`, where each key is its
+  value times the key norm's gain, the cache holds the values alone, half the bytes
+  of keys and values, and the gain goes on the queries. That holds for a layer with
+  no RoPE, a QK RMSNorm of each head without a bias, and no port that mixes other
+  values in (a `v` or `ve` read) or shares its cache (`kv`). vLLM's Triton attention
+  runs it, with the one paged slab as both its key and its value cache, in FP8 too
+  under `--kv-cache-dtype fp8`. vLLM matches pages rather than tokens, so beside
+  layers that keep both, or a recurrent state's page, its block holds twice the
+  tokens, and prefix caching hits at twice the granularity.
+
+The second serves slower. On one B300 (2026-10-29, vLLM 0.32.0), the hybrid at a
+width of 3328 with FP8 weights and an FP8 KV cache, under the agentic load of
+[Schemes on a B300](#schemes-on-a-b300), served 1990 sessions an hour per GPU. With
+`k_eq_v` on every global layer, no value residual, and their caches one vector a
+token, it served 638,
+at a TPOT of 19.3 ms at 8 sessions at once against 14.8. Those layers attend by
+Triton's kernel where the others attend by FlashInfer's, and their blocks hold 4192
+tokens where the others' hold 2096.
 
 A layer that reads the `v` port (a value residual) mixes the first layer's values
 into its own, which its keys do not share, so it caches both.
