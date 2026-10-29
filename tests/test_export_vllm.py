@@ -3102,18 +3102,22 @@ def test_a_pointer_s_rows_keep_its_keys_and_tokens(fp8: torch.dtype | None) -> N
     np.testing.assert_array_equal(got_keys.numpy(), want.numpy())
 
 
+@pytest.mark.parametrize("window", [None, 3])
 @pytest.mark.parametrize("dim", [16, 24], ids=["dim 16", "dim 24"])
-def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
+def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(
+    dim: int, window: int | None
+) -> None:
     """Each position as a request's last token: the pointer over the request's
     earlier tokens in the paged cache, mixed with the head's softmax, is bux's
     mixture (`bux.architecture.copy.log_probs`) at that position, at a key width
-    of a power of two and of none."""
+    of a power of two and of none, and within a window of 3 too."""
     from bux.architecture import copy as bux_copy
 
     source = (
         "d_model = 32\nvocab_size = 64\n"
         "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
-        f"model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim={dim}))"
+        "model = embed [rmsnorm attn] rmsnorm"
+        f" head(pointer=copy_pointer(dim={dim}, window={window or 'none'}))"
     )
     model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
     tokens = jax.random.randint(jax.random.key(0), (1, 12), 0, 6)
@@ -3135,7 +3139,15 @@ def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
     assert blocks * size == 12
     for i in range(12):
         p_copy, a_sink = copying.pointed(
-            q[i : i + 1], sink[i : i + 1], cache, table, torch.tensor([i]), 64, None, 12
+            q[i : i + 1],
+            sink[i : i + 1],
+            cache,
+            table,
+            torch.tensor([i]),
+            64,
+            None,
+            12,
+            window or copying.WHOLE,
         )
         got = copying.mixed(logits[i : i + 1], p_copy, a_sink, 63)[0].numpy()
         finite = np.isfinite(want[i])
@@ -3190,7 +3202,7 @@ def test_the_pointer_s_steps_replayed_as_a_graph_sample_bux_s_mixture() -> None:
         p_copy, a_sink = copying.pointed(
             q_, sink_, cache, table_, position, 64, None, length
         )
-        p_copy, a_sink = copying.rows_of(p_copy, a_sink, 2)
+        p_copy, a_sink, _ = copying.rows_of(p_copy, a_sink, torch.ones(2), 2)
         last = torch.stack([logits[r, max(p for s, p in at if s == r)] for r in (0, 1)])
         return copying.mixed(last, p_copy, a_sink, 63)
 
@@ -3218,14 +3230,192 @@ def test_the_pointer_s_steps_replayed_as_a_graph_sample_bux_s_mixture() -> None:
         check_rows(point(graph, [(0, a), (1, b)]), (a, b))
 
 
+def test_slices_of_the_head_input_are_found_and_gathered_rows_are_not() -> None:
+    """vLLM runs in ``inference_mode``, where a slice keeps no ``_base``: the rows of
+    a prompt are told from the rows gathered to sample by where they lie."""
+    with torch.inference_mode():
+        x = torch.randn(10, 8)
+        rows = copying.Rows.of(x)
+        assert rows.at(x[:7][2:5]) == 2 and rows.at(x) == 0
+        assert rows.at(x[torch.tensor([1, 3])]) is None
+        assert rows.at(torch.randn(3, 8)) is None
+        assert rows.at(x[:, :4]) == 0  # rows of the same stride
+
+
+@pytest.mark.parametrize("window", [None, 3])
+def test_prompt_rows_mix_as_bux_s_mixture_at_every_position(
+    monkeypatch: pytest.MonkeyPatch, window: int | None
+) -> None:
+    """vLLM's prompt logprobs over two steps: a prompt and a first chunk of another,
+    then its second chunk over the keys the first wrote, and padding. Each slice of
+    the head's input, within a request or across two as vLLM's runners take them,
+    points at every position as bux's mixture does, a few rows at a time, within a
+    window of 3 too."""
+    from bux.architecture import copy as bux_copy
+
+    monkeypatch.setattr(copying, "CHUNK", 2 * 64)  # two rows a chunk
+    source = (
+        "d_model = 32\nvocab_size = 64\n"
+        "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
+        "model = embed [rmsnorm attn] rmsnorm"
+        f" head(pointer=copy_pointer(dim=24, window={window or 'none'}))"
+    )
+    model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
+    tokens = jax.random.randint(jax.random.key(2), (2, 10), 0, 6)
+    [head] = model.heads(tokens)
+    pointer = head.pointer
+    assert pointer is not None
+    want = np.asarray(bux_copy.log_probs(head))
+    q, k, sink = (
+        torch.from_numpy(np.array(a, np.float32))
+        for a in (pointer.query, pointer.key, pointer.sink)
+    )
+    logits = torch.from_numpy(np.array(head.projection(head.hidden), np.float32))
+    ids = torch.from_numpy(np.array(tokens))
+    size = 4
+    cache = torch.zeros(8, 1, size, copying.row_width(24))
+    table = torch.tensor([[5, 2, 7], [1, 6, 3]], dtype=torch.int32)
+
+    def step(at: list[tuple[int, int]], slices: list[slice]) -> None:
+        """Run the op on the step of the (request, position) `at` and a padded
+        token, then check the mixture of each slice of its rows."""
+        flat = [r * 10 + p for r, p in at]
+        last = {r: i for i, (r, _) in enumerate(at)}  # the step's requests, in order
+        ends = [i + 1 for i in last.values()]
+        lens = [at[i][1] + 1 for i in last.values()]
+        slots = [int(table[r, p // size]) * size + p % size for r, p in at]
+        steps = copying.Steps(
+            torch.tensor([*slots, -1]),
+            table[list(last)],
+            len(at),
+            torch.tensor([0, *ends], dtype=torch.int32),
+            torch.tensor(lens, dtype=torch.int32),
+        )
+        x = torch.zeros(len(at) + 1, 32)  # the head's input, padding last
+        stash = copying.Prompts(copying.Rows.of(x), steps)
+        rows = [q.reshape(20, -1)[flat], k.reshape(20, -1)[flat], ids.reshape(20)[flat]]
+        copying.stepped(cache, steps, *rows, sink.reshape(20)[flat], len(last), None)
+        for part in slices:
+            first = stash.rows.at(x[part])
+            assert first is not None and first == part.start
+            picked = [flat[i] for i in range(part.start, min(part.stop, len(at)))]
+            pad = part.stop - part.start - len(picked)
+            q_, sink_ = q.reshape(20, -1)[picked], sink.reshape(20)[picked]
+            q_ = torch.cat([q_, q_.new_zeros(pad, 24)])
+            sink_ = torch.cat([sink_, sink_.new_zeros(pad)])
+            p_copy, a_sink = copying.prompted(
+                q_, sink_, cache, steps, first, 64, None, window or copying.WHOLE
+            )
+            assert torch.equal(p_copy[len(picked) :], p_copy.new_zeros(pad, 64))
+            kept = len(picked)
+            mine = logits.reshape(20, -1)[picked]
+            got = copying.mixed(mine, p_copy[:kept], a_sink[:kept], 63)
+            for row, i in zip(got.numpy(), range(part.start, part.start + len(got))):
+                r, p = at[i]
+                finite = np.isfinite(want[r, p])
+                assert (np.isfinite(row) == finite).all()
+                np.testing.assert_allclose(
+                    row[finite], want[r, p][finite], rtol=1e-5, atol=1e-5
+                )
+
+    first = [(0, p) for p in range(8)] + [(1, p) for p in range(5)]
+    step(first, [slice(0, 7), slice(8, 13), slice(0, 13), slice(5, 14)])
+    second = [(1, p) for p in range(5, 10)]  # its first five keys from the first
+    step(second, [slice(0, 5), slice(2, 6)])
+
+
+def one_pass(
+    q: torch.Tensor,
+    sink: torch.Tensor,
+    keys: torch.Tensor,
+    tokens: torch.Tensor,
+    vocab: int,
+    per: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The decode kernel's sums for a query `q`, (c,), over `keys`, (L, c), as its
+    programs of `per` positions make them: masses ``exp(s - c)`` into their tokens'
+    entries and their sum, the sink's mass in it; by the max past the shift's
+    range, as its first program does then."""
+    c, fits = (t[0] for t in copying.shift(q[None], sink[None]))
+    s = keys @ q * q.shape[0] ** -0.5
+    if not fits:
+        c = torch.maximum(sink, s.max())
+    p_copy, total = torch.zeros(vocab), torch.zeros(())
+    for first in range(0, len(keys), per):
+        e = torch.exp(s[first : first + per] - c)
+        p_copy.index_add_(0, tokens[first : first + per], e)
+        total += e.sum()
+    a_sink = torch.exp(sink - c)
+    return p_copy, a_sink, total + a_sink
+
+
+def rms_normed(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.rsqrt(x.square().mean(-1, keepdim=True))
+
+
+@pytest.mark.parametrize("cache", ["bfloat16", "fp8"])
+@pytest.mark.parametrize("keys", ["random", "aligned", "opposed"])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("edge", [0.1, 0.5, 0.99, 1.01, 2.0])
+def test_the_kernel_s_one_pass_masses_are_the_two_pass_pointer(
+    cache: str, keys: str, dim: int, edge: float
+) -> None:
+    """The decode kernel's one pass over the keys, its masses shifted by the bound
+    a query fixes before reading any, split over programs and summed after, gives
+    the softmax the two passes did, its sink's share too: keys of random tokens,
+    keys all along the query (every score at the bound, 4096 of them) and all
+    against it (every score at minus the bound), cached in bfloat16 or FP8, at
+    gains of a fraction `edge` of the most the one pass takes
+    (`bux_vllm.copying.shift`), up to it and past it."""
+    torch.manual_seed(dim)
+    length, vocab = 4096, 50
+    most = (copying.TOP + copying.FLOOR) / (2 * copying.KEY_NORM * dim**0.5)
+    q = (rms_normed(torch.randn(dim)) * edge * most).bfloat16().float()
+    assert bool(copying.shift(q[None], torch.zeros(1))[1]) == (edge < 1)
+    sink = q @ torch.randn(dim) * dim**-0.5 * 0.3
+    k = rms_normed(torch.randn(length, dim))
+    if keys != "random":
+        sign = 1 if keys == "aligned" else -1
+        k = rms_normed(sign * q + 0.01 * torch.randn(length, dim))
+    stored = torch.float8_e4m3fn if cache == "fp8" else torch.bfloat16
+    k = k.to(stored).float()
+    tokens = torch.randint(0, vocab, (length,))
+    scores = k @ q * dim**-0.5
+    bound = q.norm() * copying.KEY_NORM
+    assert scores.abs().max() <= bound
+    p_copy, a_sink, total = one_pass(q, sink, k, tokens, vocab, 640)
+    assert torch.isfinite(total) and total > 0
+    every = torch.cat([scores, sink[None]]).softmax(-1)
+    want = torch.zeros(vocab).index_add_(0, tokens, every[:-1])
+    torch.testing.assert_close(p_copy / total, want, rtol=1e-4, atol=1e-9)
+    torch.testing.assert_close(a_sink / total, every[-1], rtol=1e-4, atol=1e-9)
+    logits = torch.randn(1, vocab)
+    got = copying.mixed(logits, p_copy[None], a_sink[None], vocab - 1, total[None])
+    mine = copying.mixed(logits, want[None], every[-1:], vocab - 1)
+    finite = torch.isfinite(mine)
+    assert torch.equal(torch.isfinite(got), finite)
+    torch.testing.assert_close(got[finite], mine[finite], rtol=1e-4, atol=1e-5)
+
+
+def test_a_step_s_programs_cover_every_position_with_some_for_each_multiprocessor():
+    """The decode kernel's programs: 4 a multiprocessor at least, in chunks of whole
+    tiles, covering every position of the block table and no more programs."""
+    for requests, longest, sms in [(1, 100, 148), (8, 131072, 148), (256, 4096, 148)]:
+        splits, per = copying.splits(requests, longest, 148, 64)
+        assert per % 64 == 0 and splits * per >= longest > (splits - 1) * per
+        assert requests * splits >= min(4 * sms, requests * -(-longest // 64))
+    assert copying.splits(8, 131072, 148, 64) == (74, 1792)
+
+
 def test_rows_past_the_pointer_s_buffers_take_the_softmax_but_copy() -> None:
     """vLLM's dummy sampler run asks compute_logits for more rows than max_num_seqs:
     those rows mix no pointer, the head's softmax over every row but <copy>."""
     p_copy, a_sink = torch.rand(4, 10), torch.rand(4)
-    rows, sinks = copying.rows_of(p_copy, a_sink, 3)
+    total = torch.ones(4)
+    rows, sinks, _ = copying.rows_of(p_copy, a_sink, total, 3)
     assert torch.equal(rows, p_copy[:3]) and torch.equal(sinks, a_sink[:3])
-    rows, sinks = copying.rows_of(p_copy, a_sink, 6)
-    assert rows.shape == (6, 10) and sinks.shape == (6,)
+    rows, sinks, totals = copying.rows_of(p_copy, a_sink, total, 6)
+    assert rows.shape == (6, 10) and sinks.shape == (6,) and totals.shape == (6,)
     logits = torch.randn(6, 10)
     got = copying.mixed(logits, rows, sinks, 9)
     want = logits[:, :9].log_softmax(-1)
@@ -3255,8 +3445,8 @@ def test_the_pointer_s_pytorch_path_reads_nothing_on_the_host(
     p_copy, a_sink = copying.pointed(
         q, sink, cache, table, torch.tensor([3, 2, 0]), 10, None, 8
     )
-    rows_, sinks = copying.rows_of(p_copy, a_sink, 5)
-    copying.mixed(torch.randn(5, 10), rows_, sinks, 9)
+    rows_, sinks, totals = copying.rows_of(p_copy, a_sink, torch.ones(3), 5)
+    copying.mixed(torch.randn(5, 10), rows_, sinks, 9, totals)
     monkeypatch.undo()
     assert torch.allclose(p_copy.sum(-1) + a_sink, torch.ones(3))
     assert a_sink[2] == 1  # nothing before position 0

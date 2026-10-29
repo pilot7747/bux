@@ -10,10 +10,14 @@ to the request's tokens before it and a sink (`pointed`), and `mixed` turns the
 head's logits into the log of the mixture, which vLLM then samples:
 
     p(y) = p_lm(y) (1 - a (1 - a_sink)) + a p_copy(y)
+
+For prompt logprobs vLLM asks for the logits of rows of a prompt too, after the
+sampled rows' (`Prompts`): the pointer then attends from each of them (`prompted`).
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 
 import torch
@@ -22,6 +26,8 @@ from . import picks
 
 #: The base-256 digits of a token in a row of the cache: ids below 2^24.
 DIGITS = 3
+#: A window that sees the whole request, as bux's pointer without one.
+WHOLE = 2**30
 
 
 @dataclass
@@ -96,13 +102,14 @@ def decode(
     return keys, torch.as_tensor(tokens)
 
 
-def gathered(cache: torch.Tensor, table: torch.Tensor, length: int) -> torch.Tensor:
-    """The rows of each request's first `length` positions, (R, length, row), from
-    the paged `cache`, ``[blocks, 1, block_size, row]``, by its block `table`."""
+def gathered(
+    cache: torch.Tensor, table: torch.Tensor, at: torch.Tensor
+) -> torch.Tensor:
+    """The rows of each request's positions `at`, (R, L), (R, L, row), from the
+    paged `cache`, ``[blocks, 1, block_size, row]``, by its block `table`."""
     size = cache.shape[2]
-    at = torch.arange(length, device=cache.device)
-    columns = (at // size).clamp(max=table.shape[1] - 1)
-    blocks = table[:, columns].long().clamp(0, cache.shape[0] - 1)
+    columns = (at // size).clamp(0, table.shape[1] - 1)
+    blocks = table.gather(1, columns).long().clamp(0, cache.shape[0] - 1)
     return cache[blocks, 0, at % size]
 
 
@@ -145,11 +152,13 @@ def pointed(
     vocab: int,
     fp8: torch.dtype | None,
     length: int,
+    window: int = WHOLE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The pointer's distribution over the vocabulary, and its sink's share, for
     each request's query: its attention to the request's positions before the
-    query's, and to the sink, in float32. It reads the first `length` positions of
-    every request, a count fixed on the host, so that a CUDA graph captures it.
+    query's, within `window` of it, and to the sink, in float32. It reads as many
+    positions of every request as the window or `length` holds, a count fixed on
+    the host, so that a CUDA graph captures it.
 
     Args:
         q: The queries, (R, c): RMS-normed, times the gain.
@@ -161,14 +170,18 @@ def pointed(
         fp8: The FP8 dtype of an FP8 cache's keys; None for the model's dtype.
         length: The positions it reads of each request, `max_model_len`: as many
             as any query has before it.
+        window: How far back a query looks, in positions.
 
     Returns:
         p_copy, (R, vocab), and a_sink, (R,).
     """
     r, dim = q.shape
-    keys, tokens = decode(gathered(cache, table, length), dim, fp8)
+    span = min(length, window)  # the positions each query may see, the last ones
+    first = (position[:, None] - span).clamp(min=0)
+    at = first + torch.arange(span, device=q.device)
+    keys, tokens = decode(gathered(cache, table, at), dim, fp8)
     scores = torch.einsum("rc,rlc->rl", q.float(), keys) * dim**-0.5
-    seen = torch.arange(length, device=q.device) < position[:, None]
+    seen = at < position[:, None]
     scores = scores.masked_fill(~seen, -torch.inf)
     every = torch.cat([scores, sink.float()[:, None]], -1).softmax(-1)
     copy = torch.zeros(r, vocab, dtype=torch.float32, device=q.device)
@@ -176,26 +189,162 @@ def pointed(
     return copy, every[:, -1]
 
 
-def rows_of(
-    p_copy: torch.Tensor, a_sink: torch.Tensor, n: int
+#: The most scores or probabilities of a chunk of prompt rows (`prompted`).
+CHUNK = 2**24
+
+#: A bound on a cached key's norm over sqrt(c): RMS-normed, then rounded to the
+#: cache's dtype, FP8 e4m3's 6.25% the most (`shift`).
+KEY_NORM = 1.1
+#: The most a shifted score may be: e^64 over a million positions stays below
+#: float32's largest.
+TOP = 64.0
+#: How far below 0 a shifted score may be: e^-77 stays well above float32's
+#: smallest normal, e^-87.
+FLOOR = 77.0
+
+
+def shift(q: torch.Tensor, sink: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The shift c of each query's scores, (R,), that keeps every position's mass
+    ``exp(s - c)`` within float32 before any key is read, and whether it does,
+    (R,), as the decode kernel takes them: a score ``q . k / sqrt(c)`` is at most
+    ``bound = |q| KEY_NORM``, the keys being RMS-normed, and at least ``-bound``.
+    With ``c = max(sink, bound - TOP)`` no mass passes e^TOP, and none falls under
+    e^-FLOOR while ``2 bound <= TOP + FLOOR``; masses under the sink's past that
+    weigh nothing next to its 1."""
+    bound = q.float().norm(dim=-1) * KEY_NORM
+    return torch.maximum(sink.float(), bound - TOP), 2 * bound <= TOP + FLOOR
+
+
+def splits(requests: int, longest: int, sms: int, tile: int) -> tuple[int, int]:
+    """The programs each of `requests` splits its `longest` positions over, and the
+    positions of each, a multiple of `tile`: 4 programs a multiprocessor of `sms`
+    at least, as a step of a few requests has few. The step's shape fixes them, as
+    a CUDA graph captures it."""
+    chunks = -(-longest // tile)
+    count = max(1, min(chunks, -(-4 * sms // requests)))
+    per = -(-chunks // count) * tile
+    return -(-longest // per), per
+
+
+@dataclass(frozen=True)
+class Rows:
+    """Where a tensor's rows lie in memory: what tells the head's input, of which
+    vLLM's prompt logprobs take slices, from the rows it gathers to sample, which
+    lie elsewhere (in ``inference_mode`` a slice keeps no ``_base``).
+
+    Attributes:
+        start: The address of its first row.
+        rows: Its rows.
+        row_bytes: The bytes from a row to the next.
+    """
+
+    start: int
+    rows: int
+    row_bytes: int
+
+    @classmethod
+    def of(cls, x: torch.Tensor) -> Rows:
+        """Where `x`'s rows lie."""
+        return cls(x.data_ptr(), x.shape[0], x.stride(0) * x.element_size())
+
+    def at(self, rows: torch.Tensor) -> int | None:
+        """The row at which `rows` start, if they are some of these rows; None
+        for any other tensor."""
+        if rows.stride(0) * rows.element_size() != self.row_bytes:
+            return None
+        at, rest = divmod(rows.data_ptr() - self.start, self.row_bytes)
+        return at if not rest and 0 <= at <= self.rows - rows.shape[0] else None
+
+
+@dataclass
+class Prompts:
+    """A step the op ran on the host, which a CUDA graph's replay does not, as the
+    head's logits find its prompt rows: vLLM asks for the sampled rows' logits
+    first, then for those of slices of the head's input, for prompt logprobs.
+
+    Attributes:
+        rows: Where the step's head input lay.
+        steps: The step's metadata.
+        sampled: The calls for sampled rows since the op ran; a step's prompt rows
+            come after its first.
+    """
+
+    rows: Rows
+    steps: Steps
+    sampled: int = 0
+
+
+def prompted(
+    q: torch.Tensor,
+    sink: torch.Tensor,
+    cache: torch.Tensor,
+    steps: Steps,
+    first: int,
+    vocab: int,
+    fp8: torch.dtype | None,
+    window: int = WHOLE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The first `n` rows of the pointer's buffers, (max_rows, vocab) and
-    (max_rows,): past the buffers' rows, as vLLM's dummy sampler run asks for more
-    rows than requests, rows of no pointer, p_copy 0 and a_sink 1, which leave the
-    head's softmax over the vocabulary but <copy>."""
+    """The pointer's p_copy, (n, vocab), and a_sink, (n,), at the step's tokens
+    `first`, ..., `first` + n - 1, of queries `q`, (n, c), and sinks `sink`, (n,):
+    each attends to its request's tokens before it within `window`, the step's and
+    those of its earlier steps or cached prefix, in float32, `CHUNK` scores at a
+    time. It reads
+    the step's lengths on the host: vLLM asks for prompt rows outside its graphs.
+    Rows past the step's requests, padding, point at nothing."""
+    n, dim = q.shape
+    ends = steps.query_start_loc[1:].tolist()
+    lens = steps.seq_lens.tolist()
+    p_copy = torch.zeros(n, vocab, dtype=torch.float32, device=q.device)
+    a_sink = torch.ones(n, dtype=torch.float32, device=q.device)
+    i = 0
+    while i < n and (r := bisect_right(ends, first + i)) < len(ends):
+        stop = min(n, ends[r] - first)  # the request's rows among these
+        start = lens[r] - (ends[r] - first - i)  # row i's position
+        table = steps.block_table_tensor[r : r + 1]
+        lo = max(start - window, 0)  # the first key its first row may see
+        keyed = torch.arange(lo, max(start + stop - i - 1, lo + 1), device=q.device)
+        keys, tokens = decode(gathered(cache, table, keyed[None]), dim, fp8)
+        keys, tokens = keys[0], tokens[0].clamp(0, vocab - 1)
+        chunk = max(1, CHUNK // max(len(keyed), vocab))
+        for a in range(i, stop, chunk):
+            b = min(stop, a + chunk)
+            at = torch.arange(start + a - i, start + b - i, device=q.device)
+            scores = q[a:b].float() @ keys.T * dim**-0.5
+            seen = (keyed < at[:, None]) & (keyed >= at[:, None] - window)
+            scores = scores.masked_fill(~seen, -torch.inf)
+            every = torch.cat([scores, sink[a:b].float()[:, None]], -1).softmax(-1)
+            p_copy[a:b].scatter_add_(-1, tokens.expand(b - a, -1), every[:, :-1])
+            a_sink[a:b] = every[:, -1]
+        i = stop
+    return p_copy, a_sink
+
+
+def rows_of(
+    p_copy: torch.Tensor, a_sink: torch.Tensor, total: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The first `n` rows of the pointer's buffers, (max_rows, vocab), (max_rows,)
+    and (max_rows,): past the buffers' rows, as vLLM's dummy sampler run asks for
+    more rows than requests, rows of no pointer, p_copy 0, a_sink 1 and a total of
+    1, which leave the head's softmax over the vocabulary but <copy>."""
     have = p_copy.shape[0]
     if n <= have:
-        return p_copy[:n], a_sink[:n]
+        return p_copy[:n], a_sink[:n], total[:n]
     more = n - have
     p_copy = torch.cat([p_copy, p_copy.new_zeros(more, p_copy.shape[1])])
-    return p_copy, torch.cat([a_sink, a_sink.new_ones(more)])
+    ones = a_sink.new_ones(more)
+    return p_copy, torch.cat([a_sink, ones]), torch.cat([total, ones])
 
 
 def mixed(
-    logits: torch.Tensor, p_copy: torch.Tensor, a_sink: torch.Tensor, copy: int
+    logits: torch.Tensor,
+    p_copy: torch.Tensor,
+    a_sink: torch.Tensor,
+    copy: int,
+    total: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The log of the mixture, (R, vocab), from the head's logits, (R, vocab), and
     the pointer's p_copy and a_sink, in float32; -inf at <copy>, which is no token.
+    With `total`, (R,), p_copy and a_sink are masses, of which it is the sum.
 
     With a the softmax's mass on `copy` and p_lm the softmax over the other rows:
     ``log(p_lm (1 - a + a a_sink) + a p_copy)``, the mixture bux's loss scores."""
@@ -206,6 +355,9 @@ def mixed(
     gate = z[:, copy : copy + 1]
     lse = torch.logaddexp(lse_lm, gate)
     log_gate = gate - lse
-    kept = torch.logaddexp(lse_lm - lse, log_gate + a_sink.float()[:, None].log())
+    if total is not None:  # the masses' normalizer, folded into the gate
+        log_gate = log_gate - total.float()[:, None].log()
+    log_sink = a_sink.float()[:, None].log()
+    kept = torch.logaddexp(lse_lm - lse, log_gate + log_sink)
     out = torch.logaddexp(others - lse_lm + kept, log_gate + p_copy.float().log())
     return out.masked_fill(rows == copy, -torch.inf)

@@ -337,7 +337,7 @@ in every run.
 
 | Layers | In vLLM |
 |--------|---------|
-| `embed`, `value_embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping; a copy pointer ([Copy pointer](#copy-pointer)). `value_embed` looks up the step's token ids, and a reader takes its kv heads' columns of the rows. Not yet: a pointer's `window`, or a pointer with speculative decoding |
+| `embed`, `value_embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping; a copy pointer and its `window` ([Copy pointer](#copy-pointer)). `value_embed` looks up the step's token ids, and a reader takes its kv heads' columns of the rows. Not yet: a pointer with speculative decoding |
 | `rmsnorm`, `layernorm`, `dyt`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `conv` | by vLLM's short-conv kernels, its last inputs in vLLM's Mamba cache, as the conv on keys and values; the whole stream on every rank |
 | `short_conv` | LFM2's, `C * conv(B u)`, by the same kernels and state, its channels split over ranks, with or without biases |
@@ -375,23 +375,53 @@ from its mixture, as bux's loss scores it
   model's attention caches, so prefix caching hits as often.
 - **The op:** each step, ``vllm::bux_copy_pointer`` writes the step's rows, then,
   for each request's last token of the step, the one vLLM samples, attends to the
-  request's tokens before it and the sink. In a 16-bit model one Triton launch runs
-  every request, a program each: a pass over its blocks for the softmax's max and
-  sum, and one that adds each position's share into its token's entry of the
-  request's row of a buffer of `max_num_seqs` rows. A float32 model takes PyTorch's
-  path. vLLM splits its graphs around the op, and a step of decoded tokens alone is
-  one CUDA graph.
+  request's tokens before it, within its `window` if it has one, as bux's, and the
+  sink. A window caps the work of a step: it reads that many keys of a request at
+  most. In a 16-bit model one Triton launch reads each key once. A request's
+  positions split over programs, enough for 4 per multiprocessor, and each adds
+  every position's mass into its token's entry of the request's row of a buffer of
+  `max_num_seqs` rows, and the masses' sum into the request's total, which the
+  logits divide by. A mass is its score shifted by a bound the query fixes before
+  any key is read, as the keys are RMS-normed, so no max needs a pass of its own.
+  A pointer gain past about $64/\sqrt{\text{dim}}$ (5.7 at the default 128) could
+  take a mass out of float32's range; such a query takes two passes, its max
+  first, in one program. A float32 model takes PyTorch's path. vLLM splits its
+  graphs around the op, and a step of decoded tokens alone is one CUDA graph.
 - **The logits** that vLLM samples are the log of the mixture, the head's
   soft-capped logits mixed with the pointer's row, in float32; the `<copy>` row's
   are $-\infty$. The log-probabilities of the tokens vLLM samples are the
-  mixture's. A prompt's (`prompt_logprobs`) are not: the pointer points for each
-  request's sampled row alone. Rows past `max_num_seqs`, which vLLM's dummy runs
-  ask for, take the head's softmax over the vocabulary but `<copy>`.
+  mixture's, and so are a prompt's (`prompt_logprobs`): for those rows the head
+  points from each one to its request's tokens before it, the cached prefix's
+  among them, in PyTorch, a chunk of rows at a time. That costs a dense pointer
+  per row vLLM asks prompt logprobs of, outside CUDA graphs, in the steps of
+  requests that ask for them alone. Rows past `max_num_seqs`, which vLLM's dummy
+  runs ask for, take the head's softmax over the vocabulary but `<copy>`.
 - **Weights:** the pointer's projections stay in the model's dtype, whole on every
   rank, under FP8 weights too. Each rank computes the pointer.
+- **Order:** the pointer's sums run in no fixed order, so in bfloat16 two runs may
+  break a near tie between tokens differently, within bux's own bfloat16 spread.
+
+A decoding step's pointer costs less than one attention head's decoding over the
+same keys:
+
+| One step of the pointer's kernel, FP8 cache | Time |
+|---------------------------------------------|------|
+| 8 requests of 16384 keys | 69 µs |
+| 8 requests of 16384 keys, two passes in one program a request | 3589 µs |
+| 64 requests of 16384 keys | 423 µs |
+| 8 requests of 16384 keys, a window of 4096 | 26 µs |
+| FlashAttention's decoding, 8 requests of 16384 keys, a kv head of 64 in bfloat16 | 196 µs |
+
+Measured on 2026-10-29 on one NVIDIA B300 with vLLM 0.32.0 and PyTorch 2.13.0
+(CUDA 13.0) by `scripts/vllm_pointer_bench.py`: keys of 128 channels in blocks of
+16, shuffled, a vocabulary of 50304, each part replayed as a CUDA graph with the L2
+cache flushed between calls. Two passes in one program a request are what a query
+past the shift's range takes (a gain past about $64/\sqrt{\text{dim}}$); FlashAttention's head reads as many
+bytes as a bfloat16 pointer cache, twice an FP8 one's.
 
 transformers' modeling refuses a head with a pointer: generating would need the
 pointer's cache, which its cache classes do not keep.
+
 ## Values from the keys
 
 A `gqa` layer with `k_eq_v` (Gemma 4's global layers) has no value projection.
@@ -835,7 +865,10 @@ a prompt runs the ops between the graph's pieces.
 with perturbed weights. It decodes a batch of prompts of 3 to 64 tokens greedily in
 vLLM, and compares every position with bux: the token vLLM picks, and its
 log-probabilities over the whole vocabulary, for the prompts and for every decoding
-step. bux and vLLM live in separate environments, so the script runs in three steps:
+step. A copy pointer's prompts hold no `<copy>` token, which is no token: its
+mixture drops what the pointer puts on one, and vLLM's log-softmax would give that
+back to the other tokens. bux and vLLM live in separate environments, so the script
+runs in three steps:
 
 ```sh
 JAX_PLATFORMS=cpu python scripts/vllm_parity.py export runs/parity/float32   # bux's
@@ -862,10 +895,9 @@ attention and multi-stream attention residuals (`xsa`, `hyga`, `diff`, `msar`,
 their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `k-eq-v-nope`) and of zero experts (`moe-zero`, `moe-zero-longcat`,
 `moe-zero-norm`) and of the document-local copy feature (`doc-copy`,
-`doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`, over the rows vLLM
-samples) were measured the same way on 2026-10-29, and so were the sparse
-`gqa` and `mla` rows (all but `csa`'s), with each `gqa` indexer's projections in
-one GEMM.
+`doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`, `cplm-window`)
+were measured the same way on 2026-10-29, and so were the sparse `gqa` and `mla`
+rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -921,8 +953,9 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
 | `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
 | `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
-| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own; the sampled rows alone | 7.1e-4 | 0.068 (0.076) | 0.082 |
-| `cplm-128` | the same pointer at its default width of 128 | 2.3e-4 | 0.068 (0.076) | 0.082 |
+| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own, at the rows vLLM samples and the prompts' | 6.7e-6 | 0.074 (0.081) | 0.078 |
+| `cplm-128` | the same pointer at its default width of 128 | 7.2e-6 | 0.073 (0.081) | 0.078 |
+| `cplm-window` | the pointer of `cplm-128` within a window of 12 positions, shorter than 3 of the 4 prompts | 7.2e-6 | 0.073 (0.081) | 0.078 |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |
