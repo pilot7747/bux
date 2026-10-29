@@ -905,7 +905,10 @@ their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `moe-zero-norm`) and of the document-local copy feature (`doc-copy`,
 `doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`, `cplm-window`)
 were measured the same way on 2026-10-29, and so were the sparse `gqa` and `mla`
-rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM.
+rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM, and the
+shared picks on vLLM's sparse GQA attention (`dsa-share-native` and its `-plain`
+case). A case beside KDA has no float32 column: vLLM's KDA kernels are not exact in
+float32.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -950,7 +953,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 2.0 |
 | `dsa-native` | DSA on vLLM's DSA kernels: an indexer of 4 heads of 64, its top 16, one layer that reads its picks | - | 3.8 (4.9) | 3.8 |
 | `dsa-hybrid` | the same on the hybrid's global layer (QK-norm, a gate, the conv on keys and values), beside KDA | - | 0.66 (0.53) | 0.41 |
-| `dsa-share-native` | GLM-5.2's IndexShare on the hybrid's global layer: one indexer's picks read by two later layers, all on vLLM's sparse GQA attention (groups of 4), the `v` port, beside KDA | TBD | TBD | TBD |
+| `dsa-share-native` | GLM-5.2's IndexShare on the hybrid's global layer: one indexer's picks read by two later layers, all on vLLM's sparse GQA attention (groups of 4), the `v` port, beside KDA | - | 1.4 (2.8) | 1.3 |
+| `dsa-share-native-plain` | the same without KDA | 8.1e-6 | 4.2 (3.8) | 4.2 |
 | `qsa-native` | QSA on vLLM's DSA kernels: blocks of 4, 4 heads of 64, partial RoPE | - | 3.1 (5.1) | 3.1 |
 | `msa-native` | MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head | - | 0.088 (0.094) | 0.067 |
 | `mla-dsa-native` | sparse MLA with its indexer on vLLM's DSA kernels (`BUX_VLLM_SPARSE_KERNELS=native`) | - | 3.1 (3.5) | - |
