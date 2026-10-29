@@ -148,6 +148,13 @@ def run(a: argparse.Namespace) -> dict:
     tables = tables_of(analyses, points, metrics, targets, a)
     tables["best"] = best_rows(a, analyses, points, parents, targets, noise, others)
     tables["lr"] = tables["learning_rates"] = fit_points.lr_vertices(runs)
+    longctx = fit_targets.load_longctx(a.targets_longctx) if a.targets_longctx else {}
+    main = next((x for x in analyses if x.metric == "objective"), None)
+    tables["best_longctx"] = (
+        fit_best.longctx_rows(main, longctx, (a.candidates or "").split(","))
+        if longctx and main
+        else []
+    )
     tables["long_context"] = fit_report.long_context(analyses)
     tables["long_summary"] = fit_report.long_summary(tables["long_context"])
     tables["unlimited_summary"] = fit_report.unlimited_summary(analyses, targets)
@@ -158,6 +165,7 @@ def run(a: argparse.Namespace) -> dict:
         "points": points,
         "analyses": analyses,
         "short": short,
+        "longctx": longctx,
         "others": others,
         "wild": wild,
         "excluded": excluded,
@@ -606,6 +614,13 @@ def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) ->
                   ("Against each reference's target of equal measured serving cost. The main numbers hold E at 0.3204; "
                   "the range spans E held at 0.3204 … E fit (unidentified, → 0), E fit within [0.25, 0.35] between them, "
                   "and the serving cost's lower bound where it is measured as an upper one.\n")]  # fmt: skip
+    if tables.get("best_longctx"):
+        ctx = facts["longctx"]
+        parts += ["## Today's best at equal serving cost by context\n",
+                  ("The same laws (objective, E held at 0.3204), at each context's FP8 targets of equal serving cost "
+                  "against the budget model at that context; each family's predicted objective on 1T tokens.\n"),
+                  fit_report.markdown(tables["best_longctx"], fit_best.longctx_columns(ctx)),
+                  *(f"- {line}" for line in fit_best.longctx_notes(ctx, a.longctx_preliminary)), ""]  # fmt: skip
     for key, title in (
         ("leaderboard_objective", "One-change leaderboard (objective)"),
         ("leaderboard_repo_bpb", "Leaderboard (repositories, 16k)"),
@@ -662,6 +677,7 @@ def log_wandb(tables: dict, plots: list[Path], project: str, out: Path) -> None:
         "lr",
         "long_context",
         "best",
+        "best_longctx",
     ):
         rows = tables.get(name, [])
         columns = list(dict.fromkeys(k for r in rows for k in r))
@@ -674,7 +690,7 @@ def log_wandb(tables: dict, plots: list[Path], project: str, out: Path) -> None:
 
 
 def _cell(v: Any) -> Any:
-    if isinstance(v, float) and not math.isfinite(v):
+    if (isinstance(v, float) and not math.isfinite(v)) or v == "—":
         return None
     return v if isinstance(v, int | float | str | bool) or v is None else str(v)
 
@@ -737,6 +753,16 @@ def parser() -> argparse.ArgumentParser:
         "--serve",
         choices=fit_targets.PRECISIONS,
         help="the targets' serving precision; default: fp8 once the file has it",
+    )
+    p.add_argument(
+        "--targets-longctx",
+        type=Path,
+        help="targets-measured-longctx.json: the candidates' and camps' 1T objective at each context's targets",
+    )
+    p.add_argument(
+        "--longctx-preliminary",
+        action="store_true",
+        help="mark the long-context table preliminary (its targets not all in)",
     )
     p.add_argument(
         "--budget", default="B1b", help="the serving budget of a serving-table.json"
