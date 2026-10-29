@@ -691,6 +691,8 @@ JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare runs/parity/float32  # b
 Measured on 2026-10-28 on one and two (TP=2) NVIDIA B300 GPUs, with vLLM 0.32.0,
 PyTorch 2.13.0 (CUDA 13.0), flash-linear-attention 0.6.0 and Python 3.12; bux's
 reference ran on the CPU in float32. vLLM ran with CUDA graphs and `torch.compile` (its default), its own pick of attention backend, Triton's MoE kernels (`--moe-backend triton`), and, in float32, Triton's dots in IEEE float32 (`TRITON_F32_DEFAULT=ieee`).
+The rows of XSA and HyGA (`xsa`, `hyga` and their `-hybrid` cases) were measured
+the same way on 2026-10-29.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -712,10 +714,10 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `query-scale` | `power_scale` and `log_scale` on the queries, a gate's bias per head | 1.2e-5 | 0.13 (0.15) | - |
 | `qk-norm-all-heads` | QK-norm across all heads | 5.7e-6 | 0.057 (0.075) | - |
 | `kv-conv` | the conv on keys and values | 8.6e-6 | 0.12 (0.13) | 0.10 |
-| `xsa` | XSA (`exclusive`), all of each head's part along its value and a learned share of it, a window, sinks, the `v` port | - | - | - |
-| `xsa-hybrid` | learned XSA on the hybrid's global layers under `hc` (no positions, QK-norm, a gate, the conv on keys and values, the `v` port, one kv head), beside KDA | - | - | - |
-| `hyga` | HyGA's gates: the head's own output's at its width, the cross-head gate and sinks; and low-rank with a head bias | - | - | - |
-| `hyga-hybrid` | `xsa-hybrid` with HyGA's output and cross-head gates on its global layers | - | - | - |
+| `xsa` | XSA (`exclusive`), all of each head's part along its value and a learned share of it, a window, sinks, the `v` port | 2.2e-5 | 0.10 (0.096) | 0.083 |
+| `xsa-hybrid` | learned XSA on the hybrid's global layers under `hc` (no positions, QK-norm, a gate, the conv on keys and values, the `v` port, one kv head), beside KDA | - | 0.23 (0.82) | 0.46 |
+| `hyga` | HyGA's gates: the head's own output's at its width, the cross-head gate and sinks; and low-rank with a head bias | 5.7e-6 | 0.082 (0.11) | 0.071 |
+| `hyga-hybrid` | `xsa-hybrid` with HyGA's output and cross-head gates on its global layers | - | 0.34 (0.30) | 0.22 |
 | `conv` | Inkling's shortcut, a conv on branch outputs, `y + conv(y)` | 5.7e-6 | 0.055 (0.085) | - |
 | `short-conv` | LFM2's double-gated short conv beside attention | 6.7e-6 | 0.11 (0.13) | - |
 | `kv-share` | Hymba's cross-layer KV sharing: a windowed layer's keys and values read by the next one or two, a full layer's by one with a window of its own | 1.1e-5 | 0.13 (0.19) | 0.20 |
