@@ -203,6 +203,13 @@ in cudnn-frontend):
 
 - cudnn-frontend gives the GDN kernel no JAX call, so a `buffer_callback` runs cuDNN's
   graph of it on XLA's stream, one device at a time.
+- A graph compiles and loads its kernels the first time it runs on a device, which
+  waits for the device's peers. Inside a step on several GPUs, a peer may be waiting
+  at a collective that this device joins only after the callback returns, and the step
+  hangs. So on a mesh of several devices, each graph first runs once on every device,
+  as the step that runs it traces, while nothing else runs (`fused_delta.warm`): on a
+  B300, up to 4 s for a forward graph and 7 s for a backward one, per device and
+  shape (2026-10-29).
 - The KDA kernel factors each decay through the start of a tile of 16 positions. So it
   loses precision where a tile decays a channel by exp(-86), and overflows at
   exp(-90).
