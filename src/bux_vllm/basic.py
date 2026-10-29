@@ -163,6 +163,7 @@ class Pointer(Layer):
 
     p_copy: torch.Tensor
     a_sink: torch.Tensor
+    total: torch.Tensor
 
     def __init__(self, c: dict, width: int, vocab: int, site: Site):
         super().__init__()
@@ -182,6 +183,7 @@ class Pointer(Layer):
         copy = torch.zeros(rows, vocab, dtype=torch.float32)
         self.register_buffer("p_copy", copy, persistent=False)
         self.register_buffer("a_sink", torch.ones(rows), persistent=False)
+        self.register_buffer("total", torch.ones(rows), persistent=False)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         return {
@@ -199,7 +201,15 @@ class Pointer(Layer):
         k = _rms_normed(self.k(x))
         sink = (q.float() @ self.sink.float()) * self.dim**-0.5
         torch.ops.vllm.bux_copy_pointer(
-            x, q, k, ctx.input_ids, sink, self.p_copy, self.a_sink, self.cache.prefix
+            x,
+            q,
+            k,
+            ctx.input_ids,
+            sink,
+            self.p_copy,
+            self.a_sink,
+            self.total,
+            self.cache.prefix,
         )
 
     def mixed(self, logits: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
@@ -218,13 +228,16 @@ class Pointer(Layer):
             p_copy, a_sink = copying.prompted(
                 q, sink, rows, stash.steps, first, vocab, fp8, window
             )
-        elif (at := _row_in(self.cache.graphed, hidden)) is not None:
-            p_copy, a_sink = copying.rows_of(self.p_copy[at:], self.a_sink[at:], n)
-        else:  # the rows vLLM samples, gathered
-            if stash is not None:
-                stash.sampled += 1
-            p_copy, a_sink = copying.rows_of(self.p_copy, self.a_sink, n)
-        return copying.mixed(logits, p_copy, a_sink, self.copy).to(logits.dtype)
+            out = copying.mixed(logits, p_copy, a_sink, self.copy)
+            return out.to(logits.dtype)
+        at = _row_in(self.cache.graphed, hidden)
+        if at is None and stash is not None:  # the rows vLLM samples, gathered
+            stash.sampled += 1
+        at = at or 0
+        p_copy, a_sink, total = copying.rows_of(
+            self.p_copy[at:], self.a_sink[at:], self.total[at:], n
+        )
+        return copying.mixed(logits, p_copy, a_sink, self.copy, total).to(logits.dtype)
 
 
 def _row_in(graphs: list[copying.Rows], hidden: torch.Tensor) -> int | None:

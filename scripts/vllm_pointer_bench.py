@@ -12,7 +12,10 @@ bfloat16, the blocks shuffled), it prints the microseconds of:
 - **step**: the op's work on the GPU: its rows' write, its buffers' zeroing, the
   kernel;
 - **kernel**: the Triton kernel alone, its tokens spread over the vocabulary, or
-  512 of them, as a text that repeats itself;
+  512 of them, as a text that repeats itself; and its two passes in one program
+  a request, which a query past the shift's range takes (`bux_vllm.copying.shift`),
+  as the kernel took every query before it read each key once; and within a
+  window of 4096;
 - **keys**: the kernel's reads of the keys alone: one pass that scores the queries,
   one program a request as the kernel's;
 - **scatter**: its adds into the vocabulary's rows alone, one a position, with
@@ -40,6 +43,7 @@ from bux_vllm import copying, picks, pointer
 
 VOCAB, DIM, BLOCK, BN = 50304, 128, 16, 64
 REPEATS = 512  # the tokens of a text that repeats itself
+WINDOW = 4096  # nl_cplm_w4k's
 
 
 def timed(fn: Callable[[], object], graph: bool = True) -> float:
@@ -93,13 +97,17 @@ def setup(requests: int, keys: int, fp8: bool, distinct: int) -> SimpleNamespace
         slots=slots.view(requests, keys)[:, -1],  # each request's last, rewritten
         p_copy=torch.zeros(requests, VOCAB, device=dev),
         a_sink=torch.ones(requests, device=dev),
+        total=torch.ones(requests, device=dev),
         logits=torch.randn(requests, VOCAB, device=dev, dtype=torch.bfloat16),
         key_bytes=n * DIM * (1 if fp8 else 2),
     )
 
 
-def kernel(s: SimpleNamespace) -> None:
-    pointer._pointed(s.q, s.sink, s.cache, s.table, s.position, s.p_copy, s.a_sink)
+def kernel(s: SimpleNamespace, gain: float = 1.0) -> None:
+    q = s.q * gain
+    pointer._pointed(
+        q, s.sink, s.cache, s.table, s.position, s.p_copy, s.a_sink, s.total
+    )
 
 
 def step(s: SimpleNamespace) -> None:
@@ -107,6 +115,7 @@ def step(s: SimpleNamespace) -> None:
     rows = copying.encode(s.k, s.tokens[:, -1], s.cache.rows.dtype, s.cache.fp8)
     picks.write(s.cache.rows, s.slots, rows)
     s.p_copy.zero_()
+    s.total.zero_()
     kernel(s)
 
 
@@ -215,9 +224,17 @@ def bench(requests: int, keys: int, fp8: bool) -> None:
     report("step", timed(lambda: step(s)), s.key_bytes)
     report("kernel", timed(lambda: kernel(s)), s.key_bytes)
     report(f"kernel, {REPEATS} tokens", timed(lambda: kernel(r)), r.key_bytes)
+    past = 2 * (copying.TOP + copying.FLOOR) / (2 * copying.KEY_NORM * DIM**0.5)
+    two = timed(lambda: kernel(s, past))
+    report("kernel, two passes in one program a request", two, s.key_bytes)
+    w = SimpleNamespace(**vars(s))
+    w.cache = SimpleNamespace(**vars(s.cache) | {"window": WINDOW})
+    report(f"kernel, a window of {WINDOW}", timed(lambda: kernel(w)))
     out = torch.zeros(requests, device="cuda")
     report("keys: one pass, scored", timed(lambda: keys_only(s, out)), s.key_bytes)
-    report("scatter: acq_rel adds", timed(lambda: scatter(s, False)))
+    report(
+        "scatter: acq_rel adds, as the kernel's were", timed(lambda: scatter(s, False))
+    )
     report("scatter: relaxed adds", timed(lambda: scatter(s, True)))
     report(f"scatter: relaxed adds, {REPEATS} tokens", timed(lambda: scatter(r, True)))
     mix = timed(

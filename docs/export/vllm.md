@@ -377,11 +377,16 @@ from its mixture, as bux's loss scores it
   for each request's last token of the step, the one vLLM samples, attends to the
   request's tokens before it, within its `window` if it has one, as bux's, and the
   sink. A window caps the work of a step: it reads that many keys of a request at
-  most. In a 16-bit model one Triton launch runs every request, a program each: a
-  pass over its blocks for the softmax's max and sum, and one that adds each
-  position's share into its token's entry of the request's row of a buffer of
-  `max_num_seqs` rows. A float32 model takes PyTorch's path. vLLM splits its graphs around the op, and a step of decoded tokens alone is
-  one CUDA graph.
+  most. In a 16-bit model one Triton launch reads each key once. A request's
+  positions split over programs, enough for 4 per multiprocessor, and each adds
+  every position's mass into its token's entry of the request's row of a buffer of
+  `max_num_seqs` rows, and the masses' sum into the request's total, which the
+  logits divide by. A mass is its score shifted by a bound the query fixes before
+  any key is read, as the keys are RMS-normed, so no max needs a pass of its own.
+  A pointer gain past about $64/\sqrt{\text{dim}}$ (5.7 at the default 128) could
+  take a mass out of float32's range; such a query takes two passes, its max
+  first, in one program. A float32 model takes PyTorch's path. vLLM splits its
+  graphs around the op, and a step of decoded tokens alone is one CUDA graph.
 - **The logits** that vLLM samples are the log of the mixture, the head's
   soft-capped logits mixed with the pointer's row, in float32; the `<copy>` row's
   are $-\infty$. The log-probabilities of the tokens vLLM samples are the

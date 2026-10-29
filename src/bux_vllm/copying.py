@@ -192,6 +192,39 @@ def pointed(
 #: The most scores or probabilities of a chunk of prompt rows (`prompted`).
 CHUNK = 2**24
 
+#: A bound on a cached key's norm over sqrt(c): RMS-normed, then rounded to the
+#: cache's dtype, FP8 e4m3's 6.25% the most (`shift`).
+KEY_NORM = 1.1
+#: The most a shifted score may be: e^64 over a million positions stays below
+#: float32's largest.
+TOP = 64.0
+#: How far below 0 a shifted score may be: e^-77 stays well above float32's
+#: smallest normal, e^-87.
+FLOOR = 77.0
+
+
+def shift(q: torch.Tensor, sink: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The shift c of each query's scores, (R,), that keeps every position's mass
+    ``exp(s - c)`` within float32 before any key is read, and whether it does,
+    (R,), as the decode kernel takes them: a score ``q . k / sqrt(c)`` is at most
+    ``bound = |q| KEY_NORM``, the keys being RMS-normed, and at least ``-bound``.
+    With ``c = max(sink, bound - TOP)`` no mass passes e^TOP, and none falls under
+    e^-FLOOR while ``2 bound <= TOP + FLOOR``; masses under the sink's past that
+    weigh nothing next to its 1."""
+    bound = q.float().norm(dim=-1) * KEY_NORM
+    return torch.maximum(sink.float(), bound - TOP), 2 * bound <= TOP + FLOOR
+
+
+def splits(requests: int, longest: int, sms: int, tile: int) -> tuple[int, int]:
+    """The programs each of `requests` splits its `longest` positions over, and the
+    positions of each, a multiple of `tile`: 4 programs a multiprocessor of `sms`
+    at least, as a step of a few requests has few. The step's shape fixes them, as
+    a CUDA graph captures it."""
+    chunks = -(-longest // tile)
+    count = max(1, min(chunks, -(-4 * sms // requests)))
+    per = -(-chunks // count) * tile
+    return -(-longest // per), per
+
 
 @dataclass(frozen=True)
 class Rows:
@@ -287,25 +320,31 @@ def prompted(
 
 
 def rows_of(
-    p_copy: torch.Tensor, a_sink: torch.Tensor, n: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The first `n` rows of the pointer's buffers, (max_rows, vocab) and
-    (max_rows,): past the buffers' rows, as vLLM's dummy sampler run asks for more
-    rows than requests, rows of no pointer, p_copy 0 and a_sink 1, which leave the
-    head's softmax over the vocabulary but <copy>."""
+    p_copy: torch.Tensor, a_sink: torch.Tensor, total: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The first `n` rows of the pointer's buffers, (max_rows, vocab), (max_rows,)
+    and (max_rows,): past the buffers' rows, as vLLM's dummy sampler run asks for
+    more rows than requests, rows of no pointer, p_copy 0, a_sink 1 and a total of
+    1, which leave the head's softmax over the vocabulary but <copy>."""
     have = p_copy.shape[0]
     if n <= have:
-        return p_copy[:n], a_sink[:n]
+        return p_copy[:n], a_sink[:n], total[:n]
     more = n - have
     p_copy = torch.cat([p_copy, p_copy.new_zeros(more, p_copy.shape[1])])
-    return p_copy, torch.cat([a_sink, a_sink.new_ones(more)])
+    ones = a_sink.new_ones(more)
+    return p_copy, torch.cat([a_sink, ones]), torch.cat([total, ones])
 
 
 def mixed(
-    logits: torch.Tensor, p_copy: torch.Tensor, a_sink: torch.Tensor, copy: int
+    logits: torch.Tensor,
+    p_copy: torch.Tensor,
+    a_sink: torch.Tensor,
+    copy: int,
+    total: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The log of the mixture, (R, vocab), from the head's logits, (R, vocab), and
     the pointer's p_copy and a_sink, in float32; -inf at <copy>, which is no token.
+    With `total`, (R,), p_copy and a_sink are masses, of which it is the sum.
 
     With a the softmax's mass on `copy` and p_lm the softmax over the other rows:
     ``log(p_lm (1 - a + a a_sink) + a p_copy)``, the mixture bux's loss scores."""
@@ -316,6 +355,9 @@ def mixed(
     gate = z[:, copy : copy + 1]
     lse = torch.logaddexp(lse_lm, gate)
     log_gate = gate - lse
-    kept = torch.logaddexp(lse_lm - lse, log_gate + a_sink.float()[:, None].log())
+    if total is not None:  # the masses' normalizer, folded into the gate
+        log_gate = log_gate - total.float()[:, None].log()
+    log_sink = a_sink.float()[:, None].log()
+    kept = torch.logaddexp(lse_lm - lse, log_gate + log_sink)
     out = torch.logaddexp(others - lse_lm + kept, log_gate + p_copy.float().log())
     return out.masked_fill(rows == copy, -torch.inf)
