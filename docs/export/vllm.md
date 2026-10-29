@@ -394,15 +394,34 @@ from its mixture, as bux's loss scores it
   points from each one to its request's tokens before it, the cached prefix's
   among them, in PyTorch, a chunk of rows at a time. That costs a dense pointer
   per row vLLM asks prompt logprobs of, outside CUDA graphs, in the steps of
-  requests that ask for them alone. Rows past `max_num_seqs`, which vLLM's dummy runs ask for, take the
-  head's softmax over the vocabulary but `<copy>`.
+  requests that ask for them alone. Rows past `max_num_seqs`, which vLLM's dummy
+  runs ask for, take the head's softmax over the vocabulary but `<copy>`.
 - **Weights:** the pointer's projections stay in the model's dtype, whole on every
   rank, under FP8 weights too. Each rank computes the pointer.
 - **Order:** the pointer's sums run in no fixed order, so in bfloat16 two runs may
   break a near tie between tokens differently, within bux's own bfloat16 spread.
 
+A decoding step's pointer costs less than one attention head's decoding over the
+same keys:
+
+| One step of the pointer's kernel, FP8 cache | Time |
+|---------------------------------------------|------|
+| 8 requests of 16384 keys | 69 µs |
+| 8 requests of 16384 keys, two passes in one program a request | 3589 µs |
+| 64 requests of 16384 keys | 423 µs |
+| 8 requests of 16384 keys, a window of 4096 | 26 µs |
+| FlashAttention's decoding, 8 requests of 16384 keys, a kv head of 64 in bfloat16 | 196 µs |
+
+Measured on 2026-10-29 on one NVIDIA B300 with vLLM 0.32.0 and PyTorch 2.13.0
+(CUDA 13.0) by `scripts/vllm_pointer_bench.py`: keys of 128 channels in blocks of
+16, shuffled, a vocabulary of 50304, each part replayed as a CUDA graph with the L2
+cache flushed between calls. Two passes in one program a request are what a query
+past the shift's range takes (a gain past about $64/\sqrt{\text{dim}}$); FlashAttention's head reads as many
+bytes as a bfloat16 pointer cache, twice an FP8 one's.
+
 transformers' modeling refuses a head with a pointer: generating would need the
 pointer's cache, which its cache classes do not keep.
+
 ## Values from the keys
 
 A `gqa` layer with `k_eq_v` (Gemma 4's global layers) has no value projection.
@@ -878,7 +897,10 @@ their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `moe-zero-norm`) and of the document-local copy feature (`doc-copy`,
 `doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`, `cplm-window`)
 were measured the same way on 2026-10-29, and so were the sparse `gqa` and `mla`
-rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM.
+rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM. The
+copy pointer's float32 rows were measured on prompts that held its `<copy>` token,
+and are the mass its mixture drops on it, which vLLM's log-softmax gives back;
+`vllm_parity.py` keeps `<copy>` out of a pointer's prompts.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -934,9 +956,9 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
 | `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
 | `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
-| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own, at the rows vLLM samples and the prompts' | - | - | - |
-| `cplm-128` | the same pointer at its default width of 128 | - | - | - |
-| `cplm-window` | the pointer of `cplm-128` within a window of 12 positions, shorter than 3 of the 4 prompts | - | - | - |
+| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own, at the rows vLLM samples and the prompts' | 7.1e-4 | 0.073 (0.081) | 0.082 |
+| `cplm-128` | the same pointer at its default width of 128 | 2.3e-4 | 0.073 (0.081) | 0.082 |
+| `cplm-window` | the pointer of `cplm-128` within a window of 12 positions, shorter than 3 of the 4 prompts | 1.4e-3 | 0.073 (0.081) | 0.083 |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |
