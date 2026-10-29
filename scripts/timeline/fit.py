@@ -40,6 +40,8 @@ import fit_targets
 import numpy as np
 from fit_counts import FOLDER, Counts, find, notes
 
+from bux.train.trackers import _module
+
 HERE = Path(__file__).resolve().parent
 MIN_DOF = 2  # replicates' degrees of freedom to trust their noise over --noise
 
@@ -150,11 +152,10 @@ def run(a: argparse.Namespace) -> dict:
     tables["lr"] = tables["learning_rates"] = fit_points.lr_vertices(runs)
     longctx = fit_targets.load_longctx(a.targets_longctx) if a.targets_longctx else {}
     main = next((x for x in analyses if x.metric == "objective"), None)
-    tables["best_longctx"] = (
-        fit_best.longctx_rows(main, longctx, (a.candidates or "").split(","))
-        if longctx and main
-        else []
-    )
+    tables["best_longctx"] = []
+    if longctx and main is not None:
+        candidates: list[str] = str(a.candidates or "").split(",")
+        tables["best_longctx"] = fit_best.longctx_rows(main, longctx, candidates)
     tables["long_context"] = fit_report.long_context(analyses)
     tables["long_summary"] = fit_report.long_summary(tables["long_context"])
     tables["unlimited_summary"] = fit_report.unlimited_summary(analyses, targets)
@@ -664,7 +665,7 @@ def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) ->
 def log_wandb(tables: dict, plots: list[Path], project: str, out: Path) -> None:
     """Log the tables as W&B Tables, and the plots, in a run named ``analysis``
     whose local files go under `out`."""
-    import wandb
+    wandb = _module("wandb", "wandb")
 
     run = wandb.init(
         project=project,

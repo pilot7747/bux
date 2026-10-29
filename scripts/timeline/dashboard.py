@@ -41,11 +41,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import wandb
 import wandb_workspaces.reports.v2 as wr
 import wandb_workspaces.workspaces as ws
 from wandb_workspaces import expr
 from wandb_workspaces.workspaces import internal
+
+from bux.train.trackers import _module
+
+wandb = _module("wandb", "wandb")
 
 PROJECT = "bux-timeline"
 VIEW = "nw-timeline-v"  # the saved view's internal name, by which a rerun updates it
