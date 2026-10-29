@@ -6,6 +6,7 @@ from flax import nnx
 from jaxtyping import Array, Int
 
 from bux import config as cfg
+from bux import kernels
 from bux.architecture import Built, Context, Embedding, Model, NextN, Taps, num_params
 from bux.architecture.graph import Sequence
 from bux.architecture.layers.norm import Norm
@@ -19,11 +20,13 @@ from bux.architecture.residual import (
     ResidualGate,
     sinkhorn,
     sources,
+    widen,
 )
 from bux.lang import compile
 from bux.train.trainer import cast
 
 D, V = 32, 64
+GPU = pytest.mark.skipif(not kernels.gpu(), reason="needs a GPU")
 
 PRELUDE = f"""
 d_model = {D}
@@ -407,6 +410,37 @@ def test_gr_reads_normalized_streams_and_its_read_replaces_the_final_norm():
     assert y.shape == x.shape and not jnp.allclose(y, x)
     logits = m(tokens())
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
+
+
+class Affine(nnx.Module):
+    def __init__(self, d: int):
+        self.lin = nnx.Linear(d, d, rngs=nnx.Rngs(1))
+
+    def __call__(self, x, taps):
+        return self.lin(x)
+
+
+@GPU
+def test_gr_computes_on_a_gpu_as_op_by_op():
+    """A gr branch on a widened stream, its value and gradients jitted, as it runs op
+    by op: before the barriers around f, XLA halved the value on a B300."""
+    n, d = 4, 512
+    gr = GatedResidual(cfg.GatedResidualConfig(rank=64), d, nnx.Rngs(0), Affine(d))
+    graphdef, state = nnx.split(gr)
+    keys = jax.random.split(jax.random.key(0))
+    e = jax.random.normal(keys[0], (8, 128, d))
+    c = jax.random.normal(keys[1], (8, 128, n, d))
+
+    def loss(state, e):
+        return jnp.sum(nnx.merge(graphdef, state)(widen(e, n), Taps()) * c)
+
+    step = jax.value_and_grad(loss, argnums=(0, 1))
+    with jax.default_matmul_precision("highest"):
+        jitted = jax.jit(step)(state, e)
+        with jax.disable_jit():
+            eager = step(state, e)
+    for a, b in zip(jax.tree.leaves(jitted), jax.tree.leaves(eager), strict=True):
+        assert jnp.allclose(a, b, rtol=1e-4, atol=1e-4 * float(jnp.abs(b).max()))
 
 
 @pytest.mark.parametrize("residual", WIDENING)
