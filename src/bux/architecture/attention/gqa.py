@@ -304,6 +304,8 @@ class Attention(SoftmaxAttention):
     loses its part along the query's own value (`exclusive`).
     The heads' outputs then go through `SoftmaxAttention`'s norm, gate, output
     projection and dropout.
+    Under ``mimetic_vo`` its value and output kernels start near a value-output
+    map of ``-beta I`` (`~bux.initializers.mimetic_vo`).
     `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
     the config needs them.
 
@@ -408,6 +410,8 @@ class Attention(SoftmaxAttention):
         self.ve_gate = _value_embed_gate(config, ports, projects_kv, rngs)
         self._exclusion(config, projects_kv)
         self._init_differential(config, width, rngs)
+        if config.mimetic_vo is not None:
+            self._mimetic(config, width, rngs)
 
     def _init_differential(
         self, config: cfg.GQAConfig, width: int, rngs: nnx.Rngs
@@ -440,6 +444,21 @@ class Attention(SoftmaxAttention):
         learned = config.exclusive == "learned"
         zeros = jnp.zeros(self.heads)
         self.xsa_alpha = nnx.Param(zeros, names=("heads",)) if learned else None
+
+    def _mimetic(self, config: cfg.GQAConfig, width: int, rngs: nnx.Rngs) -> None:
+        """Start v's and o's kernels as `~bux.initializers.mimetic_vo` makes them, after
+        every other draw: v's columns of a fused qkv, and o's alone in a layer that
+        reads its kv port, whose values are its writer's."""
+        assert config.mimetic_vo is not None
+        h, g, dv = self.heads, self.kv_heads, self.v_head_dim
+        beta, noise = config.mimetic_vo, config.mimetic_noise
+        v, o = initializers.mimetic_vo(width, h, g, dv, beta, noise, rngs.params())
+        self.o.kernel[...] = o
+        if self.v is not None:
+            self.v.kernel[...] = v
+        elif self.qkv is not None:
+            start = (self.query_heads + g) * self.head_dim  # after q and k
+            self.qkv.kernel[...] = self.qkv.kernel[...].at[:, start:].set(v)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         """Attend each position to those before it in its document, and to itself.

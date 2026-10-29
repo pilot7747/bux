@@ -681,6 +681,25 @@ class GQAConfig(QuadraticAttentionConfig):
             raise ValueError(f"gqa: differential with {', '.join(given)} not yet")
         return self
 
+    # Mimetic init of the values and the output at this beta (modded-nanogpt's 0.05;
+    # Trockman & Kolter, 2023): v's and o's kernels start as blocks of +sqrt(beta)
+    # and -sqrt(beta) identities, so that the layer's value-output map starts at
+    # -beta I, plus noise; with kv heads, each of a group's query heads takes 1 / its
+    # group's size of it. None: as the init starts them.
+    mimetic_vo: Annotated[float, Field(gt=0)] | None = None
+    mimetic_noise: float = 0.01  # The std of the noise on v and o under mimetic_vo.
+
+    @model_validator(mode="after")
+    def _mimetic(self) -> Self:
+        """Check that the noise of the mimetic init comes with it."""
+        if self.mimetic_noise != 0.01 and self.mimetic_vo is None:
+            raise ValueError("mimetic_noise sets the init that mimetic_vo adds")
+        if self.mimetic_vo is not None and self.k_eq_v:
+            raise ValueError(
+                "gqa: mimetic_vo starts the v projection, which k_eq_v has not"
+            )
+        return self
+
 
 class MLAConfig(QuadraticAttentionConfig):
     """Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear).

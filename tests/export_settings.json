@@ -72,6 +72,8 @@
   "kv_conv_size",
   "log_scale",
   "log_scale_floor",
+  "mimetic_noise",
+  "mimetic_vo",
   "num_heads",
   "num_kv_heads",
   "output_bias",

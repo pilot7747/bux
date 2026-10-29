@@ -61,6 +61,7 @@ model = embed block^12 norm head(tied=true)
 | `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
 | `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
 | `differential` | `false` | two query heads for each output head, the second's map subtracted from the first's ([below](#differential-attention-diff-v2)) (DIFF V2) |
+| `mimetic_vo`, `mimetic_noise` | `none`, `0.01` | values and output started at a value-output map of $-\beta I$, plus noise ([Initialization](initialization.md#mimetic-values-and-output)) (modded-nanogpt) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):
