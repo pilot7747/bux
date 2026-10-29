@@ -413,6 +413,11 @@ document.
 - **Cost.** A decoded token reads its request's tokens once: about 4 bytes a token
   of context, from vLLM's token ids in host memory, which the GPU reads in place.
 
+On one B300 (2026-10-29, vLLM 0.32.0), the hybrid at a width of 3328 with the
+feature, FP8 weights and an FP8 KV cache served 1948 sessions an hour under the
+agentic load of [Schemes on a B300](#schemes-on-a-b300), against 1985 without it:
+1.9% fewer.
+
 ## Zero experts
 
 An `moe` with zero experts (`num_zero_experts`) routes once, by bux's rule, in the

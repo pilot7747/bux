@@ -339,6 +339,12 @@ adds to every copy; before the final norm, `merge` first, so that it adds once. 
 378 matches on its tokenizer's normalized classes of tokens (case and spacing);
 bux's matches on the tokens.
 
+On a KDA hybrid at a width of 512, with hyper-connections, the feature at both
+sites lowered the held-out objective by 0.52%: by 0.53%, 0.62% and 0.40% at seeds 0,
+1 and 2 (503M tokens, B300s, 2026-10-29). Served in vLLM at a
+width of 3328, with FP8 weights and an FP8 KV cache, it costs 1.9% of the sessions
+per GPU ([The document-local copy feature](../export/vllm.md#the-document-local-copy-feature)).
+
 ## Elementwise layers
 
 | Layer | What it does | Settings |
