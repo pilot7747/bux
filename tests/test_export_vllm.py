@@ -3079,6 +3079,81 @@ def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
         np.testing.assert_allclose(got[finite], want[i][finite], rtol=1e-5, atol=1e-5)
 
 
+def test_the_pointer_s_steps_replayed_as_a_graph_sample_bux_s_mixture() -> None:
+    """vLLM's steps as the op takes them: two prompts in a step, then steps of their
+    decoded tokens and a padded request, as one CUDA graph replays them, its
+    metadata the capture's and vLLM's buffers refilled in place. Each request's
+    row, written then pointed, mixes to bux's mixture at its last token."""
+    from bux.architecture import copy as bux_copy
+
+    source = (
+        "d_model = 32\nvocab_size = 64\n"
+        "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
+        "model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim=16))"
+    )
+    model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
+    tokens = jax.random.randint(jax.random.key(1), (2, 10), 0, 6)
+    [head] = model.heads(tokens)
+    pointer = head.pointer
+    assert pointer is not None
+    want = np.asarray(bux_copy.log_probs(head))
+    q, k, sink = (
+        torch.from_numpy(np.array(a, np.float32))
+        for a in (pointer.query, pointer.key, pointer.sink)
+    )
+    logits = torch.from_numpy(np.array(head.projection(head.hidden), np.float32))
+    ids = torch.from_numpy(np.array(tokens))
+    size, length = 4, 12
+    cache = torch.zeros(8, 1, size, copying.row_width(16))
+    table = torch.tensor([[5, 2, 7], [1, 6, 3], [0, 0, 0]], dtype=torch.int32)
+    starts = torch.zeros(4, dtype=torch.int32)  # vLLM's buffers, refilled in place
+    lens = torch.zeros(3, dtype=torch.int32)
+    slots = torch.full((16,), -1)
+
+    def slot(r: int, at: int) -> int:
+        return int(table[r, at // size]) * size + at % size
+
+    def point(steps: copying.Steps, at: list[tuple[int, int]]) -> torch.Tensor:
+        """Run the op's float32 path on the step of the (request, position) `at`,
+        padding past them; return the mixture of each request's last."""
+        pad = steps.num_actual_tokens - len(at)
+        rows = [r * 10 + p for r, p in at] + [0] * pad
+        flat = (x.reshape(20, *x.shape[2:])[rows] for x in (q, k, ids, sink))
+        q_, k_, ids_, sink_ = flat
+        q_, sink_, table_, position = copying.stepped(
+            cache, steps, q_, k_, ids_, sink_, steps.requests, None
+        )
+        p_copy, a_sink = copying.pointed(
+            q_, sink_, cache, table_, position, 64, None, length
+        )
+        p_copy, a_sink = copying.rows_of(p_copy, a_sink, 2)
+        last = torch.stack([logits[r, max(p for s, p in at if s == r)] for r in (0, 1)])
+        return copying.mixed(last, p_copy, a_sink, 63)
+
+    def check_rows(got: torch.Tensor, positions: tuple[int, int]) -> None:
+        for r, p in enumerate(positions):
+            finite = np.isfinite(want[r, p])
+            assert (np.isfinite(got[r].numpy()) == finite).all()
+            np.testing.assert_allclose(
+                got[r].numpy()[finite], want[r, p][finite], rtol=1e-5, atol=1e-5
+            )
+
+    graph = copying.Steps(slots[:3], table, 3, starts, lens)
+    point(graph, [(0, 0), (1, 0)])  # the capture's run, of no request
+    prompts = [(0, p) for p in range(4)] + [(1, p) for p in range(6)]
+    starts[:3] = torch.tensor([0, 4, 10])
+    lens[:2] = torch.tensor([4, 6])
+    slots[:10] = torch.tensor([slot(r, p) for r, p in prompts])
+    eager = copying.Steps(slots[:10], table[:2], 10, starts[:3], lens[:2])
+    check_rows(point(eager, prompts), (3, 5))
+    for step in range(4):
+        a, b = 4 + step, 6 + step
+        starts.copy_(torch.tensor([0, 1, 2, 2]))
+        lens.copy_(torch.tensor([a + 1, b + 1, 0]))
+        slots[:3] = torch.tensor([slot(0, a), slot(1, b), -1])
+        check_rows(point(graph, [(0, a), (1, b)]), (a, b))
+
+
 def test_rows_past_the_pointer_s_buffers_take_the_softmax_but_copy() -> None:
     """vLLM's dummy sampler run asks compute_logits for more rows than max_num_seqs:
     those rows mix no pointer, the head's softmax over every row but <copy>."""

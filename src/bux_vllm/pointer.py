@@ -7,7 +7,8 @@ token vLLM samples, attends to the request's tokens before it and the sink, and
 writes p_copy, a row of the vocabulary, and a_sink into buffers that the head's
 `logits` mixes with its softmax (`bux_vllm.copying.mixed`). vLLM splits its
 piecewise CUDA graphs around the op, as around attention, and captures a step of
-decoded tokens alone as one graph (`sparse.PagedMetadataBuilder`).
+decoded tokens alone as one graph, whose replays read each step's requests from
+vLLM's buffers (`bux_vllm.copying.Steps`).
 
 In a 16-bit model a Triton kernel attends, one program a request: a pass over the
 request's blocks for the softmax's max and sum, then one that adds each position's
@@ -17,7 +18,6 @@ path, which gathers the request's rows first.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -35,34 +35,15 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from . import copying, picks, sparse
+from . import copying, sparse
 
 #: The op, as vLLM's compilation names it.
 OP = "vllm::bux_copy_pointer"
 
 
-@dataclass
-class Steps:
-    """A step's tokens, as the pointer's op reads them.
-
-    Attributes:
-        slot_mapping: Each token's slot, (T,); -1 for padding.
-        block_table_tensor: Each request's blocks, (R, blocks).
-        num_actual_tokens: The step's tokens, padding left out.
-        last: Each request's last token in the step, (R,), which vLLM samples.
-        position: That token's position in its request, (R,).
-    """
-
-    slot_mapping: torch.Tensor
-    block_table_tensor: torch.Tensor
-    num_actual_tokens: int
-    last: torch.Tensor
-    position: torch.Tensor
-
-
-class StepsBuilder(AttentionMetadataBuilder[Steps]):
-    """Gives a `PointerCache` the step's `Steps`: each request's last token is the
-    one before the next request's first, at the position before its length. A step
+class StepsBuilder(AttentionMetadataBuilder[copying.Steps]):
+    """Gives a `PointerCache` the step's `bux_vllm.copying.Steps`: views of vLLM's
+    buffers, which the op reads each request's last token and position from. A step
     of decoded tokens alone is one CUDA graph; the op reads nothing on the CPU."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
@@ -80,20 +61,19 @@ class StepsBuilder(AttentionMetadataBuilder[Steps]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> Steps:
+    ) -> copying.Steps:
         return self._steps(common_attn_metadata)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
-    ) -> Steps:
+    ) -> copying.Steps:
         return self._steps(common_attn_metadata)
 
-    def _steps(self, cm: CommonAttentionMetadata) -> Steps:
-        requests = cm.num_reqs
-        last = cm.query_start_loc[1 : requests + 1] - 1
-        position = cm.seq_lens[:requests] - 1
-        return Steps(
-            cm.slot_mapping, cm.block_table_tensor, cm.num_actual_tokens, last, position
+    def _steps(self, cm: CommonAttentionMetadata) -> copying.Steps:
+        r = cm.num_reqs
+        starts, lens = cm.query_start_loc[: r + 1], cm.seq_lens[:r]
+        return copying.Steps(
+            cm.slot_mapping, cm.block_table_tensor, cm.num_actual_tokens, starts, lens
         )
 
 
@@ -172,22 +152,20 @@ def copy_pointer(
     if metas is None or layer_name not in metas:
         return
     cache = get_forward_context().no_compile_layers[layer_name]
-    steps: Steps = metas[layer_name]
-    n = steps.num_actual_tokens
-    rows = copying.encode(k[:n], tokens[:n], cache.dtype, cache.fp8)
-    picks.write(cache.rows, steps.slot_mapping[:n], rows)
+    steps: copying.Steps = metas[layer_name]
     # Every request's, but past the buffers' rows, which vLLM's runs within
     # max_num_seqs never reach.
-    requests = min(steps.last.shape[0], p_copy.shape[0])
-    last = copying.sampled(steps.last[:requests], q.shape[0])
-    table = steps.block_table_tensor[:requests]
+    requests = min(steps.requests, p_copy.shape[0])
+    q, sink, table, position = copying.stepped(
+        cache.rows, steps, q, k, tokens, sink, requests, cache.fp8
+    )
     if q.dtype == torch.float32:
         copy, share = copying.pointed(
-            q[last],
-            sink[last],
+            q,
+            sink,
             cache.rows,
             table,
-            steps.position[:requests],
+            position,
             p_copy.shape[1],
             cache.fp8,
             cache.longest,
@@ -196,8 +174,7 @@ def copy_pointer(
         a_sink[:requests].copy_(share)
         return
     p_copy[:requests].zero_()
-    position = steps.position[:requests]
-    _pointed(q[last], sink[last], cache, table, position, p_copy, a_sink)
+    _pointed(q, sink, cache, table, position, p_copy, a_sink)
 
 
 def _pointed(

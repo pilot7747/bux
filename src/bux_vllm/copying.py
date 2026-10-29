@@ -14,10 +14,43 @@ head's logits into the log of the mixture, which vLLM then samples:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
+
+from . import picks
 
 #: The base-256 digits of a token in a row of the cache: ids below 2^24.
 DIGITS = 3
+
+
+@dataclass
+class Steps:
+    """A step's tokens, as the pointer's op reads them: views of vLLM's buffers,
+    which every replay of a CUDA graph of decoded tokens reads in place, and the
+    counts the graph was captured with. The op works each request's last token and
+    its position out of them (`stepped`): a tensor made with the metadata would be
+    the capture's at every replay.
+
+    Attributes:
+        slot_mapping: Each token's slot, (T,); -1 for padding.
+        block_table_tensor: Each request's blocks, (R, blocks).
+        num_actual_tokens: The step's tokens, padding left out.
+        query_start_loc: Each request's first token in the step, then the step's
+            end, (R + 1,).
+        seq_lens: Each request's length with the step's tokens, (R,).
+    """
+
+    slot_mapping: torch.Tensor
+    block_table_tensor: torch.Tensor
+    num_actual_tokens: int
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+
+    @property
+    def requests(self) -> int:
+        """The step's requests, padding in them."""
+        return self.seq_lens.shape[0]
 
 
 def row_width(dim: int) -> int:
@@ -71,6 +104,29 @@ def gathered(cache: torch.Tensor, table: torch.Tensor, length: int) -> torch.Ten
     columns = (at // size).clamp(max=table.shape[1] - 1)
     blocks = table[:, columns].long().clamp(0, cache.shape[0] - 1)
     return cache[blocks, 0, at % size]
+
+
+def stepped(
+    cache: torch.Tensor,
+    steps: Steps,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    tokens: torch.Tensor,
+    sink: torch.Tensor,
+    rows: int,
+    fp8: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Write the step's keys `k`, (T, c), and `tokens`, (T,), into the paged
+    `cache`; return the query, (rows, c), and sink, (rows,), of each of its first
+    `rows` requests' last token, the one vLLM samples, with the request's blocks
+    and that token's position, before which its keys lie."""
+    n = steps.num_actual_tokens
+    picks.write(
+        cache, steps.slot_mapping[:n], encode(k[:n], tokens[:n], cache.dtype, fp8)
+    )
+    last = sampled(steps.query_start_loc[1 : rows + 1] - 1, q.shape[0])
+    position = steps.seq_lens[:rows] - 1
+    return q[last], sink[last], steps.block_table_tensor[:rows], position
 
 
 def sampled(last: torch.Tensor, tokens: int) -> torch.Tensor:
