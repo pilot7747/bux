@@ -1345,7 +1345,7 @@ class _Entry:
 
 
 # Layers that act on every copy of a widened residual stream instead of reading it.
-_ON_COPIES = (cfg.EngramConfig, cfg.NextNConfig)
+_ON_COPIES = (cfg.EngramConfig, cfg.NextNConfig, cfg.DocCopyConfig)
 
 
 class _Lowering:
@@ -1355,7 +1355,7 @@ class _Lowering:
         self.ev = ev
         self.d_model = d_model
         # Whether the residual algebra widens the stream between branches, and whether
-        # into copies of it (attnres keeps the branch outputs so far instead).
+        # into copies of it (attnres and msar keep the branch outputs so far instead).
         self.widened = residual is not None and residual.type != "vpgate"
         self.copies = residual is not None and residual.type in ("hc", "mhc", "gr")
         self.depth = 0  # residual branches the node being lowered is inside
@@ -1620,9 +1620,10 @@ class _Lowering:
                 "nothing can follow the LM head",
                 "to go on after a head, read a tap: @h norm head $h ...",
             )
-        on_streams = isinstance(config, cfg.MergeConfig) or (
-            self.copies and isinstance(config, _ON_COPIES)
-        )
+        # A value embedding leaves the stream as it is, widened or not.
+        on_streams = isinstance(
+            config, (cfg.MergeConfig, cfg.ValueEmbeddingConfig)
+        ) or (self.copies and isinstance(config, _ON_COPIES))
         if width == "streams" and not on_streams:
             # The layer needs one stream: read the widened one back into one first.
             merge = ir.Layer(config=cfg.MergeConfig(), width="streams")
@@ -1640,7 +1641,7 @@ class _Lowering:
                 raise self.error(
                     "merge reads a widened residual stream back into one, but there "
                     "is none here",
-                    "widen it with residual = hc(...), mhc(...), gr(...) or attnres(...)"
+                    "widen it with residual = hc(...), mhc(...), gr(...), attnres(...) or msar(...)"
                     if not self.widened
                     else None,
                 )

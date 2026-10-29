@@ -32,7 +32,7 @@ Seq ['Layer', 'Repeat', 'Layer', 'Layer']
 |-------|-----------|
 | `d_model` | the width of the residual stream |
 | `vocab_size` | the vocabulary, or `None` |
-| `residual` | the residual algebra (`hc`, `mhc`, `gr`, `attnres`, `vpgate`), or `None` for plain additive residuals |
+| `residual` | the residual algebra (`hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`), or `None` for plain additive residuals |
 | `init` | how the weight matrices start, by role ([Initialization](initialization.md)), or `None` for the default |
 | `graph` | the model, a tree of nodes |
 
@@ -251,8 +251,8 @@ embedding, which tied heads and `nextn` read).
 A residual branch inside another is always the plain `x + f(x)`. One outside any
 other is the architecture's residual algebra's, if it sets one
 (`bux.architecture.residual`): `hc`, `mhc` and `gr` widen the stream into n copies,
-an array `(b, t, n, d)`, and `attnres` keeps the embedding and every branch output so
-far. `embed` widens its output, and `merge` reads the stream back into one
+an array `(b, t, n, d)`, and `attnres` and `msar` keep the embedding and every branch
+output so far. `embed` widens its output, and `merge` reads the stream back into one
 ([Residual algebras](../language/residual-algebras.md)).
 
 ### Repeats: unrolled, scanned, pipelined
@@ -264,8 +264,8 @@ far. `embed` widens its output, and `merge` reads the stream back into one
   leading `layers` dimension, and runs them by `jax.lax.scan`: a scan for each run of
   passes that trace alike. Passes stack only if they have one graph and the same
   variable shapes, share no module or variable (a `shared` definition, `nextn`'s
-  embedding), and leave the stream as wide as they found it (which `attnres`'s
-  outputs do not); otherwise they run in a row.
+  embedding), and leave the stream as wide as they found it (which `attnres`'s and
+  `msar`'s outputs do not); otherwise they run in a row.
 - With `mesh.stage` above 1, the longest scanned repeat outside any other is
   **pipelined** over the stages: it splits its stacked layers over `stage`, and the
   run's `methods.pipeline` runs them. A model with no scanned repeat raises: repeat

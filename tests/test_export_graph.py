@@ -42,6 +42,11 @@ ALGEBRAS = {
     "attnres block under way": under(
         "attnres(block_size=4, norm_eps=1e-5)", "model = embed block^3 rmsnorm head"
     ),
+    "msar": under("msar(kernel_sizes=[2, 3])"),
+    "msar blocks": under("msar(block_size=2)", "model = embed block^3 head"),
+    "msar block under way": under(
+        "msar(block_size=3, norm_eps=1e-5)", "model = embed block^3 rmsnorm head"
+    ),
     "vpgate": under("vpgate(temperature=0.5)"),
     "vpgate clamped": under("vpgate(eps=0.6)"),
     "taps of the streams": under(
@@ -85,6 +90,10 @@ NEXTN = {
         "mhc(expansion=2)",
         MTP + "model = embed block merge rmsnorm @h out $h nextn block rmsnorm out",
     ),
+    "under msar": under(
+        "msar(block_size=2)",
+        MTP + "mtp = $h nextn block out\nmodel = embed block^2 @h out mtp",
+    ),
     "single pass": under(
         "mhc(expansion=2, single_pass=true)",
         MTP + "mtp = $h nextn block out\nmodel = embed block^2 @h out mtp",
@@ -125,6 +134,18 @@ ENGRAM = {
         "model = embed block mem block head",
     ),
     "no attention": engram(model="embed mem [rmsnorm ffn] mem rmsnorm head"),
+}
+
+#: The document-local copy feature at PR 378's two sites, on one stream and on hc's
+#: copies, on prompts of few tokens that repeat.
+DOC_COPY = {
+    "doc copy": BLOCK
+    + "model = embed doc_copy(copy=@c) block^2 doc_copy(gain=1, copy=$c!) rmsnorm head",
+    "doc copy, short contexts, on the streams": under(
+        "hc(expansion=2)",
+        "model = embed doc_copy(lengths=[1, 2, 3], counts=2, copy=@c) block^2 merge"
+        " doc_copy(gain=1, copy=$c!) rmsnorm head",
+    ),
 }
 
 GRAPH = {
@@ -277,3 +298,8 @@ def test_engram_hashes_as_bux_builds_it() -> None:
 def test_nextn_pads_past_the_row_as_bux_does() -> None:
     """A row shorter than the tokens ahead embeds token 0 for all of them."""
     check.compare(compile(NEXTN["fresh, three times"]), length=2, steps=2).check()
+
+
+@pytest.mark.parametrize("source", DOC_COPY.values(), ids=DOC_COPY.keys())
+def test_doc_copy_exports(source: str) -> None:
+    check.compare(compile(source)).check()

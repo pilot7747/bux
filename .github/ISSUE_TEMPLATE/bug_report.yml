@@ -1,0 +1,41 @@
+name: Bug report
+description: bux fails, or trains or exports something other than what the file says.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The smallest `.bux` file that shows the bug helps most.
+        For a security vulnerability, use the security policy's private report instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what bux did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The `.bux` file, or its lines that differ from an example, and the command you ran.
+      placeholder: |
+        $ uv run bux train examples/experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The full output, traceback included.
+      render: text
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        The output of `uv run python -c "import jax; jax.print_environment_info()"`,
+        the commit of bux (`git rev-parse --short HEAD`), and the GPUs and nodes it ran on.
+      render: text
+    validations:
+      required: true

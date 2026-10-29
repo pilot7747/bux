@@ -504,11 +504,13 @@ class Segment:
         tokens: The queries among the step's tokens.
         requests: Their requests among the batch's, one for one request's.
         keys: How many key positions of its requests to read, at least.
+        decoding: Whether they are the step's decoded tokens, one a request.
     """
 
     tokens: slice
     requests: slice
     keys: int
+    decoding: bool = False
 
 
 def segments(
@@ -517,7 +519,8 @@ def segments(
     """The step's queries by `Segment`: its first `decodes` tokens, one a request
     (vLLM puts the decoded ones first), together over `longest` keys at most; then
     each prompt chunk's, from its first token, tokens, request and keys."""
-    out = [Segment(slice(0, decodes), slice(0, decodes), longest)] if decodes else []
+    first = Segment(slice(0, decodes), slice(0, decodes), longest, decoding=True)
+    out = [first] if decodes else []
     for start, n, request, keys in prompts:
         out.append(Segment(slice(start, start + n), slice(request, request + 1), keys))
     return out

@@ -144,6 +144,8 @@ its values, and every later one mixes them in as `0.5 v + 0.5 v1`. The
 | `kv` | {bux}`gqa`, {bux}`csa` | the keys and values (for `csa`, the compressed latents with the indexer's keys) | uses them instead of computing its own (YOCO, CLA) |
 | `index` | {bux}`gqa`, {bux}`mla`, {bux}`csa` | the top-k of the sparse indexer | attends to them instead of running its own indexer (IndexCache in GLM-5, DeepSeek-V4.1) |
 | `candidates` | {bux}`csa` | coarse blocks of compressed positions | its indexer selects only inside them (DeepSeek-V4.1) |
+| `copy` | {bux}`doc_copy` | the copy vector of the candidate next tokens | adds it by a gain of its own (modded-nanogpt PR 378's second site) |
+| `ve` | {bux}`value_embed` writes, {bux}`gqa` reads | the input tokens' rows of the table | adds them to the layer's values by a gate (modded-nanogpt's value embeddings) |
 
 Hymba shares keys and values between neighbouring sliding-window layers
 (`examples/architectures/hymba.bux`). The layer that computes them exports them

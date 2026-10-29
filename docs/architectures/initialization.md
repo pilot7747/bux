@@ -95,9 +95,40 @@ init = normal: normal
 
 - a std that depends on the layer's index (torchtitan's Llama, OLMo 1);
 - one projection started apart from the others of its role (T5's queries,
-  modded-nanogpt's MLP down alone);
+  modded-nanogpt's MLP down alone), but attention's values and output together,
+  which `gqa`'s `mimetic_vo` starts ([below](#mimetic-values-and-output));
 - μP and its successors, which scale the forward pass and each role's learning rate
   as well as the init.
+
+(mimetic-values-and-output)=
+## Mimetic values and output
+
+`gqa(mimetic_vo=beta)` starts a layer's value and output projections so that its
+value-output map is $-\beta I$ (modded-nanogpt's mimetic V-O init, after Trockman &
+Kolter, 2023, who find trained attention has that structure). Attention then
+subtracts a little of what each query attends to from its first step, where it
+otherwise adds noise. modded-nanogpt takes $\beta = 0.05$ on every attention layer
+and found $0.1$ or more unstable:
+
+```bux
+attn = gqa(num_heads=8, num_kv_heads=2, qk_norm=norm, gated=true, mimetic_vo=0.05)
+```
+
+- **Values:** value head $j$ reads the stream's channels $j\,d_v$ to $(j + 1)\,d_v$,
+  times $\sqrt\beta$.
+- **Output:** each query head writes its output back onto its value head's
+  channels, times $-\sqrt\beta / n$, where $n$ is the number of query heads in a kv
+  head's group. A head attending to itself alone subtracts $\beta / n$ of those
+  channels, and the group $\beta$.
+- **Noise:** both projections then take $\mathcal{N}(0, \sigma^2)$ in place of
+  the init's draw, `mimetic_noise` $\sigma$ (0.01, the source's).
+
+With as many kv heads as heads tiling the width, this is the source's init exactly:
+each head's product is $-\beta I$ and so is the layer's. With fewer kv heads the
+layer subtracts $\beta$ of the channels its value heads read, `num_kv_heads *
+v_head_dim` of them, and nothing of the rest. The source starts its queries and keys
+its own way too; bux leaves them to `init`. The draws come after the layer's others,
+from the same seed ({py:func}`bux.initializers.mimetic_vo`).
 
 ## What the papers found
 

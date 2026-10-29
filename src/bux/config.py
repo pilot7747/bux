@@ -229,7 +229,8 @@ class MoEConfig(Config):
     shared experts, if any, take every token. A loss, a bias or both balance the
     experts' loads (`load_balancing`). The run's ``methods.moe`` says how the experts
     run: every expert on every token (``dense``), each on its own tokens
-    (``sorted``, the default), or over devices by expert parallelism.
+    (``sorted``, the default), or over devices by expert parallelism. Zero experts
+    (`num_zero_experts`, LongCat-Flash) let a token go through fewer FFN experts.
     """
 
     type: Literal["moe"] = "moe"
@@ -269,6 +270,9 @@ class MoEConfig(Config):
     # more (DeepSeek-V3). smebu moves the same bias by a step that shrinks as an expert's
     # load nears the mean: tanh(bias_softclamp * (mean - load) / mean) times the rate,
     # centered over the experts and averaged by a momentum of bias_momentum (Trinity).
+    # With zero experts, aux_free moves each FFN expert's bias by LongCat-Flash's rule
+    # instead, the rate times (1 - load / target) toward ffn_experts_per_token's share
+    # of the picks, and the zero experts' bias stays 0.
     load_balancing: Literal["aux_loss", "aux_free", "smebu"] = "aux_loss"
     # How far the bias moves each training step, for each expert: aux_free's step, and
     # SMEBU's largest (Trinity Large: 5e-4).
@@ -283,7 +287,8 @@ class MoEConfig(Config):
     bias_momentum: Annotated[float, Field(ge=0, lt=1)] = 0.5
     # Weight of each layer's balance loss, E * sum_e f_e P_e, where f_e is the fraction
     # of top-k picks that go to expert e and P_e its mean score, normalized over the
-    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with a bias. Every
+    # experts (Switch; DeepSeek-V3, eqs. 17-20); with zero experts, LongCat-Flash's,
+    # the zero experts one more group (eqs. 3-5). None -> 1e-2, or 0 with a bias. Every
     # layer adds its own, as in Megatron-LM. transformers pools the layers into one loss
     # and counts tokens, not picks, so its coefficient c is about c * top_k / layers.
     aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
@@ -302,12 +307,59 @@ class MoEConfig(Config):
     # The shared experts are weighted by the router too, normalized with the top-k
     # (Inkling); otherwise they are added with weight 1.
     shared_expert_sink: bool = False
+    # Zero-computation experts (LongCat-Flash): identity experts the router scores
+    # after the routed ones, each the token as it is, times its weight. A token picks
+    # its top_k among both, so it goes through fewer FFN experts than top_k.
+    num_zero_experts: Annotated[int, Field(ge=0)] = 0
+    # The FFN experts a token goes through on average, which aux_free's bias steers
+    # toward and the balance loss weighs by (LongCat's K_e); None -> top_k *
+    # num_experts / (num_experts + num_zero_experts), what uniform picks give.
+    ffn_experts_per_token: float | None = None
+
+    @model_validator(mode="after")
+    def _zero_experts(self) -> Self:
+        """Check the zero experts' settings, and that they balance by a rule that
+        keeps them."""
+        if not self.num_zero_experts:
+            if self.ffn_experts_per_token is not None:
+                raise ValueError("ffn_experts_per_token needs num_zero_experts")
+            return self
+        budget = self.ffn_budget
+        if not 0 < budget < self.top_k:
+            raise ValueError(
+                f"ffn_experts_per_token={budget} is not between 0 and top_k={self.top_k}"
+            )
+        refused = [
+            name
+            for name, on in (
+                ("load_balancing=smebu", self.load_balancing == "smebu"),
+                ("center_bias", self.center_bias),
+                ("num_groups", self.num_groups > 1),
+            )
+            if on
+        ]
+        if refused:
+            raise ValueError(
+                f"num_zero_experts with {', '.join(refused)}: the zero experts' bias "
+                "stays 0, which centering would move, and they are in no group"
+            )
+        return self
+
+    @property
+    def ffn_budget(self) -> float:
+        """`ffn_experts_per_token`, or its default: the FFN experts' share of the
+        top-k, ``top_k`` without zero experts."""
+        if self.ffn_experts_per_token is not None:
+            return self.ffn_experts_per_token
+        n = self.num_experts
+        return self.top_k * n / (n + self.num_zero_experts)
 
     @model_validator(mode="after")
     def _groups(self) -> Self:
         """Check that the experts split into groups that hold the top-k."""
         n, groups, picked = self.num_experts, self.num_groups, self.top_k_groups
-        if n % groups or picked > groups or self.top_k > picked * (n // groups):
+        scored = n + self.num_zero_experts  # in one group, with zero experts
+        if n % groups or picked > groups or self.top_k > picked * (scored // groups):
             raise ValueError(
                 f"{groups} groups of {n} experts, {picked} of them picked, cannot hold "
                 f"the top {self.top_k}"
@@ -442,6 +494,17 @@ class QuadraticAttentionConfig(AttentionConfig):
     # A learned bias per head on the gate, before its activation, shared by the head's
     # dims and starting at 0 (Beam).
     gate_head_bias: bool = False
+    # The gate's projection of the input made low-rank, SiLU(x W_d) W_u, W_d of this
+    # many columns for each head and W_u each head's own (HyGA's low-rank X-gate);
+    # None: one projection.
+    gate_input_rank: int | None = None
+    # The gate also reads the head's output o: SiLU(o W_d) W_u of this rank, by the
+    # head's own matrices, added to its logits from the input before the activation
+    # (HyGA's H-gate; the paper's main runs make it as wide as the head); None: none.
+    gate_output_rank: int | None = None
+    # A second gate, one value a head, sigmoid(o W_c) of all the heads' outputs
+    # together, times the first (HyGA's C-gate).
+    gate_cross_head: bool = False
     # A norm of each head's output, before the gate (Muse); None: none.
     output_norm: NormalizationConfig | None = None
     # Norm of each query and key head, before RoPE (Qwen3); gqa's qk_norm_all_heads
@@ -477,11 +540,20 @@ class QuadraticAttentionConfig(AttentionConfig):
                 ("gate_per_head", self.gate_per_head),
                 ("gate_head_bias", self.gate_head_bias),
                 ("gate_activation", self.gate_activation != "sigmoid"),
+                ("gate_input_rank", self.gate_input_rank is not None),
+                ("gate_output_rank", self.gate_output_rank is not None),
+                ("gate_cross_head", self.gate_cross_head),
             )
             if on
         ]
         if given and not self.gated:
             raise ValueError(f"{', '.join(given)} set the gate, which gated=true adds")
+        ranks = self.gate_input_rank is not None or self.gate_output_rank is not None
+        if ranks and self.gate_per_head:
+            raise ValueError(
+                "gate_input_rank and gate_output_rank gate each dim of a head: not with "
+                "gate_per_head"
+            )
         return self
 
     @model_validator(mode="after")
@@ -513,10 +585,11 @@ class GQAConfig(QuadraticAttentionConfig):
 
     Ports: ``v`` exports the value heads, or imports them for value-residual mixing
     (ResFormer); ``kv`` exports keys and values, or imports them instead of computing
-    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k.
+    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k;
+    ``ve`` imports a `ValueEmbeddingConfig` table's rows, added to the values.
     """
 
-    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index"})
+    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index", "ve"})
 
     type: Literal["gqa"] = "gqa"
     num_heads: int  # query heads
@@ -560,6 +633,108 @@ class GQAConfig(QuadraticAttentionConfig):
     # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
     # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
+    # Exclusive self-attention (XSA): each head's output y less its part along the
+    # query's own value v, y - (y . v) v / (v . v), before the output's norm and gate,
+    # so that attention carries only what the token lacks (Zhai, 2026). "learned"
+    # takes tanh(a) of that part, a learned for each head from 0 (modded-nanogpt).
+    # The values are those the layer attends to: not with its kv port read.
+    exclusive: bool | Literal["learned"] = False
+    # A layer that reads the ve port adds its rows e to its values by a gate per kv
+    # head, v + 2 sigmoid(W [x[:n], e[:n]]) e, from the first n channels of its input
+    # x and of e, W starting at 0 (modded-nanogpt: 6); None: no gate, v + e.
+    value_embed_gate: Positive | None = 6
+    # Values from the key projection, no v projection of their own (Gemma 4's global
+    # layers, attention_k_eq_v): each head's projected key, after the conv with
+    # kv_conv_size, RMS-normalized without a gain, at qk_norm's eps (1e-6 without
+    # one), and not rotated; the keys go on through qk_norm and RoPE.
+    k_eq_v: bool = False
+
+    @model_validator(mode="after")
+    def _k_eq_v(self) -> Self:
+        """Check that values from the keys have the keys' width."""
+        if self.k_eq_v and self.v_head_dim not in (None, self.head_dim):
+            raise ValueError(
+                "gqa(k_eq_v=true) makes the values from the keys, so v_head_dim is "
+                f"head_dim: give no v_head_dim (got {self.v_head_dim})"
+            )
+        return self
+
+    # Differential attention (DIFF V2; Ye et al., 2026): twice the query heads, both
+    # of each pair in the group of one kv head, and each of the num_heads outputs
+    # a1 - sigmoid(x W) a2 of its pair, W a projection of the input to a value a head
+    # and token. Its kv heads, KV cache and output projection are as without it.
+    differential: bool = False
+
+    @model_validator(mode="after")
+    def _differential(self) -> Self:
+        """Check that differential attention comes without the settings that see a
+        head of each output alone: an indexer and a relative bias."""
+        given = [
+            name
+            for name, on in (
+                ("indexer", self.indexer),
+                ("relative_bias", self.relative_bias),
+            )
+            if on is not None
+        ]
+        if self.differential and given:
+            raise ValueError(f"gqa: differential with {', '.join(given)} not yet")
+        return self
+
+    # Paired-head attention (modded-nanogpt's record 58): query head j and head
+    # j + num_heads / 2, and kv head m and m + num_kv_heads / 2, interleaved along the
+    # sequence into one of twice its length, so that a query sees both heads' keys
+    # in one softmax: its own head's up to its own and the other's before it, or up
+    # to its own for the second. A window counts the interleaved positions, and RoPE
+    # turns head i of token n at 2n + (i mod 2). Not in vLLM yet.
+    paired: bool = False
+
+    @model_validator(mode="after")
+    def _paired(self) -> Self:
+        """Check that paired heads come in pairs of query and kv heads, without the
+        settings that see each query head alone."""
+        if not self.paired:
+            return self
+        if self.num_heads % 2 or self.num_kv_heads % 2:
+            raise ValueError(
+                f"gqa: paired takes an even number of heads and kv heads, not "
+                f"{self.num_heads} and {self.num_kv_heads}"
+            )
+        given = [
+            name
+            for name, on in (
+                ("indexer", self.indexer is not None),
+                ("relative_bias", self.relative_bias is not None),
+                ("log_scale", self.log_scale is not None),
+                ("attention_dropout", self.attention_dropout > 0),
+                ("sinks", self.sinks),
+                ("differential", self.differential),
+                ("exclusive", bool(self.exclusive)),
+            )
+            if on
+        ]
+        if given:
+            raise ValueError(f"gqa: paired with {', '.join(given)} not yet")
+        return self
+
+    # Mimetic init of the values and the output at this beta (modded-nanogpt's 0.05;
+    # Trockman & Kolter, 2023): v's and o's kernels start as blocks of +sqrt(beta)
+    # and -sqrt(beta) identities, so that the layer's value-output map starts at
+    # -beta I, plus noise; with kv heads, each of a group's query heads takes 1 / its
+    # group's size of it. None: as the init starts them.
+    mimetic_vo: Annotated[float, Field(gt=0)] | None = None
+    mimetic_noise: float = 0.01  # The std of the noise on v and o under mimetic_vo.
+
+    @model_validator(mode="after")
+    def _mimetic(self) -> Self:
+        """Check that the noise of the mimetic init comes with it."""
+        if self.mimetic_noise != 0.01 and self.mimetic_vo is None:
+            raise ValueError("mimetic_noise sets the init that mimetic_vo adds")
+        if self.mimetic_vo is not None and self.k_eq_v:
+            raise ValueError(
+                "gqa: mimetic_vo starts the v projection, which k_eq_v has not"
+            )
+        return self
 
 
 class MLAConfig(QuadraticAttentionConfig):
@@ -896,6 +1071,27 @@ class EmbeddingConfig(Config):
     dropout: float = 0.0  # Dropout rate of the embedding, in training.
 
 
+class ValueEmbeddingConfig(Config):
+    """Value embeddings (modded-nanogpt): a table of `vocab_size` rows of `features`,
+    each input token's row pushed to the ``ve`` port for a ``gqa`` layer to add to its
+    values: ``value_embed(features=128, ve=@ve1)``.
+
+    It leaves the stream as it is, so it goes bare, on a widened stream too, or
+    inside a branch before the layer that reads it. Several layers may read one table.
+
+    Ports: ``ve`` exports the rows of the input tokens.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"ve"})
+
+    type: Literal["value_embed"] = "value_embed"
+    # Width of a row: the kv heads times the value head dim of the layers that read it.
+    features: Positive
+    # Std of the rows' normal init (modded-nanogpt: 0.01), where the model sets no
+    # init; one that does starts them as its embedding.
+    std: float = 0.01
+
+
 class LMHeadConfig(Config):
     """The language-model head: the stream to logits over the vocabulary,
     ``softcap(x W + b)``. Every head is an output of the model; nothing follows one
@@ -960,6 +1156,40 @@ class EngramConfig(Config):
     vocab_classes: int | None = None
     # N-grams do not reach back past this token, such as EOS (Qwen); None: none.
     boundary_token: int | None = None
+
+
+class DocCopyConfig(Config):
+    """The document-local copy feature (modded-nanogpt PR 378): each position's
+    candidate next token, the one that followed the latest earlier occurrence in its
+    document of the longest of its contexts that occurred, fed to the stream.
+
+    For each of `lengths`, the context of that many tokens ending at a position
+    matches where the same tokens ended earlier in the same document. The longest
+    length that matches picks the latest such occurrence; the candidate is the token
+    after it, and its bucket is the length and how often the context occurred before
+    (1 to `counts`, the last counting more). The layer adds
+    ``gain (E[c] s[b] + e[b])`` to the stream: the candidate's row of the model's
+    first embedding, times a scale of its bucket, plus an embedding of the bucket,
+    both from 0, so that it starts as nothing.
+
+    PR 378 adds the same vector at two sites, after the embedding and before the
+    final norm, with gains of 0.5 and 1: write it bare at the first, which pushes the
+    vector to its ``copy`` port (``doc_copy(copy=@c)``), and at the second read it,
+    with a gain of its own (``doc_copy(gain=1, copy=$c!)``). It reads the model's
+    input tokens itself, as engram does, and adds to every copy of a widened stream.
+
+    Ports: ``copy`` exports the copy vector, or imports it instead of computing one.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"copy"})
+
+    type: Literal["doc_copy"] = "doc_copy"
+    gain: float = 0.5  # The vector's weight at this site, learned from here.
+    # The context lengths that match, shortest first (PR 378's ten).
+    lengths: tuple[Positive, ...] = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+    # How often a matched context occurred before that its bucket tells apart: 1, 2
+    # and 3 or more by default.
+    counts: Positive = 3
 
 
 # --- Initialization -------------------------------------------------------------
@@ -1056,7 +1286,8 @@ for _init in (InitConfig, NormalInitConfig, FanInitConfig, ZerosInitConfig):
 # Residual algebras: what a residual branch `[f]` does instead of `x + f(x)`, set for
 # the whole model by the top-level setting `residual`, as `residual = mhc()`. Only
 # branches outside any other change; one inside another stays `x + f(x)`. `hc`,
-# `mhc`, `gr` and `attnres` widen the stream, and `merge` reads it back into one.
+# `mhc`, `gr`, `attnres` and `msar` widen the stream, and `merge` reads it back into
+# one.
 
 
 class HyperConnectionsConfig(Config):
@@ -1127,6 +1358,29 @@ class AttentionResidualConfig(Config):
     norm_eps: float = 1e-6  # Epsilon of the keys' RMS norm (Kimi K3: 1e-5).
 
 
+class MultiStreamAttentionResidualConfig(Config):
+    """Multi-stream attention residuals (Qin et al., 2026, MSAR): a residual algebra,
+    ``residual = msar(block_size=8)``.
+
+    attnres in several streams: each source (the embedding, a block's sum of branch
+    outputs, the block under way) becomes one stream as it is and one more for each
+    of `kernel_sizes`, its causal depthwise conv over the tokens, by a bank of convs
+    of the source's own. Each branch reads a softmax over depth in every stream, by
+    a query of its own per stream, and mixes the streams it read by sigmoid weights
+    of their RMS norm, ``sigmoid(a rmsnorm(Z) W + b)``. The head reads the last
+    branch's input plus its output. The stream holds the sources, so `engram` and
+    `nextn` need one stream under it, as under attnres.
+    """
+
+    type: Literal["msar"] = "msar"
+    # Branch outputs summed into one source; None -> each is its own source.
+    block_size: Positive | None = None
+    # The taps of each stream's conv after the first, the source as it is (MSAR's
+    # main setting: 4, 8 and 12, so 4 streams).
+    kernel_sizes: tuple[Positive, ...] = (4, 8, 12)
+    norm_eps: float = 1e-6  # Epsilon of the keys' and the mixer's RMS norms.
+
+
 class ResidualGateConfig(Config):
     """Variance-preserving residual gate (Muse Spark): a residual algebra,
     ``residual = vpgate()``.
@@ -1145,7 +1399,7 @@ class ResidualGateConfig(Config):
 
 
 class MergeConfig(Config):
-    """Reads a widened residual stream back into one (hc, mhc, gr, attnres).
+    """Reads a widened residual stream back into one (hc, mhc, gr, attnres, msar).
 
     The read the algebra does for a branch, without the write. The compiler puts one
     before the first layer outside a branch that needs one stream, such as the final
@@ -1155,12 +1409,13 @@ class MergeConfig(Config):
     type: Literal["merge"] = "merge"
 
 
-#: The residual algebras, `hc`, `mhc`, `gr`, `attnres` and `vpgate`, by their
+#: The residual algebras, `hc`, `mhc`, `gr`, `attnres`, `msar` and `vpgate`, by their
 #: ``type``, the values of the top-level ``residual`` setting.
 ResidualConfig = Annotated[
     HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
+    | MultiStreamAttentionResidualConfig
     | ResidualGateConfig,
     Field(discriminator="type"),
 ]
@@ -1192,9 +1447,11 @@ LayerConfig = Annotated[
     | ScaleConfig
     | DropoutConfig
     | EmbeddingConfig
+    | ValueEmbeddingConfig
     | LMHeadConfig
     | NextNConfig
     | EngramConfig
+    | DocCopyConfig
     | MergeConfig,
     Field(discriminator="type"),
 ]
@@ -1210,6 +1467,7 @@ SubConfig = Annotated[
     | HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
+    | MultiStreamAttentionResidualConfig
     | ResidualGateConfig
     | NormalInitConfig
     | FanInitConfig

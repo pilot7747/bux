@@ -246,6 +246,9 @@ class AdamWConfig(Config):
     b2: float = 0.95  # the decay of the second moment, the squared gradients' average
     eps: float = 1e-8  # added to the second moment's square root, against zero
     weight_decay: float = 0.1  # decoupled, of the matrices, times the learning rate
+    # Decay only the entries whose update has the parameter's sign, or is 0, so that
+    # decay never pulls against the step (Chen et al., 2025's cautious weight decay).
+    cautious_weight_decay: bool = False
 
 
 class MuonConfig(Config):
@@ -275,13 +278,51 @@ class MuonConfig(Config):
     # What Newton-Schulz runs in, and what the updates move between devices in.
     ns_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     weight_decay: float = 0.1  # decoupled, of its matrices, times the learning rate
+    # Decay only the entries whose orthogonalized update has the parameter's sign, or
+    # is 0 (Chen et al., 2025's cautious weight decay).
+    cautious_weight_decay: bool = False
     # Updates scaled to this RMS, as AdamW's roughly are, so that one lr suits both
     # (Moonlight: 0.2); none -> by sqrt(max(1, fan_out / fan_in)) (Keller Jordan).
     consistent_rms: float | None = 0.2
     adam: AdamWConfig | None = None  # for the rest; None -> adamw(lr=lr)
 
 
-OptimizerConfig = Annotated[AdamWConfig | MuonConfig, Field(discriminator="type")]
+class NorMuonConfig(MuonConfig):
+    """NorMuon (Li et al., 2025): Muon whose orthogonalized update is divided, for
+    each output unit (a neuron), by the root of a running average of its mean square
+    over the unit's inputs, then scaled back to the update's norm before, as its
+    official code does. Everything else is `MuonConfig`'s."""
+
+    type: Literal["normuon"] = "normuon"  # ty: ignore[invalid-attribute-override]
+    b2: float = 0.95  # the decay of each neuron's mean square's average
+    eps: float = 1e-10  # added to the average's root, against zero
+
+
+OptimizerConfig = Annotated[
+    AdamWConfig | MuonConfig | NorMuonConfig, Field(discriminator="type")
+]
+
+
+class EMAConfig(Config):
+    """An exponential moving average of the weights over the run's last steps, which
+    it ends on: after the last step the weights become a blend of the average and
+    the last step's (modded-nanogpt's TailEMA). The final eval, the final checkpoint
+    and an export read those; evals before see the weights as trained. It keeps a
+    float32 copy of the parameters in the optimizer's state, all run long, and a
+    checkpoint keeps it, so that a run resumes inside its window."""
+
+    type: Literal["ema"] = "ema"
+    # The steps it averages, the run's last, or a share of the steps below 1; a step's
+    # weights join it at the rate 2 / (window + 1) (modded-nanogpt: 298 of 1188).
+    window: Positive | Annotated[float, Field(gt=0, lt=1)] = 0.25
+    # How much of the average the weights end on: last + blend (average - last); 1
+    # ends on the average alone (modded-nanogpt: 0.65).
+    blend: Annotated[float, Field(ge=0, le=1)] = 0.65
+
+    def steps(self, steps: int) -> int:
+        """The steps it averages, of a run of `steps`: at least one, at most all."""
+        window = self.window if isinstance(self.window, int) else self.window * steps
+        return min(max(round(window), 1), steps)
 
 
 # --- Learning-rate schedules ------------------------------------------------------------
@@ -550,16 +591,38 @@ Phases = Annotated[tuple[PhaseConfig, ...], BeforeValidator(_phases)]
 # observe and profile. None of these but the loss is in the run's id.
 
 
+class PrefixConfig(Config):
+    """Prefix-token prediction (modded-nanogpt's record 88): beside each target token
+    T, the first head also predicts T's prefix token T', the token whose bytes are the
+    longest proper prefix of T's that the vocabulary has, by the same softmax.
+
+    The objective adds ``weight * CE(T')`` at each target that has a prefix token, a
+    mean over all the targets, as `prefix_loss`, its weight held for `hold` of the
+    run's steps, then falling linearly to 0 over the next `decay`: the record's
+    0.25 for the first third of its steps, to 0 over the second.
+    ``loss(prefix=prefix())``. It takes the run's tokenizer, which says the tokens'
+    bytes; evals measure the plain next-token loss and bits per byte."""
+
+    type: Literal["prefix"] = "prefix"
+    weight: Annotated[float, Field(ge=0)] = 0.25  # its weight while it holds
+    hold: Fraction = 1 / 3  # the share of the steps it holds its weight
+    decay: Fraction = 1 / 3  # the share after those over which it falls to 0
+
+
 class LossConfig(Config):
     """The loss a run minimizes: the cross-entropy of the first head, plus `z` times
     its z-loss, plus `mtp` times the mean cross-entropy of the heads after it, each of
-    which predicts one token further ahead for every `nextn` before it. The losses
-    layers report, as an MoE's balance loss, add with the weights set on the layer."""
+    which predicts one token further ahead for every `nextn` before it, plus, with
+    `prefix`, its prefix tokens' cross-entropy. The losses layers report, as an MoE's
+    balance loss, add with the weights set on the layer."""
 
     type: Literal["loss"] = "loss"
     z: float = 0.0  # weight of the z-loss, log(Z)^2 of the first head (PaLM: 1e-4)
     # Weight of the mean loss of the heads that predict further ahead (DeepSeek-V3).
     mtp: float = 0.3
+    # The first head also predicts each target's prefix token (modded-nanogpt's
+    # prefix-token prediction), as prefix() says; none: not.
+    prefix: PrefixConfig | None = None
 
 
 def _ascending(v: tuple[int, ...]) -> tuple[int, ...]:
@@ -1317,6 +1380,9 @@ class TrainConfig(Config):
     seed: int = 0  # of the model's initialization and of the data's order
     # Clip gradients to this global norm, above 0; none disables it.
     clip: Annotated[float | None, Field(gt=0)] = 1.0
+    # The weights the run ends on, an average of its last steps' blended into the
+    # last's (`EMAConfig`); none: the last step's.
+    ema: EMAConfig | None = None
     loss: LossConfig = LossConfig()  # the loss's terms and their weights
     # Held-out loss and bits per byte every so many steps: an eval, or a list of them
     # under names of their own; none: no eval.
@@ -1337,6 +1403,16 @@ class TrainConfig(Config):
     objective: ObjectiveConfig | None = None
     search: SearchConfig = SearchConfig()  # how a run with dimensions is searched
 
+    @model_validator(mode="after")
+    def _prefix_tokens(self) -> "TrainConfig":
+        """Check that prefix-token prediction has a tokenizer to read bytes from."""
+        if self.loss.prefix is not None and self.tokenizer is None:
+            raise ValueError(
+                "loss(prefix=...) predicts each target's prefix token, by its bytes: "
+                "it takes a tokenizer = tokenizer(...)"
+            )
+        return self
+
 
 # The configs a .bux file calls by name, besides layers and their settings.
 Setting = Annotated[
@@ -1350,6 +1426,8 @@ Setting = Annotated[
     | BestFitPacking
     | AdamWConfig
     | MuonConfig
+    | NorMuonConfig
+    | EMAConfig
     | ConstantSchedule
     | CosineSchedule
     | WSDSchedule
@@ -1361,6 +1439,7 @@ Setting = Annotated[
     | PhaseConfig
     | RampConfig
     | LossConfig
+    | PrefixConfig
     | EvalConfig
     | CheckpointConfig
     | LogConfig

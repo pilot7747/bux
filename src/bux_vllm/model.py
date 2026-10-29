@@ -43,6 +43,7 @@ from .plan import (
     children,
     is_call,
     live,
+    msar_packs,
     plan,
     ports,
 )
@@ -65,6 +66,7 @@ LAYER_MODULES = (
     "rwkv7",
     "residual",
     "engram",
+    "doc_copy",
 )
 
 
@@ -179,7 +181,10 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":
             embedding = layer
-    return layers | build_branches(config.bux, p, len(calls))
+    branches = build_branches(config.bux, p, len(calls))
+    slot = sum(map(len, states.values()))  # msar's packs come after every state
+    _keep_histories(vllm_config, config.bux, p, branches, slot)
+    return layers | branches
 
 
 def build_branches(arch: Node, p: Plan, calls: int) -> dict[str, nn.Module]:
@@ -198,6 +203,34 @@ def build_branches(arch: Node, p: Plan, calls: int) -> dict[str, nn.Module]:
         else:
             out[b.path] = Unused()
     return out
+
+
+def _keep_histories(
+    vllm_config: VllmConfig, arch: Node, p: Plan, branches: dict, slot: int
+) -> None:
+    """Make msar's packs of its convs' states (`bux_vllm.msar`), named after every
+    other state, and give each branch the place of each of its calls' in them, in
+    the order they run; nothing without msar."""
+    packs = msar_packs(arch, p)
+    if not packs:
+        return
+    from . import msar  # vLLM's ops, on a GPU alone
+
+    d, size = arch["d_model"], max(arch["residual"]["kernel_sizes"], default=1)
+    made = [
+        msar.Histories(
+            n * d, size, vllm_config, cache_name(slot + i, f"model.msar.{i}")
+        )
+        for i, n in enumerate(packs)
+    ]
+    live_calls = len(live(p.calls))
+    places = ((made[j // packs[0]], j % packs[0] * d) for j in range(sum(packs)))
+    for b in (b for b in p.branches if b.calls < live_calls):
+        branch = branches[b.path]
+        branch.path = b.path
+        branch.histories.append(msar.History(*next(places)))
+    # vLLM finds them by their names (`Histories`); the first branch holds them.
+    branches[p.branches[0].path].packs = nn.ModuleList(made)
 
 
 def _class(call: Call) -> type[Layer]:
@@ -317,6 +350,7 @@ def _repeat(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
         "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
+        "doc_copy": 0,
     }
 )
 class BuxModel(Scoped):
@@ -360,10 +394,11 @@ class BuxModel(Scoped):
         inputs_embeds: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
+        doc_copy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ctx = Ctx(positions, self.shared, inputs_embeds, self.plan)
         ctx.input_ids, ctx.query_start_loc = input_ids, query_start_loc
-        ctx.ngram_context = ngram_context
+        ctx.ngram_context, ctx.doc_copy = ngram_context, doc_copy
         run(self, self.plan.top.root, (), input_ids, ctx, 0)
         assert ctx.hidden is not None, "the model ran no head"
         return ctx.hidden
@@ -388,7 +423,8 @@ class BuxForCausalLM(nn.Module, IsHybrid):
 
     def get_model_state_cls(self) -> type:
         """vLLM's model runner state for the model (V2's): its own, which also gives
-        an engram the ids before each step (`bux_vllm.engram.model_state`)."""
+        an engram the ids before each step and ``doc_copy`` its candidates
+        (`bux_vllm.engram.model_state`)."""
         return engram.model_state(self.vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -409,6 +445,7 @@ class BuxForCausalLM(nn.Module, IsHybrid):
             inputs_embeds,
             kwargs.get("query_start_loc"),
             kwargs.get("ngram_context"),
+            kwargs.get("doc_copy"),
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

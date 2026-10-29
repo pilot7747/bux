@@ -189,8 +189,15 @@ model = embed(norm=norm) "DD" "LLLG" "LLLLLG"^10 norm @h logits ...
 
 With `max_positions`, the compiler checks that the run's `seq_len` fits, and those
 of its curriculum's phases and of its evals. Under a
-residual algebra that widens the stream (`hc`, `mhc`, `gr`, `attnres`), `embed` widens
+residual algebra that widens the stream (`hc`, `mhc`, `gr`, `attnres`, `msar`), `embed` widens
 its output ([Residual algebras](../language/residual-algebras.md)).
+
+### `value_embed`
+
+`value_embed(features=n)` is a second table of `vocab_size` rows, `n` wide
+({bux}`value_embed`), whose rows the attention layers that read its `ve` port add to
+their values (modded-nanogpt). It leaves the stream as it is
+([Value embeddings](attention.md#value-embeddings)).
 
 ### `head`
 
@@ -300,6 +307,44 @@ classes; a checkpoint of the real model replaces it with the tokenizer's map. Th
 tables' rows split over devices as the vocabulary does, and weight decay skips them.
 :::
 
+## `doc_copy`: the document-local copy feature
+
+The copy feature (modded-nanogpt PR 378) gives each position a candidate next
+token from its own document ({bux}`doc_copy`). Of the contexts of 1, 2, 3, 4, 6, 8,
+12, 16, 24 and 32 tokens ending at a position, the longest one that occurred
+earlier in its document picks its latest occurrence, and the candidate is the token
+that followed it. Its bucket is the context's length and how often it occurred
+before: once, twice, or more. PR 378 adds the same vector at two sites, after the
+embedding and before the final norm:
+
+```bux
+model = embed doc_copy(copy=@c) block^12 merge doc_copy(gain=1, copy=$c!) norm head
+```
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `gain` | `0.5` | the vector's weight at this site, learned |
+| `lengths` | `[1, 2, 3, 4, 6, 8, 12, 16, 24, 32]` | the context lengths that match |
+| `counts` | `3` | how many earlier occurrences the buckets tell apart |
+
+The layer adds $g\,(E_c\, s_b + e_b)$ to the stream: $E_c$ is the candidate's row of
+the model's first embedding, $s_b$ a scale of its bucket and $e_b$ an embedding of
+it. Both start at 0, so the feature starts as nothing, and a position with no match
+gets nothing. The layer at the first site pushes the vector to its `copy` port; the
+one that reads it has a gain of its own and no tables.
+
+Write `doc_copy` bare. It reads the model's input tokens itself, as `engram` does,
+and never looks past its own document or its own position. On a widened stream it
+adds to every copy; before the final norm, `merge` first, so that it adds once. PR
+378 matches on its tokenizer's normalized classes of tokens (case and spacing);
+bux's matches on the tokens.
+
+On a KDA hybrid at a width of 512, with hyper-connections, the feature at both
+sites lowered the held-out objective by 0.52%: by 0.53%, 0.62% and 0.40% at seeds 0,
+1 and 2 (503M tokens, B300s, 2026-10-29). Served in vLLM at a
+width of 3328, with FP8 weights and an FP8 KV cache, it costs 1.9% of the sessions
+per GPU ([The document-local copy feature](../export/vllm.md#the-document-local-copy-feature)).
+
 ## Elementwise layers
 
 | Layer | What it does | Settings |
@@ -331,7 +376,7 @@ block = [(attn unit - _) step] unit [(ffn unit - _) step] unit
 
 ## `merge`
 
-`merge` reads a widened residual stream (`hc`, `mhc`, `gr`, `attnres`) back into one:
+`merge` reads a widened residual stream (`hc`, `mhc`, `gr`, `attnres`, `msar`) back into one:
 the read the algebra does for a branch, without the write ({bux}`merge`). You rarely
 write it: the compiler puts one before the first layer outside a branch that needs
 a single stream, such as the final norm, and `bux fmt` prints it. See

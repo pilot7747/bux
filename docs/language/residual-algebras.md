@@ -4,7 +4,7 @@
 The top-level setting `residual` keeps a model's wiring and changes what every
 residual branch `[f]` means. One line turns a pre-norm Transformer into one with
 hyper-connections (`hc`, `mhc`), the gated residual (`gr`), attention residuals
-(`attnres`) or the variance-preserving gate (`vpgate`). This page lists the algebras
+(`attnres`, `msar`) or the variance-preserving gate (`vpgate`). This page lists the algebras
 and their settings, then covers what happens outside the brackets when the stream is
 widened, and the `merge` the compiler inserts there.
 
@@ -52,6 +52,7 @@ itself.
 | `mhc(expansion=4)` | the same, with the stream mixing projected onto doubly stochastic matrices by Sinkhorn (DeepSeek mHC, 2025) |
 | `gr(rank=320)` | a gated read of 4 normalized streams, and a weighted write to each; branches need no pre-norm (Qwen3.8-Flash-Next) |
 | `attnres(block_size=24)` | `f` reads a learned softmax over depth of the embedding and the earlier branch outputs, instead of their sum (Kimi K3) |
+| `msar(block_size=8)` | `attnres` in 4 streams: each source as it is and its causal convs over the tokens of 4, 8 and 12 taps, a softmax over depth in each, mixed by sigmoid weights (Qin et al., 2026) |
 | `vpgate(temperature=0.3)` | `a x + b f(x)` with `a^2 + b^2 = 1` per channel (Muse Spark) |
 
 Their settings, with defaults:
@@ -66,13 +67,39 @@ Their settings, with defaults:
 | `res_bias` | `mhc` | -8 | the static mixing logits off the diagonal: the mixing starts as the identity to within `e^res_bias` |
 | `single_pass` | `hc`, `mhc` | `false` | see below |
 | `rank` | `gr` | required | rank of the read gate (Qwen3.8-Flash-Next: `d_model / 8`) |
-| `block_size` | `attnres` | `none` | branch outputs summed into one source; `none`: each is its own |
-| `norm_eps` | `hc`, `mhc`, `gr`, `attnres` | 1e-6 | epsilon of the algebra's own norm |
+| `block_size` | `attnres`, `msar` | `none` | branch outputs summed into one source; `none`: each is its own |
+| `kernel_sizes` | `msar` | `[4, 8, 12]` | the taps of each stream's conv after the first: `msar` has one stream more |
+| `norm_eps` | `hc`, `mhc`, `gr`, `attnres`, `msar` | 1e-6 | epsilon of the algebra's own norm |
 | `temperature` | `vpgate` | 0.3 | `b = sigmoid(g / temperature)` |
 | `eps` | `vpgate` | 1e-3 | `a = sqrt(max(1 - b^2, eps))`: the stream is never cut off |
 
 Every algebra with its own norm takes `norm_eps`. See {bux}`hc`, {bux}`gr`,
-{bux}`attnres` and {bux}`vpgate` in the reference for the full descriptions.
+{bux}`attnres`, {bux}`msar` and {bux}`vpgate` in the reference for the full
+descriptions.
+
+### Multi-stream attention residuals
+
+`msar` (Qin et al., 2026) reads over depth as `attnres` does, in several streams. Each
+source (the embedding, a finished block's sum of branch outputs, or the block under
+way) is one stream as it is, and one more for each of its causal depthwise convs over
+the tokens, of 4, 8 and 12 taps by default. Each branch reads a softmax over depth in
+every stream, by a query of its own per stream. It then mixes the streams it read,
+each by the weight $\sigma(a\,\mathrm{rmsnorm}(Z)\,W + b)$. The head reads the last
+branch's input plus its output. On the factorial's candidate, in place of `hc`:
+
+```bux
+residual = msar(block_size=layers // 4)
+```
+
+The convs belong to the source: a finished block's are those of the branch that
+read it first, and the block under way's those of the branch that reads it. They
+start at 0, as do the queries and the mixer's projection, so a branch starts by
+reading the mean of its sources, a quarter of it in each of the 4 streams.
+
+It costs more than it gave at small scale. On a KDA hybrid of 680M parameters at a
+width of 512, in place of `hc`, it raised the held-out bits per byte by 0.5% and took
+2.1 times as long a step (503M tokens, 3 seeds, B300s, 2026-10-29). Its vLLM export
+at a width of 3328 served 58% fewer agentic sessions an hour per GPU in FP8.
 
 ### How hc and mhc start
 
@@ -105,8 +132,8 @@ residual = mhc(expansion=4, single_pass=true, norm_eps=1e-20)
 (lang-outside-brackets)=
 ## Outside the brackets
 
-`hc`, `mhc`, `gr` and `attnres` widen the stream. Between the branches, the stream is
-several copies of itself (for `attnres`, the outputs so far). Only a few things act
+`hc`, `mhc`, `gr`, `attnres` and `msar` widen the stream. Between the branches, the
+stream is several copies of itself (for `attnres` and `msar`, the outputs so far). Only a few things act
 on it as a whole:
 
 - `embed` widens it, and so does `nextn` when its input is one stream.
@@ -114,8 +141,9 @@ on it as a whole:
   inside `f` are plain skips.
 - Taps `@h` and `$h` save and restore it as it is.
 - `engram` adds its memory to every copy, gated by each copy's own key, and `nextn`
-  mixes the embedding into every copy (Qwen3.8-Flash-Next). Under `attnres`, whose
-  state is the outputs so far rather than copies, both need one stream.
+  mixes the embedding into every copy (Qwen3.8-Flash-Next). Under `attnres` and
+  `msar`, whose state is the outputs so far rather than copies, both need one
+  stream.
 
 `vpgate` does not widen the stream, so none of this applies to it.
 
@@ -182,7 +210,7 @@ The other errors:
 |-------|-------|
 | `engram adds to the stream itself, so [engram] would add the stream twice` | `[engram]`; write it bare |
 | `merge reads a widened residual stream back into one, but there is none here` | a `merge` without a widening `residual`, or after the stream was read back |
-| `'residual' must be hc(...) or mhc(...) or gr(...) or attnres(...) or vpgate(...), found a rope config` | `residual` set to something else |
+| `'residual' must be hc(...) or mhc(...) or gr(...) or attnres(...) or msar(...) or vpgate(...), found a rope config` | `residual` set to something else |
 
 Under `attnres`, an `engram` between branches gets a merge before it, so the branch
 after it is the first error above.

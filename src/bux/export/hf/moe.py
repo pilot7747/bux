@@ -131,6 +131,11 @@ class MoE(nn.Module):
     moves (``bias_update_rate``, ``center_bias``, SMEBU's ``bias_softclamp`` and
     ``bias_momentum``; the bias itself is a buffer, ``router_bias``, which ``aux_free``
     and ``smebu`` both add to the scores that choose), ``random_logits``, and dropout.
+
+    Zero experts (``num_zero_experts``) are scored after the routed ones; a token's
+    picks of them add the token, as the experts take it, times their weights, and
+    reach the routed experts as picks of expert 0 of weight 0, as vLLM's
+    ``ZeroExpertRouter`` passes them on.
     """
 
     bux_types = ("moe",)
@@ -139,10 +144,11 @@ class MoE(nn.Module):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         self.config, n = c, c["num_experts"]
+        scored = n + c["num_zero_experts"]
         sinks = c["num_shared_experts"] if c["shared_expert_sink"] else 0
-        self.router = nn.Linear(width, n + sinks, bias=c["router_bias"])
+        self.router = nn.Linear(width, scored + sinks, bias=c["router_bias"])
         by_bias = c["load_balancing"] != "aux_loss"  # aux_free, smebu
-        self.register_buffer("router_bias", torch.zeros(n) if by_bias else None)
+        self.register_buffer("router_bias", torch.zeros(scored) if by_bias else None)
         latent = c["latent_size"] or width
         lat = c["latent_size"] is not None
         self.to_latent = nn.Linear(width, latent, bias=False) if lat else None
@@ -170,9 +176,13 @@ class MoE(nn.Module):
         if self.latent_input_norm is not None:
             z = self.latent_input_norm(z)
         rows = z.reshape(-1, z.shape[-1])
-        k = idx.shape[-1]
-        y = self.experts(rows, idx.reshape(-1, k), weights.reshape(-1, k))
+        k, n = idx.shape[-1], self.config["num_experts"]
+        zero = idx >= n  # the zero experts' picks
+        ffn_idx, ffn_weights = idx.masked_fill(zero, 0), weights.masked_fill(zero, 0)
+        y = self.experts(rows, ffn_idx.reshape(-1, k), ffn_weights.reshape(-1, k))
         y = y.reshape(z.shape)
+        if self.config["num_zero_experts"]:
+            y = y + z * (weights * zero).sum(-1, keepdim=True)
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         if self.from_latent is not None:
@@ -184,7 +194,8 @@ class MoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Each token's top-k experts and their weights, and the shared experts'
         weights if the router scores them too, as bux's ``MoE._route``."""
-        c, n = self.config, self.config["num_experts"]
+        c = self.config
+        n = c["num_experts"] + c["num_zero_experts"]
         scores = SCORES[c["router"]](self._logits(x) * c["router_logit_scale"])
         scores, sinks = scores[..., :n], scores[..., n:]
         choice = (

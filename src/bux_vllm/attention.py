@@ -3,8 +3,8 @@ tensor parallelism, attending by vLLM's attention layer and its paged KV cache, 
 its ``v`` port (the value residual, `bux_vllm.kv`), its conv on keys and values
 (`bux_vllm.conv`) and its indexer, which picks the keys each query attends to
 (`bux_vllm.sparse`). Its projections take the engine's quantization config
-(`bux_vllm.common.quantization`); its norms, conv and indexer stay in the model's
-dtype."""
+(`bux_vllm.common.quantization`), its indexer's too, merged into one; its norms and
+conv stay in the model's dtype."""
 
 from __future__ import annotations
 
@@ -19,11 +19,12 @@ from vllm.distributed import (
 from vllm.model_executor.layers.attention import Attention as PagedAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 
-from . import kv, picks, sparse
+from . import keyed, kv, outputs, picks, sparse
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -31,6 +32,7 @@ from .common import (
     Norm,
     Rope,
     Site,
+    load_into,
     logit_gain,
     sharded_loader,
 )
@@ -41,12 +43,15 @@ from .indexer import Indexer, rotated
 
 class Attention(Layer):
     """bux's ``gqa``: q, k and v by one column-parallel projection, the causal conv
-    on k and v added to them (``kv_conv_size``), the values mixed with those of its
-    ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
+    on k and v added to them (``kv_conv_size``), the ``ve`` port's value embeddings
+    added to the values by their gate, the values mixed with those of its ``v``
+    port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
     as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
     causal softmax attention with its sliding window, soft-capping and sinks by
-    vLLM's attention layer, each head's output norm and gate (with a bias per head),
-    and the row-parallel output projection.
+    vLLM's attention layer (twice the query heads under ``differential``, each
+    pair's maps subtracted, DIFF V2's), XSA on each head's output (``exclusive``,
+    `bux_vllm.outputs`), its norm and gate (with a bias per head, and HyGA's input,
+    output and cross-head gates), and the row-parallel output projection.
 
     With an indexer, each query attends to the keys the indexer picks alone, as
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
@@ -55,6 +60,14 @@ class Attention(Layer):
     of those its own window sees, and runs no indexer. With a relative bias, each
     query attends to every key it sees, the bias and the length scale on its
     logits, by the plugin's op over a paged cache of its own.
+
+    With ``k_eq_v`` (Gemma 4's global layers) its values are its keys as
+    projected, after the conv, RMS-normalized without a gain: as vLLM's Gemma 4
+    does, bux's key projection loads into both the k and the v shard of the
+    projection, whose v output goes unused, and the KV cache holds both. Asked
+    for, where each key is its value times the key norm's gain
+    (`bux_vllm.kv.keys_from_values`), it holds the values alone, read as both by
+    vLLM's Triton attention (`bux_vllm.keyed`), and the gain goes on the queries.
 
     Each call of the layer keeps a KV cache of its own, a conv state beside it with
     ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
@@ -70,6 +83,11 @@ class Attention(Layer):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         kv.check_ports(c, site.ports)
+        if c["paired"]:
+            raise NotImplementedError(
+                "gqa: paired (paired-head attention) not in vLLM yet: it needs an "
+                "attention over two heads' keys in one softmax"
+            )
         self.rel, self.rel_proj, self.rel_table = c["relative_bias"], None, None
         if self.rel and (c["indexer"] or site.ports):
             raise NotImplementedError("gqa: a relative bias beside an indexer or ports")
@@ -80,13 +98,20 @@ class Attention(Layer):
         dk, dv = kv.head_dims(c, width)
         self.path, self.dk, self.dv, self.fused = site.path, dk, dv, c["fused_qkv"]
         self.h, self.g = h // tp, max(1, g // tp)  # this rank's
+        self.hq = (2 * h if c["differential"] else h) // tp  # its query heads
+        if c["differential"] and self.reads_index:
+            raise NotImplementedError("gqa: differential with the index port")
         self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
         self.c, self.scale = c, (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
+        self.k_eq_v = c["k_eq_v"] and not self.reads_kv  # values from the keys
+        self.keyed = kv.keys_from_values(c, site.ports)  # one vector a token cached
         self._projections(c, width, site)
         self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
-        self.sinks = sink_logits(self.h) if c["sinks"] else None
+        self._value_embed_gate(c, site.ports)
+        self.sinks = sink_logits(self.hq) if c["sinks"] else None
+        self._exclusion(c)
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
         self.indexer = None
@@ -104,24 +129,30 @@ class Attention(Layer):
         layer that reads its ``kv`` port), the gate's, and the row-parallel output
         projection, each with the engine's quantization config."""
         h, g, dk, dv = c["num_heads"], c["num_kv_heads"], self.dk, self.dv
+        hq = 2 * h if c["differential"] else h
         path, kw = site.path, {"return_bias": False, "quant_config": site.quant}
         self.qkv, self.q = None, None
         if self.reads_kv:
             self.q = ColumnParallelLinear(
-                width, h * dk, bias=c["bias"], prefix=f"{path}.q", **kw
+                width, hq * dk, bias=c["bias"], prefix=f"{path}.q", **kw
             )
         else:
             self.qkv = QKVParallelLinear(
                 width,
                 dk,
-                h,
+                hq,
                 g,
                 bias=c["bias"],
                 v_head_size=dv,
                 prefix=f"{path}.qkv",
                 **kw,
             )
-        self._gate(c, width, h * dv, site)
+        self._gate(c, width, site)
+        self.lambda_proj = None
+        if c["differential"]:  # an output a head: too few for FP8's GEMMs
+            self.lambda_proj = ColumnParallelLinear(
+                width, h, bias=False, return_bias=False, prefix=f"{path}.lambda_proj"
+            )
         out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
         self.o = RowParallelLinear(
             h * dv, width, bias=out_bias, prefix=f"{path}.o", **kw
@@ -134,17 +165,12 @@ class Attention(Layer):
         Raises:
             NotImplementedError: QK-norm of all heads where ranks copy kv heads.
         """
-        qk, out, h, g = (
-            c["qk_norm"],
-            c["output_norm"],
-            c["num_heads"],
-            c["num_kv_heads"],
-        )
+        qk, out, g = c["qk_norm"], c["output_norm"], c["num_kv_heads"]
         self.all_heads = bool(qk and c["qk_norm_all_heads"])
         if self.all_heads and g % tp:
             raise NotImplementedError("gqa: qk_norm_all_heads with kv heads copied")
         if self.all_heads:
-            self.q_norm = AllHeads(qk, h, self.dk, tp)
+            self.q_norm = AllHeads(qk, self.hq * tp, self.dk, tp)
             self.k_norm = AllHeads(qk, g, self.dk, tp)
         else:
             self.q_norm = Norm(qk, self.dk) if qk else None
@@ -152,15 +178,21 @@ class Attention(Layer):
         if self.reads_kv:  # its writer's keys are normalized
             self.k_norm = None
         self.out_norm = Norm(out, self.dv) if out else None
+        self.v_norm = Norm(kv.value_norm(qk), self.dk) if self.k_eq_v else None
 
     def _caches(
         self, c: dict, site: Site, names: list[str], shares: list[str | None]
     ) -> None:
         """Make each call's vLLM attention layer, with its KV cache, or attending
-        to the KV cache it `shares`, a writer's through the ``kv`` port."""
+        to the KV cache it `shares`, a writer's through the ``kv`` port: one of a
+        vector a token (`bux_vllm.keyed`) where the keys are the values times the
+        key norm's gain."""
+        layer, backend = PagedAttention, None
+        if self.keyed:
+            layer, backend = keyed.KeyedAttention, keyed.KeyedTritonBackend
         self.caches = nn.ModuleList(
-            PagedAttention(
-                self.h,
+            layer(
+                self.hq,
                 self.dk,
                 self.scale,
                 num_kv_heads=self.g,
@@ -171,6 +203,7 @@ class Attention(Layer):
                 sinks=self.sinks,
                 head_size_v=self.dv,
                 kv_sharing_target_layer_name=share,
+                attn_backend=backend,
             )
             for name, share in zip(names, shares, strict=True)
         )
@@ -184,11 +217,15 @@ class Attention(Layer):
         ix = None if self.reads_index else c["indexer"]
         if ix is not None:
             rotated_dims = rotated(self.dk, c["rope"])
-            self.indexer = Indexer(ix, width, c["rope"], rotated_dims)
+            merged = merged_indexer(ix, width, site)
+            self.indexer = Indexer(ix, width, c["rope"], rotated_dims, None, merged)
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         groups = (self.kv_first, self.g)
         spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
         what = "gqa with an indexer" if ix else "gqa reading its index port"
+        dtype = site.vllm_config.model_config.dtype
+        dims, heads = (self.dk, self.dv), c["num_kv_heads"]
+        native, blocked, fp8 = sparse.paths(spec, ix, dims, dtype, heads)
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -197,6 +234,9 @@ class Attention(Layer):
             names,
             site.vllm_config,
             what,
+            native,
+            fp8,
+            blocked,
         )
 
     def _biased_caches(
@@ -233,7 +273,7 @@ class Attention(Layer):
         ``kv_conv_size``: all calls' over the same weights."""
         self.convs, self.conv_weight = None, None
         if (size := c["kv_conv_size"]) and names:  # none for a kv reader
-            channels = self.g * (self.dk + self.dv)
+            channels = self.g * (self.dk + (0 if self.k_eq_v else self.dv))
             convs = [
                 CausalConv(channels, size, site.vllm_config, name) for name in names
             ]
@@ -242,13 +282,16 @@ class Attention(Layer):
                 other.weight = self.conv_weight
             self.convs = nn.ModuleList(convs)
 
-    def _gate(self, c: dict, width: int, heads_dv: int, site: Site) -> None:
+    def _gate(self, c: dict, width: int, site: Site) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
-        a head (``gate_per_head``), column-parallel by head; None without one."""
+        a head (``gate_per_head``), or `gate_input_rank` a head under a low-rank
+        input gate, column-parallel by head; None without one. HyGA's other parts
+        follow (`_hybrid_gate`)."""
         self.gate, self.gate_bias = None, None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
         if c["gated"]:
-            n = c["num_heads"] if c["gate_per_head"] else heads_dv
+            n = c["num_heads"] * (c["gate_input_rank"] or self.dv)
+            n = c["num_heads"] if c["gate_per_head"] else n
             self.gate = ColumnParallelLinear(
                 width,
                 n,
@@ -260,6 +303,44 @@ class Attention(Layer):
         if c["gated"] and c["gate_head_bias"]:
             self.gate_bias = nn.Parameter(torch.zeros(self.h), requires_grad=False)
             self.gate_bias.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+        self._hybrid_gate(c, site)
+
+    def _hybrid_gate(self, c: dict, site: Site) -> None:
+        """Make HyGA's parts of the gate, each where it is set: this rank's heads'
+        up projections of a low-rank input gate and projections of their own
+        outputs, in the model's dtype, and the cross-head gate, row-parallel by
+        head, unquantized for its few outputs."""
+        rank, own, dv = c["gate_input_rank"], c["gate_output_rank"], self.dv
+        self.gate_up = per_head_weight(self.h, rank, dv) if rank else None
+        self.output_gate_down = per_head_weight(self.h, dv, own) if own else None
+        self.output_gate_up = per_head_weight(self.h, own, dv) if own else None
+        self.cross_gate, h = None, c["num_heads"]
+        self.heads_first = get_tensor_model_parallel_rank() * self.h
+        if c["gate_cross_head"]:
+            self.cross_gate = RowParallelLinear(
+                h * dv,
+                h,
+                bias=c["bias"],
+                reduce_results=False,
+                return_bias=False,
+                prefix=f"{site.path}.cross_gate",
+            )
+
+    def _exclusion(self, c: dict) -> None:
+        """Keep XSA's setting (``exclusive``), and this rank's heads' strengths
+        where it learns them, in float32 as bux keeps them.
+
+        Raises:
+            NotImplementedError: XSA in a layer that reads its ``kv`` port, which
+                has no values of its own.
+        """
+        self.exclusive, self.xsa_alpha = c["exclusive"], None
+        if self.exclusive and self.reads_kv:
+            raise NotImplementedError("gqa: exclusive (XSA) in a layer that reads kv")
+        if self.exclusive == "learned":
+            alpha = torch.zeros(self.h, dtype=torch.float32)
+            self.xsa_alpha = nn.Parameter(alpha, requires_grad=False)
+            self.xsa_alpha.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
 
     def _value_residual(self, c: dict, layer_ports: list) -> None:
         """Keep the layer's ports, and the learned weights of its value residual
@@ -271,16 +352,27 @@ class Attention(Layer):
             w = torch.full(shape, 0.5, dtype=torch.float32)
             self.v_mix = nn.Parameter(w, requires_grad=False)
 
+    def _value_embed_gate(self, c: dict, layer_ports: list) -> None:
+        """Keep the gate of the ``ve`` port's rows, every kv head's, where the layer
+        reads the port and gates them (``value_embed_gate``)."""
+        n = c["value_embed_gate"] if kv.reads(layer_ports, "ve") else None
+        self.ve_gate = None
+        if n:
+            w = torch.zeros(c["num_kv_heads"], 2 * n)
+            self.ve_gate = nn.Parameter(w, requires_grad=False)
+
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
         for kind in ("weight", "bias"):
             if (fused := getattr(self.qkv, kind, None)) is not None:
                 shards = {"qkv": None} if self.fused else {s: s for s in "qkv"}
                 out |= {f"{n}.{kind}": (fused, (s,)) for n, s in shards.items()}
-            for name in ("q", "gate", "o", "rel_proj"):
+            for name in ("q", "gate", "o", "rel_proj", "cross_gate", "lambda_proj"):
                 layer = getattr(self, name)
                 if layer is not None and getattr(layer, kind) is not None:
                     out[f"{name}.{kind}"] = (getattr(layer, kind), ())
+        if self.k_eq_v:  # bux's keys load into the v shard too, as Gemma 4's
+            out.pop("v.weight", None), out.pop("v.bias", None)
         for name in ("q_norm", "k_norm", "out_norm"):
             if (norm := getattr(self, name)) is not None:
                 out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
@@ -288,11 +380,15 @@ class Attention(Layer):
             out["sinks"] = (self.sinks, ())
         if self.v_mix is not None:
             out["v_mix"] = (self.v_mix, ())
+        if self.ve_gate is not None:
+            out["ve_gate.weight"] = (self.ve_gate, ())
         if self.gate_bias is not None:
             out["gate_bias"] = (self.gate_bias, ())
-        if self.indexer is not None:
-            params = self.indexer.named_parameters()
-            out |= {f"indexer.{name}": (p, ()) for name, p in params}
+        if self.xsa_alpha is not None:
+            out["xsa_alpha"] = (self.xsa_alpha, ())
+        for name in ("gate_up", "output_gate_down", "output_gate_up"):
+            if (weight := getattr(self, name)) is not None:
+                out[name] = (weight, ())
         if self.rel_table is not None:
             out["rel_table"] = (self.rel_table, ())
         return out
@@ -300,7 +396,26 @@ class Attention(Layer):
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
         if name in ("k_conv.weight", "v_conv.weight") and self.conv_weight is not None:
             return self._load_conv(self.conv_weight, name[0], tensor)
+        if name.startswith("indexer.") and self.indexer is not None:
+            return self.indexer.load(name.removeprefix("indexer."), tensor)
+        if self.k_eq_v and self.qkv is not None and name.split(".")[0] in ("k", "qkv"):
+            return self._load_keys_as_values(name, tensor)
         return super().load(name, tensor)
+
+    def _load_keys_as_values(self, name: str, tensor: torch.Tensor) -> list:
+        """Load bux's key projection (or the q and k of its fused one) into the k
+        shard of ``qkv`` and into its v shard too, as vLLM loads Gemma 4's
+        ``attention_k_eq_v`` layers: the v shard's output goes unused, but it keeps
+        an FP8 scale of the whole projection the keys'."""
+        assert self.qkv is not None
+        param = getattr(self.qkv, name.split(".")[1])
+        if name.startswith("qkv."):  # bux's fused q and k, as rows
+            queries = self.c["num_heads"] * self.dk
+            load_into(param, tensor[:queries], "q")
+            tensor = tensor[queries:]
+        for shard in ("k", "v"):
+            load_into(param, tensor, shard)
+        return [param]
 
     def _load_conv(
         self, weight: nn.Parameter, which: str, taps: torch.Tensor
@@ -318,10 +433,14 @@ class Attention(Layer):
         if self.reads_kv:  # its writer's keys and values, as vLLM shares them
             assert self.q is not None
             q = self._queries(self.q(x), ctx).reshape(t, -1).contiguous()
-            out = self.caches[call](q, None, None).view(t, self.h, self.dv)
-            return self.o(self._gated(x, out).reshape(t, -1))
+            out = self.caches[call](q, None, None).view(t, self.hq, self.dv)
+            return self.o(self._gated(x, self._difference(x, out)).reshape(t, -1))
         q, k, v = self._project(x, call)
-        v = self._v_port(v, ctx)
+        v = self._v_port(self._ve_port(x, v, ctx), ctx)
+        if self.keyed:
+            out = self._difference(x, self._keyed(q, v, call, ctx))
+            out = self._exclude(out, v)
+            return self.o(self._gated(x, out).reshape(t, -1))
         q, k = self._queries(q, ctx), self._normed(k, self.k_norm, self.g)
         if self.rope is not None:
             k = self.rope(k, ctx.positions)
@@ -331,14 +450,49 @@ class Attention(Layer):
             out = self._biased(x, q, k, v, call, ctx)
         else:
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
-            out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
+            out = self.caches[call](q, k, v.contiguous()).view(t, self.hq, self.dv)
+        out = self._exclude(self._difference(x, out), v)
         return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _difference(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """The output heads, (T, h, dv), of the query heads' outputs `out`, (T, hq,
+        dv): under ``differential``, each ``a1 - sigmoid(x W) a2`` of its pair of
+        query heads (`bux_vllm.outputs.differential`); `out` itself without it."""
+        if self.lambda_proj is None:
+            return out
+        return outputs.differential(out, self.lambda_proj(x))
+
+    def _exclude(self, out: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), by XSA under ``exclusive``: each less
+        its part along its token's own value, of the values v, (T, g dv), the layer
+        attended to."""
+        if not self.exclusive:
+            return out
+        alpha = self.xsa_alpha
+        strength = None if alpha is None else alpha.tanh()
+        return outputs.exclusive(out, v.view(-1, self.g, self.dv), strength)
+
+    def _keyed(
+        self, q: torch.Tensor, v: torch.Tensor, call: int, ctx: Ctx
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending over a cache of the values
+        alone (`bux_vllm.keyed`): each key is its value times the key norm's gain,
+        which goes on the queries instead."""
+        assert self.k_norm is not None
+        gain = self.k_norm.weight
+        if gain is not None and self.k_norm.zero_centered:
+            gain = 1 + gain
+        q = self._queries(q, ctx)
+        q = q if gain is None else q * gain.to(q.dtype)
+        t, v = q.shape[0], v.contiguous()
+        out = self.caches[call](q.reshape(t, -1).contiguous(), v, v)
+        return out.view(t, self.hq, self.dv)
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The projected queries, (T, h dk), as heads, (T, h, dk): QK-norm then RoPE
         (in float32, as bux), and their scale by position (``power_scale``,
         ``log_scale``)."""
-        q = self._normed(q, self.q_norm, self.h)
+        q = self._normed(q, self.q_norm, self.hq)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
         scales = kv.power_scale if self.rel else kv.query_scale  # biased: its op's
@@ -370,9 +524,7 @@ class Attention(Layer):
         `call`-th call's caches (`bux_vllm.sparse.attend`)."""
         index = None
         if self.indexer is not None:
-            at = ctx.positions
-            ix = self.indexer
-            index = (ix.queries(x, at), ix.head_weights(x), ix.keys(x, at))
+            index = self.indexer.project(x, ctx.positions)
         out = q.new_empty(q.shape[0], self.h, self.dv)
         values = v.view(-1, self.g, self.dv)
         cache = self.caches[call]
@@ -407,12 +559,35 @@ class Attention(Layer):
         """q, k and v of x, (T, _) each, with the conv added to k and v (by the
         `call`-th call's state) under ``kv_conv_size``."""
         assert self.qkv is not None, "a layer that reads kv projects q alone"
+        if self.k_eq_v:
+            return self._project_keys_as_values(x, call)
         q, keys_values = self.qkv(x).split(
-            [self.h * self.dk, self.g * (self.dk + self.dv)], -1
+            [self.hq * self.dk, self.g * (self.dk + self.dv)], -1
         )
         if self.convs is not None:
             keys_values = keys_values + self.convs[call](keys_values)
         return [q, *keys_values.split([self.g * self.dk, self.g * self.dv], -1)]
+
+    def _ve_port(self, x: torch.Tensor, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        """The values, (T, g dv), with the ``ve`` port's rows added by their gate,
+        as bux adds them, before the value residual."""
+        read = kv.reads(self.ports, "ve")
+        if read is None:
+            return v
+        heads = (self.kv_first, self.g)
+        return kv.add_value_embedding(x, v, ctx.read(*read), self.ve_gate, heads)
+
+    def _project_keys_as_values(self, x: torch.Tensor, call: int) -> list:
+        """q, k and v of x, (T, _) each, v made from k (``k_eq_v``): each head's
+        key, after the conv, RMS-normalized without a gain."""
+        assert self.qkv is not None and self.v_norm is not None
+        q, k, _ = self.qkv(x).split(
+            [self.hq * self.dk, self.g * self.dk, self.g * self.dv], -1
+        )
+        if self.convs is not None:
+            k = k + self.convs[call](k)
+        v = self.v_norm(k.view(-1, self.g, self.dk)).view(k.shape)
+        return [q, k, v]
 
     def _v_port(self, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The values, (T, g dv), with those the ``v`` port reads mixed in, pushed
@@ -431,9 +606,42 @@ class Attention(Layer):
         if self.gate is None:
             return out
         gate = self.gate(x).view(out.shape[0], self.h, -1)
+        hyga = (self.gate_up, self.output_gate_down, self.output_gate_up)
+        gate = outputs.hybrid_logits(gate, out, *hyga)
         if self.gate_bias is not None:
             gate = gate + self.gate_bias.to(gate.dtype)[:, None]
-        return out * self.gate_activation(gate)
+        gate = self.gate_activation(gate)
+        return out * (gate if self.cross_gate is None else gate * self._cross(out))
+
+    def _cross(self, out: torch.Tensor) -> torch.Tensor:
+        """HyGA's cross-head gate of this rank's heads, (T, h, 1): sigmoid(o W_c) of
+        every head's output, each rank's share of the product summed over the
+        ranks, padded to 16 columns, which vLLM's all-reduces take whole."""
+        assert self.cross_gate is not None
+        logits = self.cross_gate(out.flatten(1))
+        if get_tensor_model_parallel_world_size() > 1:
+            padded = F.pad(logits, (0, -logits.shape[1] % 16))
+            logits = tensor_model_parallel_all_reduce(padded)
+        first = self.heads_first
+        return torch.sigmoid(logits[:, first : first + self.h])[..., None]
+
+
+def merged_indexer(ix: dict, width: int, site: Site) -> MergedColumnParallelLinear:
+    """The projection of a ``gqa`` layer's indexer, `ix`, from its input: its
+    queries', keys' and head weights' in one GEMM (`bux_vllm.indexer.Indexer.sizes`),
+    the same on every rank, with the engine's quantization config where its parts
+    are multiples of 16, as vLLM's FP8 GEMMs take them."""
+    sizes = Indexer.sizes(ix)
+    quant = site.quant if all(n % 16 == 0 for n in sizes) else None
+    return MergedColumnParallelLinear(
+        width,
+        sizes,
+        bias=False,
+        quant_config=quant,
+        prefix=f"{site.path}.indexer.merged",
+        return_bias=False,
+        disable_tp=True,
+    )
 
 
 class AllHeads(Norm):
@@ -471,6 +679,14 @@ def _ranks_sum(x: torch.Tensor) -> torch.Tensor:
     bytes at least."""
     sums = F.pad(x.sum(-1, keepdim=True), (0, 3))
     return tensor_model_parallel_all_reduce(sums)[:, :1]
+
+
+def per_head_weight(heads: int, n_in: int, n_out: int) -> nn.Parameter:
+    """A matrix for each of this rank's `heads`, (heads, n_in, n_out), in the
+    model's dtype, loaded as its share of every head's."""
+    weight = nn.Parameter(torch.empty(heads, n_in, n_out), requires_grad=False)
+    weight.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+    return weight
 
 
 def sink_logits(heads: int) -> nn.Parameter:

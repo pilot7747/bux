@@ -19,6 +19,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
@@ -30,8 +31,10 @@ from bux.architecture import Model
 from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
+from bux.architecture.experts import moe as bux_moe
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
+from bux.architecture.registry import Taps
 from bux.export import check
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
@@ -47,12 +50,14 @@ from bux_vllm import (
     compressed,
     config,
     delta,
+    docmatch,
     dplr,
     feeds,
     kv,
     latent,
     linear,
     ngram,
+    outputs,
     plan,
     residual,
     routing,
@@ -181,6 +186,225 @@ def test_a_sparse_cache_s_rows_hold_the_indexer_keys_beside_the_kv() -> None:
     torch.testing.assert_close(cache.keys(table, at[None])[0], index)
     got = picks.gather(cache.kv, table, at[None])[0].transpose(0, 1)
     torch.testing.assert_close(got, kv)
+
+
+def test_native_indexer_keys_are_in_deepgemm_s_paged_layout() -> None:
+    """bux_vllm.dsa.Region writes FP8 indexer keys in the head slots after a cache's
+    kv heads, as DeepGEMM's paged MQA logits read them: each block's keys, then
+    their float32 scales; the kv heads keep their rows, and the views address the
+    same bytes."""
+    from bux_vllm import dsa
+
+    torch.manual_seed(0)
+    g, block, blocks, c, d, s = 3, 8, 5, 32, 64, 19
+    slots = dsa.slots(d, c, torch.bfloat16.itemsize)
+    assert slots == 2  # 68 bytes of a key and its scale, 64 a slot
+    cache = torch.randn(blocks, g + slots, block, c, dtype=torch.bfloat16)
+    kv = cache[:, :g].clone()
+    table = (torch.randperm(blocks - 1) + 1)[None]
+    at = torch.arange(s)
+    keys = torch.randn(s, d) * torch.rand(s, 1) * 10
+    region = dsa.Region(cache, g, d)
+    region.write(table[0, at // block] * block + at % block, keys)
+    assert torch.equal(cache[:, :g], kv)
+    values, scales = dsa.quantized(keys)
+    want = values.float() * scales[:, None]
+    torch.testing.assert_close(region.dequantized(table, s), want, rtol=0, atol=0)
+    near = 1e-3 * keys.abs().max().item()  # e4m3's rounding, and its subnormals'
+    torch.testing.assert_close(want, keys, rtol=0.07, atol=near)
+    raw = cache[:, g:].contiguous().view(torch.uint8).view(blocks, -1)
+    b, o = table[0, 2 // block], 2 % block
+    assert torch.equal(raw[b, o * d : (o + 1) * d], values[2].view(torch.uint8))
+    sf = raw[b, block * d + 4 * o : block * d + 4 * o + 4].view(torch.float32)
+    assert sf.item() == scales[2].item()
+    paged = region.paged()
+    assert paged.shape == (blocks, block, 1, d + 4)
+    assert paged.stride(0) == region.raw.stride(0) == (g + slots) * block * c * 2
+
+
+def test_native_indexer_queries_score_as_bux_s_indexer() -> None:
+    """The FP8 queries and weights bux_vllm.dsa gives DeepGEMM, padded with heads of
+    no weight, score FP8 keys as bux's indexer scores the keys it rounds,
+    ``sum_j w_j ReLU(q_j . k)``, within FP8's rounding."""
+    from bux_vllm import dsa, picks
+
+    torch.manual_seed(0)
+    q, w, keys = torch.randn(7, 4, 64), torch.randn(7, 4), torch.randn(30, 64)
+    q8, weights = dsa.queries(q, w, 8)
+    assert q8.dtype == dsa.FP8 and q8.shape == (7, 8, 64)
+    assert torch.equal(weights[:, 4:], torch.zeros(7, 4))
+    k8, sf = dsa.quantized(keys)
+    dots = torch.einsum("qhd,sd->qhs", q8.float(), k8.float() * sf[:, None]).relu()
+    got = torch.einsum("qhs,qh->qs", dots, weights)
+    want = picks.scores(q, w, keys, relu=True, per_group=False)
+    torch.testing.assert_close(got, want, rtol=0.1, atol=0.1 * want.abs().max().item())
+
+
+def test_native_indexer_takes_deepseek_s_settings_alone() -> None:
+    """vLLM's DSA kernels take single keys, ReLU'd dots summed over the heads, head
+    dims of 32, 64 or 128, no window and a top-k of 2048 at most, in 16-bit
+    models; not MLA's latents unless asked for."""
+    from bux_vllm import dsa, picks
+
+    def spec(**c: Any) -> picks.Sparse:
+        settings: dict[str, Any] = {"top_k": 2048, "block_size": 1, "relu": True}
+        settings |= c
+        return picks.Sparse(
+            settings["top_k"],
+            settings["block_size"],
+            False,
+            bool(settings.get("per_group", False)),
+            bool(settings["relu"]),
+            settings.get("window"),
+            1.0,
+            None,
+            64,
+            (0, 1),
+            latent=settings.get("latent", 0),
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dsa, "available", lambda: True)
+        mp.setattr(dsa, "_head_sizes", lambda: (4, 8, 16, 32, 64, 128))
+        assert dsa.takes(spec(), 64, 4, torch.bfloat16)
+        assert dsa.takes(spec(), 128, 64, torch.float16)
+        assert not dsa.takes(spec(), 64, 4, torch.float32)
+        assert not dsa.takes(spec(), 16, 4, torch.bfloat16)
+        assert not dsa.takes(spec(), 64, 200, torch.bfloat16)
+        assert not dsa.takes(spec(top_k=4096), 64, 4, torch.bfloat16)
+        assert not dsa.takes(spec(block_size=4), 64, 4, torch.bfloat16)
+        assert not dsa.takes(spec(relu=False), 64, 4, torch.bfloat16)
+        assert not dsa.takes(spec(window=16), 64, 4, torch.bfloat16)
+        assert not dsa.takes(spec(per_group=True), 64, 4, torch.bfloat16)
+        assert not dsa.takes(spec(latent=64), 64, 4, torch.bfloat16)
+    assert dsa.padded_heads(3) >= 3
+
+
+def test_a_step_s_decoded_tokens_are_one_segment() -> None:
+    from bux_vllm import picks
+
+    parts = picks.segments(3, [(3, 5, 3, 9)], 64)
+    assert [(p.tokens, p.decoding) for p in parts] == [
+        (slice(0, 3), True),
+        (slice(3, 8), False),
+    ]
+
+
+def test_native_qsa_pools_its_blocks_as_bux_s_indexer() -> None:
+    """For QSA on vLLM's DSA kernels, bux_vllm.dsa caches the keys as projected
+    (Raw), and a token that completes a block writes the block's key (`pooled`) at
+    the position of the block's index: what bux's indexer pools (block_keys), within
+    FP8's rounding; `block_picks` adds the query's unfinished block as bux does."""
+    from bux_vllm import dsa, picks
+    from bux_vllm import indexer as plugin_indexer
+
+    torch.manual_seed(0)
+    ix = cfg.SparseIndexerConfig.model_validate(
+        {"num_heads": 4, "head_dim": 64, "top_k": 8, "block_size": 4}
+        | {"weighted": False, "norm": {"type": "rmsnorm"}}
+    ).model_dump(mode="json")
+    rope = cfg.RoPEConfig().model_dump(mode="json")
+    ours = plugin_indexer.Indexer(ix, 32, rope, 16)
+    for p in ours.parameters():
+        p.data.normal_()
+    g, block, blocks, c, s, size = 2, 8, 6, 32, 23, 4
+    raw_slots = dsa.raw_slots(64, c * 4)
+    cache = torch.zeros(blocks, g + raw_slots + dsa.slots(64, c, 4), block, c)
+    table = (torch.randperm(blocks - 1) + 1)[None]
+    at = torch.arange(s)
+    slots = table[0, at // block] * block + at % block
+    x = torch.randn(s, 32)
+    raw = dsa.Raw(cache, g, 64)
+    raw.write(slots, ours.keys(x, at))
+    region = dsa.Region(cache, g + raw_slots, 64)
+    rows = table.expand(s, -1)
+    dsa.pooled(raw, region, ours, rows, at, size)
+    keys = raw.at(rows[:1], at[None])[0]
+    torch.testing.assert_close(keys, ours.keys(x, at).bfloat16().float())
+    want = ours.block_keys(picks.pooled(keys, size), size)  # bux's, of 5 blocks
+    got = region.dequantized(table, s // size)
+    near = 1e-3 * want.abs().max().item()
+    torch.testing.assert_close(got, want, rtol=0.07, atol=near)
+    blocks_ = torch.tensor([[1, -1], [0, 1]], dtype=torch.int32)
+    positions = torch.tensor([9, 11])
+    keys_, valid = dsa.block_picks(blocks_, positions, size)
+    see = picks.seen(positions, 12, None)
+    theirs = picks.with_own_block(
+        blocks_.long().clamp(min=0), blocks_ >= 0, see, positions, None, size
+    )
+    ours_ = torch.where(valid, keys_, -1).sort(-1).values
+    want_ = torch.where(theirs[1], theirs[0], -1).sort(-1).values
+    assert torch.equal(ours_, want_)
+
+
+def test_vllm_s_sparse_gqa_attention_takes_plain_bfloat16_groups() -> None:
+    """vLLM's own sparse GQA attention (Qwen4's QSA kernel) attends where it takes
+    the layer: bfloat16 queries, keys and values of a power of two of dims, a
+    bfloat16 or e4m3 cache, groups of 4 query heads or more, no sinks or softcap."""
+    from bux_vllm import dsa, picks
+
+    spec = picks.Sparse(16, 1, False, False, True, None, 0.125, None, 64, (0, 2))
+    q = torch.zeros(3, 8, 64, dtype=torch.bfloat16)
+    kv = torch.zeros(5, 2, 64, 128, dtype=torch.bfloat16)
+    assert dsa.attends(spec, q, kv)
+    assert dsa.attends(spec, q, kv.view(torch.uint8)[..., :128].view(dsa.FP8))
+    assert not dsa.attends(
+        spec, q, kv.view(torch.uint8)[..., :128].view(torch.float8_e5m2)
+    )
+    assert not dsa.attends(spec, q.float(), kv.float())
+    assert not dsa.attends(spec, q, torch.zeros(5, 8, 64, 128, dtype=torch.bfloat16))
+    assert not dsa.attends(spec, q[..., :48], kv[..., :96])
+    sunk = picks.Sparse(
+        16, 1, False, False, True, None, 0.1, None, 64, (0, 2), torch.ones(8)
+    )
+    assert not dsa.attends(sunk, q, kv)
+
+
+def test_msa_takes_minimax_s_settings_alone() -> None:
+    """vLLM's MiniMax-M3 kernels take MSA of blocks of 128, an unweighted index head
+    a kv head, plain dots, heads of a power of two of dims, a power of two of kv
+    heads on a rank and fewer than 64 blocks a query, in bfloat16; their picks of
+    blocks are bux's keys of them."""
+    from bux_vllm import msa, picks
+
+    def spec(**c: Any) -> picks.Sparse:
+        top_k, size = c.get("top_k", 2048), c.get("block_size", 128)
+        relu, window = c.get("relu", False), c.get("window")
+        groups = (0, c.get("kv_heads", 4))
+        return picks.Sparse(
+            top_k, size, False, True, relu, window, 1.0, None, 64, groups
+        )
+
+    ix = {"num_heads": 4, "head_dim": 128, "weighted": False}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(msa, "available", lambda: True)
+        assert msa.takes(spec(), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(), ix, 4, 128, torch.float16)
+        assert not msa.takes(spec(), ix, 8, 128, torch.bfloat16)
+        assert not msa.takes(spec(), ix | {"weighted": True}, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(), ix | {"head_dim": 96}, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(block_size=64), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(relu=True), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(window=512), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(top_k=128 * 64), ix, 4, 128, torch.bfloat16)
+        six = ix | {"num_heads": 6}
+        assert not msa.takes(spec(kv_heads=6), six, 6, 128, torch.bfloat16)
+    blocks = torch.tensor([[[2, -1]], [[0, 1]]], dtype=torch.int32)  # (g, Q, k)
+    keys, valid = msa.as_picks(blocks, torch.tensor([300]))
+    assert keys.shape == (1, 2, 256)
+    assert keys[0, 0, :2].tolist() == [256, 257] and not valid[0, 0, 128:].any()
+    assert valid[0, 0, :45].all() and not valid[0, 0, 45:].any()  # 256..300 seen
+    assert valid[0, 1].all()
+
+
+def test_native_picks_are_bux_s_picks() -> None:
+    """bux_vllm.dsa.as_picks turns the kernels' picks, int32 positions with -1 for
+    none, into bux_vllm.picks' positions and mask."""
+    from bux_vllm import dsa
+
+    keys, valid = dsa.as_picks(torch.tensor([[3, -1, 0]], dtype=torch.int32))
+    assert keys.dtype == torch.long and keys.tolist() == [[3, 0, 0]]
+    assert valid.tolist() == [[True, False, True]]
 
 
 def test_a_conv_layer_keeps_a_conv_state() -> None:
@@ -348,6 +572,12 @@ ROUTERS = {
     " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5, expert=e)",
     "unnormalized sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
     " shared_expert_sink=true, normalize_top_k=false, expert=e)",
+    "zero experts": "moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
+    "zero experts, longcat": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=e)",
+    "zero experts, sinks": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " num_shared_experts=2, shared_expert_sink=true, router=sigmoid, expert=e)",
 }
 
 
@@ -364,7 +594,7 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     moe = MoE(c, 64, rngs=nnx.Rngs(0))
     router = routing.Router(c.model_dump(mode="json"))
     if moe.router_bias is not None and router.bias is not None:
-        bias = 0.1 * jax.random.normal(jax.random.key(1), (c.num_experts,))
+        bias = 0.1 * jax.random.normal(jax.random.key(1), moe.router_bias[...].shape)
         moe.router_bias[...] = bias
         router.bias.data = torch.from_numpy(np.array(bias))
     x = jax.random.normal(jax.random.key(2), (1, 32, 64))
@@ -376,6 +606,81 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     got_sinks = router.route(logits, c.top_k)[2].numpy()
     want = np.zeros((32, 0)) if sinks is None else np.asarray(sinks)[0]
     np.testing.assert_allclose(got_sinks, want, rtol=1e-6)
+
+
+def test_zero_experts_split_as_bux_runs_them() -> None:
+    """The zero experts' output (`zero_split`) is bux's, and the picks the fused MoE
+    keeps of `given_logits` (`pick_given`), or `zero_split`'s for `apart`, weigh the
+    routed experts as bux's do; every zero pick is the phantom expert, which the
+    expert map skips, so that a token's GEMM slots are its FFN experts'."""
+    c = cfg.MoEConfig.model_validate(
+        {
+            "num_experts": 4,
+            "top_k": 3,
+            "num_zero_experts": 2,
+            "router": "sigmoid",
+            "expert": {
+                "type": "gated_mlp",
+                "intermediate_size": 8,
+                "activation": "swish",
+            },
+        }
+    )
+    moe = MoE(c, 16, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(2), (1, 32, 16))
+    idx, weights, _ = moe._route(x)
+    zeros = np.asarray(idx)[0] >= 4
+    assert zeros.any() and not zeros.all()
+    as_torch = (torch.from_numpy(np.array(a)[0]) for a in (x, weights, idx))
+    zero, w, picks = routing.zero_split(*as_torch, 4)
+    want = bux_moe.zero_experts(x, idx, weights, 4)[0]
+    np.testing.assert_allclose(zero.numpy(), np.asarray(want), rtol=1e-6)
+    emap = routing.phantom_map(4)
+    assert emap.tolist() == [0, 1, 2, 3, -1]
+    dense = bux_moe.dense_weights(idx, weights, 4)[0]
+    w_, i_ = (torch.from_numpy(np.array(a)[0]) for a in (weights, idx))
+    given = routing.given_logits(w_, i_, 4)
+    assert given.shape == (32, 5) and torch.isinf(given[:, 4]).all()
+    for got_w, got_ids in (
+        (w, picks),
+        routing.pick_given(torch.zeros(32, 16), given, 3, True),
+    ):
+        skipped = emap[got_ids.long()] == -1  # the slots the kernels skip
+        np.testing.assert_array_equal(skipped.sum(-1).numpy(), zeros.sum(-1))
+        assert (got_w[skipped] == 0).all()
+        kept = bux_moe.dense_weights(jnp.asarray(got_ids), jnp.asarray(got_w), 4)
+        np.testing.assert_allclose(np.asarray(kept), np.asarray(dense), rtol=1e-6)
+
+
+def test_zero_experts_route_in_one_graph() -> None:
+    """The routing with zero experts traces whole, as torch.compile takes the
+    model's forward, where vLLM's ZeroExpertRouter's assertion fails."""
+    c = {
+        "num_experts": 8,
+        "num_zero_experts": 4,
+        "top_k": 3,
+        "router": "sigmoid",
+        "router_logit_scale": 1.0,
+        "num_groups": 1,
+        "normalize_top_k": True,
+        "routed_scaling_factor": 2.5,
+        "load_balancing": "aux_free",
+    }
+    router = routing.Router(c)
+
+    def routed(z: torch.Tensor, logits: torch.Tensor) -> tuple:
+        weights, idx, _ = router.route(logits, 3)
+        zero = routing.zero_split(z, weights, idx, 8)[0]
+        return zero, routing.pick_given(
+            z, routing.given_logits(weights, idx, 8), 3, True
+        )
+
+    z, logits = torch.randn(5, 16), torch.randn(5, 12)
+    traced = torch.compile(routed, fullgraph=True, backend="eager")
+    for a, b in zip(
+        jax.tree.leaves(traced(z, logits)), jax.tree.leaves(routed(z, logits))
+    ):
+        assert torch.equal(a, b)
 
 
 ROPES = {
@@ -486,6 +791,9 @@ RESIDUALS = {
     "gr eps": "gr(expansion=3, rank=4, norm_eps=1e-3)",
     "vpgate": "vpgate(temperature=0.5)",
     "vpgate clamped": "vpgate(eps=0.6)",
+    "msar": "msar(kernel_sizes=[2, 3])",
+    "msar blocks": "msar(block_size=2, norm_eps=1e-5)",
+    "msar block under way": "msar(block_size=4)",
 }
 
 
@@ -558,7 +866,9 @@ def compare_branches(setting: str) -> None:
     tokens, body = torch.randn(5, d), torch.randn(d, d) / d**0.5
     copies = hf_residual.widening(c)
     x = tokens[None] if copies is None else hf_residual.widen(tokens[None], copies)
-    ctx, ctx_mine = stand_in(pending_read=None), stand_in(pending_read=None)
+    # One sequence, whole: msar's convs read no cache.
+    ctx = stand_in(pending_read=None, cache=None, attention_mask=None, cache_slot=int)
+    ctx_mine = stand_in(pending_read=None)
     reads, x = through(theirs, x, ctx, body)
     got, y = through(mine, residual.widen(c, tokens), ctx_mine, body)
     for g, h in zip(got, reads, strict=True):
@@ -812,6 +1122,254 @@ def test_the_value_residual_mixes_as_bux(kind: str) -> None:
     flat = [torch.from_numpy(np.array(a)[0].reshape(8, 32)) for a in (v, v1)]
     got = kv.mix_values(kind, w, *flat)
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-6)
+
+
+@pytest.mark.parametrize("learned", [False, True], ids=["fixed", "learned"])
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
+    y = jax.random.normal(jax.random.key(1), (1, 8, 4, 16))
+    v = jax.random.normal(jax.random.key(2), (1, 8, groups, 16))
+    s = jax.random.normal(jax.random.key(3), (4,)) if learned else None
+    want = bux_gqa.exclusive(y, v, None if s is None else jnp.tanh(s))[0]
+    strength = None if s is None else torch.from_numpy(np.array(s)).tanh()
+    got = outputs.exclusive(
+        *(torch.from_numpy(np.array(a)[0]) for a in (y, v)), strength
+    )
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
+
+
+def test_differential_attention_pairs_heads_as_bux() -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, differential=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.lambda_proj is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    maps = jax.random.normal(jax.random.key(2), (1, 8, 8, 16))
+    want = attn._difference(x, maps)[0]
+    lam = torch.from_numpy(np.array(attn.lambda_proj(x)[0]))
+    got = outputs.differential(torch.from_numpy(np.array(maps[0])), lam)
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), atol=1e-6)
+
+
+def test_hyga_s_gate_is_bux_s() -> None:
+    c = cfg.GQAConfig(
+        num_heads=4,
+        num_kv_heads=2,
+        gated=True,
+        gate_input_rank=3,
+        gate_output_rank=5,
+        gate_cross_head=True,
+        gate_head_bias=True,
+    )
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.gate is not None and attn.cross_gate is not None
+    assert attn.gate_up is not None and attn.gate_bias is not None
+    attn.gate_bias[...] = jax.random.normal(jax.random.key(3), (4,))
+    assert attn.output_gate_down is not None and attn.output_gate_up is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    out = jax.random.normal(jax.random.key(2), (1, 8, 4, 16))
+    want = attn._gate(x, out)[0]
+
+    def t(a: Any) -> torch.Tensor:
+        return torch.from_numpy(np.array(a))
+
+    weights = (attn.gate_up, attn.output_gate_down, attn.output_gate_up)
+    logits = t(attn.gate(x)[0]).view(8, 4, -1)
+    logits = outputs.hybrid_logits(logits, t(out[0]), *(t(w[...]) for w in weights))
+    gate = torch.sigmoid(logits + t(attn.gate_bias[...])[:, None])
+    cross = torch.sigmoid(t(attn.cross_gate(out.reshape(1, 8, -1))[0]))[..., None]
+    np.testing.assert_allclose((gate * cross).numpy(), np.asarray(want), atol=1e-6)
+
+
+@pytest.mark.parametrize("gate", [6, None], ids=["gated", "plain"])
+@pytest.mark.parametrize(("kv_heads", "tp"), [(2, 1), (2, 2), (1, 2)])
+def test_value_embeddings_add_to_each_ranks_values_as_bux(
+    gate: int | None, kv_heads: int, tp: int
+) -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=kv_heads, value_embed_gate=gate)
+    port = ir.Port(name="ve", tap="ve1", mode="read")
+    attn = BuxAttention(c, 64, (port,), rngs=nnx.Rngs(0))
+    w = None
+    if attn.ve_gate is not None:
+        kernel = jax.random.normal(jax.random.key(1), attn.ve_gate.kernel[...].shape)
+        attn.ve_gate.kernel[...] = kernel
+        w = torch.from_numpy(np.array(kernel)).T.contiguous()
+    x = jax.random.normal(jax.random.key(2), (1, 8, 64))
+    v = jax.random.normal(jax.random.key(3), (1, 8, kv_heads, 16))
+    e = jax.random.normal(jax.random.key(4), (1, 8, kv_heads * 16))
+    want = np.asarray(attn._add_value_embedding(x, v, e)[0])
+    xt, et = (torch.from_numpy(np.array(a)[0]) for a in (x, e))
+    for rank in range(tp):
+        first, g = kv.kv_heads(kv_heads, tp, rank)
+        mine = torch.from_numpy(np.array(v)[0, :, first : first + g].reshape(8, -1))
+        got = kv.add_value_embedding(xt, mine, et, w, (first, g))
+        np.testing.assert_allclose(
+            got.numpy(), want[:, first : first + g].reshape(8, -1), rtol=1e-5, atol=1e-6
+        )
+
+
+def test_values_from_the_keys_are_normalized_as_bux_and_convolved_alone() -> None:
+    qk = cfg.NormalizationConfig(type="rmsnorm", eps=1e-5)
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, qk_norm=qk, k_eq_v=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    k = jax.random.normal(jax.random.key(1), (1, 8, 32))
+    _, want = attn._keys_as_values(k, None, Taps())
+    norm = common.Norm(kv.value_norm(c.model_dump(mode="json")["qk_norm"]), 16)
+    assert not list(norm.parameters())
+    got = norm(torch.from_numpy(np.array(k)[0]).view(8, 2, 16))
+    np.testing.assert_allclose(got.numpy(), np.asarray(want[0]), rtol=1e-5, atol=1e-6)
+    conv = c.model_copy(update={"kv_conv_size": 4}).model_dump(mode="json")
+    assert kv.conv_channels(conv, 64, 1) == 2 * 16
+    assert kv.conv_channels(conv | {"k_eq_v": False}, 64, 2) == 16 + 16
+
+
+KEYED = {
+    "nope": ({}, (), True),
+    "zero-centered gain": ({"qk_norm": {"zero_centered": True}}, (), True),
+    "writes v": ({}, (["v", "v1", "write"],), True),
+    "rope": ({"rope": cfg.RoPEConfig()}, (), False),
+    "reads v": ({}, (["v", "v1", "read"],), False),
+    "writes kv": ({}, (["kv", "kv", "write"],), False),
+    "layernorm": ({"qk_norm": {"type": "layernorm"}}, (), False),
+}
+
+
+@pytest.mark.parametrize(("change", "ports", "keyed"), KEYED.values(), ids=KEYED)
+def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
+    change: dict, ports: tuple, keyed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bux's keys are its values times the key norm's gain wherever the plugin
+    caches the values alone, asked to, and puts the gain on the queries instead."""
+    qk = {"type": "rmsnorm", "eps": 1e-5} | change.pop("qk_norm", {})
+    c = cfg.GQAConfig.model_validate(
+        {"num_heads": 4, "num_kv_heads": 2, "k_eq_v": True, "qk_norm": qk} | change
+    )
+    dumped = c.model_dump(mode="json")
+    assert not kv.keys_from_values(dumped, list(ports))  # keys and values, unasked
+    monkeypatch.setenv("BUX_VLLM_K_EQ_V_CACHE", "keys")
+    assert kv.keys_from_values(dumped, list(ports)) == keyed
+    if not keyed:
+        return
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.k_norm is not None and attn.k_norm.scale is not None
+    attn.k_norm.scale[...] = jax.random.normal(jax.random.key(2), (16,))
+    k, v = attn._keys_as_values(
+        jax.random.normal(jax.random.key(1), (1, 8, 32)), None, Taps()
+    )
+    gain = attn.k_norm.scale[...] + (1 if attn.k_norm.zero_centered else 0)
+    np.testing.assert_allclose(
+        np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
+    )
+
+
+def test_msar_packs_its_calls_states_to_a_recurrent_layers_page() -> None:
+    """The hybrid's 8 branches, packed 5 a pack (KDA's state of 4 value heads of 32
+    by 32 in float32, at 11 values of 128 a call in 16 bits), after every other
+    state in layer_types; d channels a call, 12 taps."""
+    c = bux_config(vllm_parity.CASES["msar-hybrid"])
+    assert c.bux is not None
+    p = plan.plan(c.bux, c.bux_reserved)
+    assert plan.msar_packs(c.bux, p) == [5, 3]
+    assert c.layer_types[-2:] == ["conv", "conv"]
+    assert c.layer_types[:-2].count("linear_attention") == 2
+    assert plan.msar_shapes(c.bux, p) == {(5 * 128, 12), (3 * 128, 12)}
+    plain = bux_config(vllm_parity.CASES["msar"])
+    assert plain.bux is not None
+    assert plan.msar_packs(plain.bux, plan.plan(plain.bux, plain.bux_reserved)) == [4]
+
+
+def test_msar_convs_over_steps_are_the_whole_sequences() -> None:
+    """Two sequences in a pack's channels: a prompt in two chunks (the second
+    after the first's kept values) beside one in a chunk, then two decoding steps,
+    convolve as each whole sequence does, the slots of other calls' channels
+    untouched; a padded decode row writes vLLM's null block alone."""
+    torch.manual_seed(0)
+    d, sizes = 6, (2, 4, 12)
+    taps = [torch.randn(k, d) for k in sizes]
+    weight = residual.stacked_taps(taps, 12)
+    lens = [9, 14]
+    seqs = [torch.randn(n + 2, d) for n in lens]  # each prompt, then 2 decoded
+    pack = torch.randn(4, 3 * d, 11)  # slots: null, a, b, spare; another call first
+    before = pack.clone()
+    states = pack[:, d : 2 * d]
+    want = [residual.causal_convs(s, taps) for s in seqs]
+    slots = torch.tensor([1, 2])
+
+    def prefill(chunks: list[torch.Tensor], initial: list[bool]) -> torch.Tensor:
+        starts = torch.tensor([0, *itertools.accumulate(len(c) for c in chunks)])
+        meta = stand_in(
+            query_start_loc_p=starts,
+            state_indices_tensor_p=slots,
+            has_initial_states_p=torch.tensor(initial),
+        )
+        v = torch.cat(chunks)
+        out = v.new_zeros(len(v), 3, d)
+        residual.prefill_convs(v, weight, states, meta, out)
+        return out
+
+    a, b = seqs
+    first = prefill([a[:5], b[:14]], [False, False])
+    second = prefill([a[5:9]], [True])[:4]  # a alone: slots[:1]
+    torch.testing.assert_close(torch.cat([first[:5], second]), want[0][:9])
+    torch.testing.assert_close(first[5:], want[1][:14])
+    for step in range(2):
+        v = torch.stack([a[9 + step], b[14 + step], torch.zeros(d)])
+        out = v.new_zeros(3, 3, d)
+        rows = torch.tensor([[1], [2], [-1]])  # a padded row last
+        residual.decode_convs(v, weight, states, rows, out)
+        torch.testing.assert_close(out[0], want[0][9 + step])
+        torch.testing.assert_close(out[1], want[1][14 + step])
+    torch.testing.assert_close(pack[1:, :d], before[1:, :d])  # the other call's
+    torch.testing.assert_close(pack[3], before[3])
+
+
+@pytest.mark.parametrize("lengths", [(1, 2, 3, 4, 6), (2, 8)], ids=["short", "gaps"])
+def test_doc_copy_scans_each_tokens_sequence_as_bux_matches(lengths: tuple) -> None:
+    """The plugin's scan of each token's sequence so far, for a step of two prompt
+    chunks (the second after its cached tokens) and a decoded token, finds bux's
+    candidates and buckets of each whole sequence."""
+    from bux.architecture.layers.doc_copy import candidates
+
+    tokens = jax.random.randint(jax.random.key(0), (3, 30), 0, 3)
+    seqs = jnp.ones_like(tokens), jnp.broadcast_to(jnp.arange(30), (3, 30))
+    want = [np.asarray(w) for w in candidates(tokens, *seqs, lengths, 3)]
+    history = torch.from_numpy(np.array(tokens)).int()
+    # Row 0's tokens 0-11 whole, row 1's 20-29 after 20 cached, row 2's token 29.
+    rows = torch.tensor([0] * 12 + [1] * 10 + [2])
+    pos = torch.cat([torch.arange(12), torch.arange(20, 30), torch.tensor([29])])
+    got = docmatch.scan(history, rows, pos, list(lengths), 3)
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(g.numpy(), w[rows.numpy(), pos.numpy()])
+
+
+def test_doc_copy_vectors_are_buxs() -> None:
+    source = (
+        HEAD
+        + "model = embed doc_copy(copy=@c) [rmsnorm] doc_copy(gain=1, copy=$c!) head"
+    )
+    m = Model(compile(source), rngs=nnx.Rngs(0))
+    from bux.architecture import DocCopy, Taps
+
+    first = next(x for _, x in nnx.iter_graph(m) if isinstance(x, DocCopy))
+    first.scale[...] = jax.random.normal(jax.random.key(1), first.scale.shape)
+    first.bucket_embed[...] = jax.random.normal(
+        jax.random.key(2), first.bucket_embed.shape
+    )
+    tokens = jax.random.randint(jax.random.key(3), (1, 24), 0, 3)
+    want = np.asarray(first.vector(Taps(tokens=tokens)))[0]
+    history = torch.from_numpy(np.array(tokens)).int()
+    c, b = docmatch.scan(
+        history,
+        torch.zeros(24, dtype=torch.long),
+        torch.arange(24),
+        list(first.lengths),
+        3,
+    )
+    table = torch.from_numpy(np.array(first.embedding.tokens.embedding[...]))
+    scale, embed = (
+        torch.from_numpy(np.array(p[...])) for p in (first.scale, first.bucket_embed)
+    )
+    got = docmatch.vector(table[c], b, scale, embed)
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
@@ -2124,6 +2682,8 @@ class StubExperts(torch.nn.Module):
     """vLLM's routed experts (`FusedMoEFactory`'s): their stacked weights, whose
     loaders count, and their quantization config."""
 
+    use_ep = False  # one rank's every expert
+
     def __init__(self, num_experts, hidden_size, intermediate_size, **kwargs):
         super().__init__()
         self.quant_config = kwargs.get("quant_config")
@@ -2294,10 +2854,11 @@ def built(
 
 def kept(model: Any, path: str) -> bool:
     """Whether the plugin keeps the vLLM linear layer at `path` in the model's
-    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's, and
-    a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
+    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's,
+    HyGA's cross-head gate and differential attention's weights, of an output a
+    head, and a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name == "shared_gate":
+    if name in ("shared_gate", "cross_gate", "lambda_proj"):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 
@@ -2371,13 +2932,25 @@ def test_fp8_weights_quantize_every_layer_s_projections(
     assert assert_quantized(model, quant)
 
 
+def test_paired_heads_say_vllm_has_no_attention_for_them(
+    stood_in: ModuleType, tmp_path: Path
+) -> None:
+    source = vllm_parity.LLAMA.replace("rope=rope()", "rope=rope(), paired=true")
+    with pytest.raises(NotImplementedError, match="paired .* two heads' keys"):
+        built(source + "model = embed block rmsnorm head", tmp_path, stood_in, None)
+
+
 #: The parity cases whose attention keeps a cache of the plugin's own
-#: (bux_vllm.sparse's, csa's), which takes no FP8 KV cache, by the layer it names.
+#: (bux_vllm.sparse's, csa's), which takes no FP8 KV cache, by the layer it names:
+#: on the CPU, where vLLM's DSA kernels pick none (see the test after).
 OWN_CACHES = {
     **dict.fromkeys(("dsa", "dsa-conv", "msa", "qsa"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-share", "msa-share"), "gqa with an indexer"),
+    **dict.fromkeys(("dsa-native", "dsa-hybrid", "qsa-native"), "gqa with an indexer"),
+    "msa-native": "gqa with an indexer",
     "relbias": "gqa with a relative bias",
     **dict.fromkeys(("mla-dsa", "mla-share"), "mla with an indexer"),
+    "mla-dsa-native": "mla with an indexer",
     **dict.fromkeys(("csa", "csa-ports", "csa-latent"), "csa"),
 }
 
@@ -2399,6 +2972,40 @@ def test_an_fp8_kv_cache_is_vllm_s_or_refused(
     model = built(source, tmp_path, stood_in, quant, "fp8")
     caches = [m for m in model.modules() if isinstance(m, StubModule)]
     assert all(m.kwargs["cache_config"].cache_dtype == "fp8" for m in caches)
+
+
+def test_native_dsa_takes_an_fp8_kv_cache(
+    stood_in: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where vLLM's DSA kernels pick (as on a B300), a gqa layer's indexer keeps its
+    FP8 keys in head slots after its kv heads (two, of 64 bytes, for 64 FP8 dims and
+    their scale), and its cache, and that of a layer that reads its picks, take an
+    FP8 KV cache; so do QSA's, its keys as projected in bfloat16 in slots of their
+    own, and MSA's on vLLM's MiniMax-M3 kernels; sparse MLA's latents refuse it."""
+    dsa = importlib.import_module("bux_vllm.dsa")
+    monkeypatch.setattr(dsa, "available", lambda: True)
+    msa = importlib.import_module("bux_vllm.msa")
+    monkeypatch.setattr(msa, "available", lambda: True)
+    model = built(vllm_parity.CASES["dsa-native"], tmp_path, stood_in, None, "fp8")
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    e4m3 = torch.float8_e4m3fn
+    want = [(True, e4m3, 2), (True, e4m3, 2), (False, e4m3, 0)]
+    assert [(c.native, c.fp8, c.slots) for c in caches] == want
+    assert all(c.dtype is torch.uint8 and c.share == 0 for c in caches)
+    model = built(
+        vllm_parity.CASES["qsa-native"], tmp_path / "qsa", stood_in, None, "fp8"
+    )
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    assert [(c.native, c.raw_slots, c.slots) for c in caches] == [(True, 2, 4)] * 2
+    source = vllm_parity.CASES["msa-native"]
+    model = built(source, tmp_path / "msa", stood_in, None, "fp8")
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    assert [(c.blocked, c.native, c.raw_slots, c.slots) for c in caches] == [
+        (True, False, 1, 1)
+    ] * 2
+    with pytest.raises(NotImplementedError, match="mla with an indexer: kv_cache"):
+        source = vllm_parity.CASES["mla-dsa-native"]
+        built(source, tmp_path / "mla", stood_in, None, "fp8")
 
 
 def test_the_plugin_s_own_caches_keep_the_model_s_dtype_alone() -> None:
@@ -2502,3 +3109,76 @@ def test_the_fp8_emulation_rounds_what_vllm_quantizes(tmp_path: Path) -> None:
         ]
         assert all(torch.equal(a, x) for a, x in zip(again, w if w.dim() == 3 else [w]))
         assert not torch.equal(p, before[name]), name
+
+
+class RunnerState:
+    """A stand-in of vLLM's model runner state, the base `DocCopyInputs` extends."""
+
+    max_num_tokens, device = 64, torch.device("cpu")
+
+    def __init__(self) -> None:
+        pass
+
+    def prepare_inputs(self, input_batch: Any, req_states: Any) -> dict[str, Any]:
+        return {}
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        return {}
+
+
+def test_doc_copy_hands_the_model_each_steps_candidates_contiguous(
+    stood_in: ModuleType,
+) -> None:
+    """Whatever a step's count of tokens, the runner's candidates and buckets it
+    hands the compiled model are rows of its buffer laid out as a fresh tensor of
+    them is, (T, 2) of strides (2, 1): a graph traced on one count replays every
+    other, whose inputs' strides Inductor's compiled code asserts."""
+    from bux_vllm import doc_copy  # stood in: Triton's
+
+    inputs = type(
+        "Inputs", (doc_copy.DocCopyInputs, RunnerState), {"lengths": (1, 2)}
+    )()
+    for n in (1, 5, 64):
+        found = inputs.prepare_dummy_inputs(1, n)["doc_copy"]
+        batch = SimpleNamespace(num_tokens_after_padding=n, num_reqs=0, num_tokens=n)
+        stepped = inputs.prepare_inputs(batch, None)["doc_copy"]
+        for x in (found, stepped):
+            assert x.shape == (n, 2) and x.stride() == torch.empty(n, 2).stride()
+
+
+class ContiguousTable(torch.nn.Module):
+    """A stand-in of vLLM's vocab-parallel embedding, whose kernel under tensor
+    parallelism takes contiguous ids alone."""
+
+    def __init__(self, table: torch.Tensor) -> None:
+        super().__init__()
+        self.table = table
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        assert ids.is_contiguous(), "vocab_parallel_embedding requires contiguous ids"
+        return self.table[ids]
+
+
+def test_doc_copy_looks_up_contiguous_ids(stood_in: ModuleType) -> None:
+    """The layer looks its candidates' rows up by contiguous ids, as vLLM's
+    vocab-parallel embedding kernel takes them, though the runner's buffer holds
+    each token's candidate and bucket side by side; and adds their vector."""
+    from bux_vllm import doc_copy  # stood in: Triton's
+
+    d, table = 8, torch.randn(16, 8)
+    embedding = SimpleNamespace(tokens=ContiguousTable(table))
+    c = {"gain": 0.5, "lengths": [1, 2], "counts": 3}
+    config = SimpleNamespace(bux={"d_model": d})
+    site = common.Site("model.copy", None, config, embedding=embedding)
+    layer = doc_copy.DocCopy(c, d, site)
+    layer.scale.data = torch.randn(layer.scale.shape)
+    layer.bucket_embed.data = torch.randn(layer.bucket_embed.shape)
+    found = torch.stack([torch.arange(5) % 16, torch.arange(5) % 7], 1).int()
+    buffer = torch.zeros(64, 2, dtype=torch.int32)
+    buffer[:5] = found
+    x = torch.randn(5, d)
+    y = layer(x, SimpleNamespace(doc_copy=buffer))
+    want = docmatch.vector(
+        table[found[:, 0]], found[:, 1].long(), layer.scale, layer.bucket_embed
+    )
+    torch.testing.assert_close(y, x + 0.5 * want)

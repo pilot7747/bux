@@ -30,6 +30,7 @@ from bux.architecture import (
     registry,
 )
 from bux.architecture.attention import norm_rope
+from bux.architecture.attention.gqa import exclusive
 from bux.architecture.attention.rope import frequencies, rotate
 from bux.architecture.experts.moe import dense_weights
 from bux.architecture.graph import Sequence
@@ -214,6 +215,160 @@ def test_the_gate_bias_adds_one_value_per_head_before_the_sigmoid():
     gate = attn.gate(x).reshape(2, 8, H, -1) + jnp.arange(H)[:, None]
     expected = attn.o((heads * jax.nn.sigmoid(gate)).reshape(2, 8, -1))
     assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
+
+
+def test_hyga_gates_as_the_paper_writes_it():
+    """HyGA's output, H_i * sigmoid(SiLU(x Wd_i) Wu_i + SiLU(H_i Wd'_i) Wu'_i) *
+    sigmoid((H W_c)_i): its low-rank X-gate, its H-gate and its C-gate."""
+    attn = gqa(gated=True, gate_input_rank=3, gate_output_rank=5, gate_cross_head=True)
+    assert attn.gate is not None and attn.cross_gate is not None
+    up, down, own = attn.gate_up, attn.output_gate_down, attn.output_gate_up
+    assert up is not None and down is not None and own is not None
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    heads = jax.random.normal(jax.random.key(2), (2, 8, H, D // H))
+    silu = jax.nn.silu
+    xg = jnp.einsum("bthr,hrd->bthd", silu(attn.gate(x).reshape(2, 8, H, 3)), up[...])
+    hg = jnp.einsum(
+        "bthr,hrd->bthd", silu(jnp.einsum("bthd,hdr->bthr", heads, down[...])), own[...]
+    )
+    cg = jax.nn.sigmoid(attn.cross_gate(heads.reshape(2, 8, -1)))[..., None]
+    expected = attn.o((heads * jax.nn.sigmoid(xg + hg) * cg).reshape(2, 8, -1))
+    assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
+
+
+def test_hyga_s_gates_take_the_gate_and_are_new_parameters_alone():
+    def params(attn: Attention) -> dict:
+        return dict(nnx.to_flat_state(nnx.state(attn, nnx.Param)))
+
+    plain, hyga = params(gqa(gated=True)), params(gqa(gated=True, gate_output_rank=4))
+    assert {k[0] for k in hyga.keys() - plain.keys()} == {
+        "output_gate_down",
+        "output_gate_up",
+    }
+    assert all(jnp.array_equal(plain[k][...], hyga[k][...]) for k in plain)
+    with pytest.raises(ValueError, match="gate_cross_head set the gate"):
+        gqa(gate_cross_head=True)
+    with pytest.raises(ValueError, match="gate_per_head"):
+        gqa(gated=True, gate_per_head=True, gate_output_rank=4)
+
+
+def paired_reference(
+    attn: Attention, x: Float[Array, "b t d"], window: int | None
+) -> Float[np.ndarray, "b t d"]:
+    """Paired-head attention as record 58 describes it, one query at a time: head
+    j's and head j + h/2's queries, of token n at rows 2n and 2n + 1, see kv head m's
+    and m + g/2's keys at rows 2s and 2s + 1, m their group's, causally and within
+    the window of rows; RoPE turns head i at 2n + (i mod 2)."""
+    assert attn.q is not None and attn.k is not None and attn.v is not None
+    b, t, _ = x.shape
+    h, g, dk = H, 2, D // H
+    pos = jnp.broadcast_to(jnp.arange(t), (b, t))
+
+    def turned(y, n):
+        assert attn.rope is not None
+        parts = [
+            rotate(y[:, :, i : i + 1], attn.rope, 2 * pos + i % 2) for i in range(n)
+        ]
+        return np.asarray(jnp.concatenate(parts, 2))
+
+    q = turned(attn.q(x).reshape(b, t, h, dk), h)
+    k = turned(attn.k(x).reshape(b, t, g, dk), g)
+    v = np.asarray(attn.v(x).reshape(b, t, g, dk))
+    out = np.zeros((b, t, h, dk))
+    for i in range(h):
+        a, j = divmod(i, h // 2)  # its half, and its pair
+        m = j // (h // g)  # the pair's kv heads: m and m + g/2
+        for n in range(t):
+            keys, values = [], []
+            for s_ in range(t):
+                for c in (0, 1):
+                    row = (2 * n + a) - (2 * s_ + c)
+                    if row >= 0 and (window is None or row < window):
+                        keys.append(k[:, s_, m + c * g // 2])
+                        values.append(v[:, s_, m + c * g // 2])
+            logits = np.einsum("bd,kbd->bk", q[:, n, i], np.stack(keys)) * dk**-0.5
+            probs = np.exp(logits - logits.max(-1, keepdims=True))
+            probs /= probs.sum(-1, keepdims=True)
+            out[:, n, i] = np.einsum("bk,kbd->bd", probs, np.stack(values))
+    return np.asarray(attn.o(jnp.asarray(out, jnp.float32).reshape(b, t, -1)))
+
+
+@pytest.mark.parametrize("window", [None, 5])
+def test_paired_heads_attend_as_record_58(window):
+    rope = cfg.RoPEConfig()
+    attn = gqa(paired=True, rope=rope, sliding_window_size=window)
+    x = jax.random.normal(jax.random.key(1), (2, 6, D))
+    want = paired_reference(attn, x, window)
+    assert np.allclose(attn(x, Taps()), want, atol=1e-5)
+    positions = jnp.concatenate([jnp.arange(2), jnp.arange(4)])[None].repeat(2, 0)
+    packed = attn(x, Taps(segments=Segments.of(positions)))
+    assert jnp.allclose(packed[:, 2:], attn(x[:, 2:], Taps()), atol=1e-5)
+    with pytest.raises(ValueError, match="paired takes an even number"):
+        cfg.GQAConfig(num_heads=4, num_kv_heads=1, paired=True)
+    with pytest.raises(ValueError, match="paired with exclusive"):
+        gqa(paired=True, exclusive=True)
+
+
+def test_differential_attention_subtracts_each_pairs_second_map():
+    """DIFF V2: 2h query heads, heads 2i and 2i + 1 a pair in one kv head's group,
+    and output head i a1 - sigmoid(x W)_i a2: as a 2h-head layer of the same
+    weights computes them, paired by its microsoft/unilm code's 0::2 and 1::2."""
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    diff = gqa(differential=True, head_dim=8, sinks=True)
+    assert diff.q is not None and diff.lambda_proj is not None
+    assert diff.q.kernel.shape == (D, 2 * H * 8) and diff.sinks is not None
+    assert diff.sinks.shape == (2 * H,)
+    diff.sinks[...] = jax.random.normal(jax.random.key(3), (2 * H,))
+    wide = Attention(
+        cfg.GQAConfig(num_heads=2 * H, num_kv_heads=2, head_dim=8, sinks=True),
+        D,
+        (),
+        nnx.Rngs(0),
+    )
+    for name in ("q", "k", "v"):
+        getattr(wide, name).kernel[...] = getattr(diff, name).kernel[...]
+    assert wide.sinks is not None
+    wide.sinks[...] = diff.sinks[...]
+    x_, projected = wide._projections(x)
+    q, k, v = wide._heads(x_, projected, None, Taps())
+    maps = wide._attend(x_, q, k, v, None)
+    lam = jax.nn.sigmoid(diff.lambda_proj(x))[..., None]
+    heads = maps[:, :, 0::2] - lam * maps[:, :, 1::2]
+    expected = diff.o(heads.reshape(2, 8, -1))
+    assert jnp.allclose(diff(x, Taps()), expected, atol=1e-5)
+    with pytest.raises(ValueError, match="differential with relative_bias"):
+        gqa(differential=True, relative_bias=cfg.RelativeBiasConfig(rank=2, extent=4))
+
+
+def test_xsa_removes_each_heads_part_along_its_own_value():
+    """y - (y . v) v / |v|^2, the paper's formula: nothing left along v, the rest
+    of y kept; a query head takes its group's value. Learned, tanh(a) of it."""
+    y = jax.random.normal(jax.random.key(1), (2, 8, H, 6))
+    v = jax.random.normal(jax.random.key(2), (2, 8, 2, 6))
+    vh = jnp.repeat(v, H // 2, axis=2)
+    dots = jnp.sum(y * vh, -1, keepdims=True)
+    want = y - dots * vh / jnp.sum(vh * vh, -1, keepdims=True)
+    got = exclusive(y, v)
+    assert jnp.allclose(got, want, atol=1e-5)
+    assert jnp.allclose(jnp.sum(got * vh, -1), 0, atol=1e-5)
+    s = jnp.linspace(-0.5, 1, H)
+    assert jnp.allclose(exclusive(y, v, s), y - s[:, None] * (y - want), atol=1e-5)
+
+
+def test_xsa_learned_starts_as_attention_and_grows_into_xsa():
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    plain, full = gqa(gated=True), gqa(gated=True, exclusive=True)
+    learned = gqa(gated=True, exclusive="learned")
+    assert plain.xsa_alpha is None and full.xsa_alpha is None
+    assert learned.xsa_alpha is not None
+    assert jnp.array_equal(learned(x, Taps()), plain(x, Taps()))  # tanh(0) = 0
+    assert not jnp.allclose(full(x, Taps()), plain(x, Taps()), atol=1e-3)
+    learned.xsa_alpha[...] = jnp.full(H, 20.0)  # tanh(20) = 1
+    assert jnp.allclose(learned(x, Taps()), full(x, Taps()), atol=1e-6)
+    reader = (ir.Port(name="kv", tap="kv", mode="read"),)
+    config = cfg.GQAConfig(num_heads=H, num_kv_heads=2, exclusive=True)
+    with pytest.raises(ValueError, match="exclusive"):
+        Attention(config, D, reader, nnx.Rngs(0))
 
 
 def qk_normed_over_all_heads() -> Attention:

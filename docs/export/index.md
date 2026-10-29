@@ -175,9 +175,9 @@ naming the layer or the setting.
 
 | Layers | What exports |
 |--------|--------------|
-| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | every setting and activation |
-| `moe` | every setting inference reads: the routers, group-limited routing, the load-balancing bias (`aux_free`, `smebu`), shared experts, LatentMoE, the expert norm, and experts of either MLP type. The routed experts run on transformers' experts implementations |
-| `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm per head or across all heads, biases, fused or separate projections, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, and the indexer; the `v`, `kv` and `index` ports. Dropout applies only in training |
+| `embed`, `value_embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | every setting and activation |
+| `moe` | every setting inference reads: the routers, group-limited routing, the load-balancing bias (`aux_free`, `smebu`), shared experts, LatentMoE, the expert norm, zero experts, and experts of either MLP type. The routed experts run on transformers' experts implementations |
+| `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm per head or across all heads, biases, fused or separate projections, head dims, scale, sliding windows, sinks, softcap, gates (HyGA's too), output norm, length scale, relative bias, the conv on keys and values, values from the keys (`k_eq_v`), XSA (`exclusive`), differential attention, paired heads, and the indexer; the `v`, `kv`, `index` and `ve` ports. Dropout applies only in training |
 | `indexer` | every setting inference reads: DSA's top-k keys, QSA's mean-pooled blocks, MSA's max-pooled blocks and per-group picks, plain or ReLU'd dot products, weighted or summed. Its loss applies only in training |
 | `mla` | every setting, the indexer and the `index` port; keys and values are cached as projected up from the latents |
 | `csa` | every setting, its candidate pools and the `kv`, `index` and `candidates` ports; the indexer, except max-pooled blocks, which bux does not build on compressed latents either. Every token's latents are cached, and the window is a mask over them |
@@ -186,9 +186,10 @@ naming the layer or the setting.
 | `rwkv7` | every setting, and its `v` port (the value residual) |
 | `mamba`, `mamba2`, `short_conv` | every setting; `dt_min` and `dt_max` matter only at initialization |
 | `engram` | on a single or a widened stream; its last tokens and its conv's input tail stay in the cache while decoding. A token's class is its id mod `vocab_classes`, as in bux |
+| `doc_copy` | every setting and its `copy` port, on a single or a widened stream; the sequence's token ids stay in the cache while decoding, which each new token's contexts match against |
 | `nextn` | on a single or a widened stream; every head's logits on whole sequences (`all_heads=True`), skipped during generation |
 | `merge` | yes |
-| residual algebras | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
+| residual algebras | `hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`, with every setting, single-pass included; `msar`'s convs keep their last inputs in the cache while decoding |
 | the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions |
 
 A few combinations of exported settings raise: a layer that reads a `kv` port and
@@ -308,7 +309,9 @@ and equal scores pick the lower expert. The load-balancing bias of `aux_free` or
 `smebu`, which the checkpoint holds as `router_bias`, affects only the choice. The
 routed experts are stacked the way transformers' MoE models keep theirs, so
 transformers' experts implementations run them: `gate_up_proj` is (E, 2f, d), the
-gate's rows first, and `down_proj` is (E, d, f).
+gate's rows first, and `down_proj` is (E, d, f). Zero experts are scored after the
+routed ones, and add the token times their weights; the routed experts take their
+picks as expert 0 of weight 0.
 
 ```python
 model = AutoModelForCausalLM.from_pretrained(

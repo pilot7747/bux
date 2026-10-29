@@ -43,7 +43,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from . import kv
 from .common import Ctx, Layer, Site
 from .config import states
-from .plan import live, plan, ports
+from .plan import live, msar_shapes, plan, ports
 
 
 def state_shapes(vllm_config: Any) -> list[tuple]:
@@ -64,6 +64,7 @@ def state_shapes(vllm_config: Any) -> list[tuple]:
             convs.add((width, c["size"]))
         if c["type"] == "short_conv":
             convs.add((width // tp, c["conv_size"]))
+    convs |= msar_shapes(config.bux, plan(config.bux, config.bux_reserved))
     return [state_shape(vllm_config, *conv) for conv in sorted(convs)]
 
 
