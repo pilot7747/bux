@@ -2,6 +2,7 @@
 the tokenizer's bytes, its cross-entropy beside the loss, its weight's schedule over
 the run's steps, and runs without it as before."""
 
+import contextlib
 import json
 import tempfile
 from pathlib import Path
@@ -17,7 +18,7 @@ from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train import trainer as trainer_module
 from bux.train.data import plain
-from bux.train.objective import Heads, objective, prefix_weight
+from bux.train.objective import Heads, Objective, objective, prefix_weight
 from bux.train.sinks import Scalars, Sink
 from bux.train.trainer import train
 
@@ -143,23 +144,38 @@ def trained(run) -> list[tuple[int, str, float]]:
     return seen
 
 
-def test_a_run_without_it_trains_as_before():
-    """smoke.bux's id, losses and eval losses, as main computed them before it
-    (04f1159; CPU, float32)."""
+def losses(seen: list[tuple[int, str, float]]) -> list[tuple[int, str, float]]:
+    """The run's loss and eval loss at each step, as logged."""
+    return [(s, k, v) for s, k, v in seen if k in ("loss", "eval_loss")]
+
+
+def test_a_run_without_it_trains_as_before(byte_tokenizer, monkeypatch):
+    """smoke.bux keeps its id; and on this machine, unset it trains to the bit as
+    with its term at weight 0, and as with the training step's share of the run
+    (`Objective.at`) taken away, as before it: both runs in one process, so that the
+    comparison holds on any CPU."""
     [run] = short()
     assert run.id == "0e4953952b"
-    want = [
-        (1, "loss", 6.256721496582031),
-        (2, "loss", 6.250439643859863),
-        (2, "eval_loss", 6.25772942437066),
-        (3, "loss", 6.242168426513672),
-        (4, "loss", 6.254068851470947),
-        (4, "eval_loss", 6.257589431036086),
+    tokenizer = f'tokenizer = tokenizer(name="{byte_tokenizer.name}")'
+    table = np.zeros(512, np.int32)  # every id's prefix token is 0
+    monkeypatch.setattr(
+        trainer_module,
+        "_prefix_tokens",
+        lambda config: None if config.loss.prefix is None else table,
+    )
+    unset = losses(trained(short(tokenizer)[0]))
+    weightless = "loss = loss(prefix=prefix(weight=0))"
+    assert losses(trained(short(tokenizer, weightless)[0])) == unset
+    monkeypatch.setattr(Objective, "at", lambda self, step: contextlib.nullcontext())
+    assert losses(trained(short(tokenizer)[0])) == unset
+    assert [(s, k) for s, k, _ in unset] == [
+        (1, "loss"),
+        (2, "loss"),
+        (2, "eval_loss"),
+        (3, "loss"),
+        (4, "loss"),
+        (4, "eval_loss"),
     ]
-    seen = trained(run)
-    assert [(s, k) for s, k, _ in seen] == [(s, k) for s, k, _ in want]
-    for (_, _, got), (_, _, value) in zip(seen, want, strict=True):
-        assert got == pytest.approx(value, rel=1e-6)
 
 
 @pytest.mark.parametrize(
