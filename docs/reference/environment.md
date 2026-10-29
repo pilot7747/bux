@@ -119,6 +119,13 @@ trains the run at that 0-based index, in the order `bux plan` lists them:
 Tasks that read the same documents each prepare them, which is safe but wasteful:
 run `bux prepare sweep.bux` once beforehand.
 
+## Trackers
+
+| Variable | What it does | Default | Read in |
+|----------|--------------|---------|---------|
+| `WANDB_API_KEY` | The key the {bux}`wandb` tracker logs in with, in place of `wandb login`. Pass `-e WANDB_API_KEY` to the Docker image. | unset | W&B |
+| `WANDB_MODE` | `online`, `offline` or `disabled`: where the {bux}`wandb` tracker logs, for a run whose `wandb(...)` sets no `mode`. `WANDB_MODE=disabled bux train run.bux` trains without W&B. A `mode` in the file wins. See [Trackers](../training/observing.md#trackers). | unset: `online` | W&B |
+
 ## Scripts and tests
 
 | Variable | Where | What it does |

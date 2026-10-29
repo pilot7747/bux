@@ -741,8 +741,8 @@ class WandbConfig(Config):
     group: str | None = None  # none: the file's name, which a sweep's runs share
     tags: tuple[str, ...] = ()  # tags of the W&B run, to filter runs by
     # online: as it trains; offline: into the run's directory, for `wandb sync`
-    # later; disabled: nowhere.
-    mode: Literal["online", "offline", "disabled"] = "online"
+    # later; disabled: nowhere; none: as `WANDB_MODE` says, online if it is unset.
+    mode: Literal["online", "offline", "disabled"] | None = None
 
 
 class TensorBoardConfig(Config):

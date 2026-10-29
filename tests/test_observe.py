@@ -1,6 +1,7 @@
 import itertools
 import json
 import math
+import os
 import struct
 import sys
 import types
@@ -365,6 +366,31 @@ def test_wandb_logs_a_run_s_metrics_and_resumes_the_w_b_run_it_started(
     Wandb(WandbConfig(), run, tmp_path, start=0)  # a fresh run starts its own
     ids = [c["id"] for c in calls.init]
     assert ids[0] == ids[1] != ids[2] and all(len(i) == 8 for i in ids)
+
+
+def wandb_mode(made: dict) -> str:
+    """The mode a W&B run of `wandb.init`'s arguments `made` runs in: their `mode`,
+    else ``WANDB_MODE``'s, as wandb's settings take them, else online."""
+    return made["mode"] or os.environ.get("WANDB_MODE", "online")
+
+
+@pytest.mark.parametrize("environment", [None, "disabled", "offline"])
+def test_wandb_takes_its_mode_from_the_environment_unless_the_file_sets_one(
+    tmp_path, monkeypatch, environment
+):
+    calls = fake_wandb(monkeypatch)
+    if environment is None:
+        monkeypatch.delenv("WANDB_MODE", raising=False)
+    else:
+        monkeypatch.setenv("WANDB_MODE", environment)
+    [run] = compile_runs(source(DENSE, log='log(trackers=[wandb(mode="offline"),])'))
+    [written] = run.train.log.trackers
+    assert isinstance(written, WandbConfig)
+    for config in (WandbConfig(), written, WandbConfig(mode="online")):
+        Wandb(config, run, tmp_path, start=0)
+    assert [c["mode"] for c in calls.init] == [None, "offline", "online"]
+    modes = [wandb_mode(c) for c in calls.init]
+    assert modes == [environment or "online", "offline", "online"]
 
 
 def test_wandb_names_each_axis_counts_parameters_and_logs_the_objective(
