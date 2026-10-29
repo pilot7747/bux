@@ -84,9 +84,9 @@ class Router(nn.Module):
 def zero_split(
     z: torch.Tensor, weights: torch.Tensor, idx: torch.Tensor, num_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """A token's picks split as vLLM's ``ZeroExpertRouter`` splits them: the zero
-    experts' output, each token times its zero picks' weights summed, and the picks
-    the routed experts run, a zero expert's as expert 0 of weight 0.
+    """A token's picks split into the zero experts' output, each token times its zero
+    picks' weights summed, and the picks the fused MoE runs: a zero expert's as the
+    phantom expert ``num_experts``, of weight 0, which `phantom_map` skips.
 
     Args:
         z: The tokens as the experts take them, (T, d).
@@ -95,32 +95,32 @@ def zero_split(
         num_experts: The routed experts.
 
     Returns:
-        The zero experts' output, (T, d), and the routed experts' weights and picks.
+        The zero experts' output, (T, d), and the fused MoE's weights and picks.
     """
     zero = idx >= num_experts
     output = z * (weights * zero).sum(-1, keepdim=True).to(z.dtype)
-    return output, weights.masked_fill(zero, 0), idx.masked_fill(zero, 0)
+    return output, weights.masked_fill(zero, 0), idx.masked_fill(zero, num_experts)
 
 
 def given_logits(
     weights: torch.Tensor, idx: torch.Tensor, num_experts: int
 ) -> torch.Tensor:
-    """Logits that hand vLLM's fused MoE each token's picks of the routed experts
-    (`pick_given`): their weights where `idx` picks them, -inf elsewhere; picks of
-    the zero experts, ``num_experts`` and up, left out.
+    """Logits that hand vLLM's fused MoE each token's picks (`pick_given`): their
+    weights where `idx` picks a routed expert, -inf elsewhere, and -inf in the
+    phantom expert's column, ``num_experts``, which the zero experts' picks become.
 
     Args:
         weights: The router's weights of each token's picks, (T, k), final.
-        idx: The picks, (T, k).
+        idx: The picks, (T, k), zero experts' from `num_experts` on.
         num_experts: The routed experts.
 
     Returns:
-        The logits, (T, num_experts), in float32.
+        The logits, (T, num_experts + 1), in float32.
     """
-    shape = (idx.shape[0], num_experts + 1)  # the zero experts' picks go last
+    shape = (idx.shape[0], num_experts + 2)  # the zero experts' picks go last
     every = torch.full(shape, -torch.inf, dtype=torch.float32, device=idx.device)
-    at = idx.long().clamp(max=num_experts)
-    return every.scatter(-1, at, weights.float())[:, :num_experts]
+    at = torch.where(idx >= num_experts, num_experts + 1, idx.long())
+    return every.scatter(-1, at, weights.float())[:, : num_experts + 1]
 
 
 def pick_given(
@@ -130,9 +130,21 @@ def pick_given(
     renormalize: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """vLLM's custom routing of `given_logits`: each token's routed picks with their
-    weights, and, for each pick of a zero expert, a pick of weight 0."""
+    weights, and, for each pick of a zero expert, the phantom expert, its last
+    column, of weight 0."""
     values, ids = gating_output.topk(topk, -1)
-    return torch.where(values.isfinite(), values, 0.0), ids
+    given = values.isfinite()
+    phantom = gating_output.shape[-1] - 1
+    return torch.where(given, values, 0.0), torch.where(given, ids, phantom)
+
+
+def phantom_map(num_experts: int) -> torch.Tensor:
+    """The expert map that skips the phantom expert ``num_experts``: each routed
+    expert at its own slot and the phantom at -1, whose picks vLLM's Triton kernels
+    then neither multiply nor sum, as they skip another rank's experts under expert
+    parallelism."""
+    experts = torch.arange(num_experts + 1, dtype=torch.int32)
+    return torch.where(experts < num_experts, experts, -1).to(torch.int32)
 
 
 def pick_rows(
