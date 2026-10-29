@@ -163,6 +163,7 @@ def abstract(
 
     from bux import parallel
     from bux.architecture import Model
+    from bux.train import ema
     from bux.train.optim import optimizer
     from bux.train.stages import balanced
 
@@ -172,6 +173,7 @@ def abstract(
         model = Model(run.arch, rngs=nnx.Rngs(0))
         # The schedule has no state, so a constant one stands in for the run's.
         tx = optimizer(t.optimizer, lambda step: jnp.ones(()), model, t.clip)
+        tx = ema.beside(tx, t)  # the average is state as the moments are
         return model, nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     grid = None if gpus is None else _grid(run, gpus)

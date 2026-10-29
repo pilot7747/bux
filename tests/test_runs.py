@@ -103,7 +103,10 @@ def test_an_architecture_alone_is_not_a_run():
         ("steps = true", "'steps' must be an integer, found a boolean"),
         ("steps = 1.5", "'steps' must be an integer, found 1.5"),
         ("steps = 0", "'steps' must be greater than 0, found 0"),
-        ("optimizer = rmsnorm", "'optimizer' must be adamw(...) or muon(...), found"),
+        (
+            "optimizer = rmsnorm",
+            "'optimizer' must be adamw(...), muon(...) or normuon(...), found",
+        ),
         (
             "data = 3",
             "'data' must be text(...), chat(...), tokens(...), synthetic(...) or a mix",

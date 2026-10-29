@@ -294,7 +294,7 @@ _UNCOMPUTED |= {"objective", "search"}  # how a search ranks and proposes runs
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
 # Settings newer than run ids that are not configs, at the values runs computed with
 # before them, dumped.
-_NEWER_VALUES = {"batch_ramp": None, "curriculum": []}
+_NEWER_VALUES = {"batch_ramp": None, "curriculum": [], "ema": None}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
     "precision": {
@@ -311,6 +311,7 @@ _NEWER_FIELDS = {
         "ns_dtype": "float32",
         "ns_algorithm": "standard",
         "ns_restarts": None,
+        "cautious_weight_decay": False,
     },
     "schedule": {"horizon": 1.0},
 }
@@ -373,9 +374,10 @@ def _without_newer_fields(train: dict) -> dict:
     nor the `_UNCOMPUTED_FIELDS`."""
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
-        for field, before in fields.items():
-            if field in given and given[field] == before:
-                del given[field]
+        for part in (given, given.get("adam") or {}):  # and Muon's own AdamW
+            for field, before in fields.items():
+                if field in part and part[field] == before:
+                    del part[field]
     for setting, names in _UNCOMPUTED_FIELDS.items():
         for name in names:
             (train.get(setting) or {}).pop(name, None)
