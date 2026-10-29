@@ -343,7 +343,7 @@ in every run.
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate; by bux's own rule ([DPLR delta rules](#dplr-delta-rules)) without a conv or an output gate, with a `v_head_dim` other than `head_dim`, or a lower bound under -5. Not yet: speculative decoding |
 | `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, with a conv or none, `lightning`'s decay by the layer's depth among the token mixers and its RMSNorm of all heads, its statistics summed over the ranks, and `rwkv7`'s `v` port (the value residual). Not yet: `gla` without a conv in a 16-bit model, or speculative decoding |
 | `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
-| residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
+| residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`, with every setting, single-pass included; `msar`'s convs keep each sequence's last values in vLLM's Mamba cache ([Multi-stream attention residuals](#multi-stream-attention-residuals)) |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet. Serve those models with transformers
@@ -433,8 +433,33 @@ how often it moves it.
   PyTorch against the export, and `scripts/vllm_residual.py` compares the kernels
   with the PyTorch path on a GPU and times a branch both ways.
 
-The kernels are custom ops that stay inside vLLM's CUDA graphs: the graphs split at
-attention and the recurrent and MoE layers' ops, not at these. On an NVIDIA B300
+### Multi-stream attention residuals
+
+`msar` keeps attnres's sources, each finished one as its streams: itself and its
+causal convs over the tokens. A branch expands the newest source, which its convs
+read the last values of from before the step: each sequence's last
+`max(kernel_sizes) - 1` values of the source, which vLLM keeps in its Mamba cache, as
+a conv's state.
+
+- **Packs.** vLLM gives every state of its Mamba cache a page as large as the
+  model's largest. So the plugin packs the branches' states, d channels each, into
+  as few states as fill that page: a recurrent layer's, such as KDA's in the
+  hybrid. They come after every other state in `layer_types`. In the hybrid at a
+  width of 3328, the 104 branches before the head pack 46 to a state, in 3 pages per
+  sequence (about 10 MB), where a state each would take 104.
+- **Kernels.** In a 16-bit model, two Triton kernels convolve a step's tokens and
+  keep each sequence's last values, by vLLM's slots: decoded tokens one a sequence,
+  a prompt's chunk after its kept values. The op runs between the CUDA graph's
+  pieces, as a short conv does, and a decoding step's graph captures it. A float32
+  model, and any under `BUX_VLLM_RESIDUAL_KERNELS=torch`, takes the PyTorch path.
+  The read's softmax over depth and its mixer run in PyTorch, which torch.compile
+  fuses.
+- **Checks.** CPU tests run the plugin's branches against the export's, and its
+  steps' convs (prompts in chunks, then decoded tokens) against each whole sequence;
+  `scripts/vllm_residual.py` compares the kernels with the PyTorch path on a GPU.
+
+The other algebras' kernels are custom ops that stay inside vLLM's CUDA graphs: the
+graphs split at attention and the recurrent and MoE layers' ops, not at these. On an NVIDIA B300
 (2026-10-28, vLLM 0.32.0, a step of 8 tokens in a CUDA graph), an `hc` branch's read
 and write take 0.013 ms fused against 0.094 ms in PyTorch.
 
@@ -762,6 +787,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `rwkv7-residual` | RWKV-7's value residual through its `v` port, low ranks | 1.3e-5 | 0.11 (0.25) | - |
 | `hc` | hyper-connections, 4 streams | 8.1e-6 | 0.079 (0.10) | 0.086 |
 | `attnres` | attention residuals in blocks of 3 | 8.6e-6 | 0.098 (0.17) | 0.14 |
+| `msar` | multi-stream attention residuals in blocks of 3, convs of 4, 8 and 12 taps over the tokens | - | - | - |
+| `msar-hybrid` | `msar` in blocks of 2 on the hybrid's shape: KDA, gated global layers without positions, the conv on keys and values, the `v` port | - | - | - |
 | `mhc` | manifold-constrained hyper-connections | 8.1e-6 | 0.097 (0.11) | 0.11 |
 | `mhc-single` | mhc, single-pass | 6.7e-6 | 0.11 (0.10) | - |
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |
