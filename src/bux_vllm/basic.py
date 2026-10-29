@@ -1,10 +1,11 @@
-"""The embedding, the head, the dense MLP and the elementwise layers, in vLLM.
+"""The embedding, the value embeddings, the head, the dense MLP and the elementwise
+layers, in vLLM.
 
-Under tensor parallelism the embedding and the head split the vocabulary, an MLP its
+Under tensor parallelism the embeddings and the head split the vocabulary, an MLP its
 hidden units (a column-parallel up and gate, a row-parallel down), and the other
 layers are whole on every rank. Under vLLM's online FP8 weights the MLPs' and
 ``linear``'s projections take the engine's quantization config
-(`bux_vllm.common.quantization`); the embedding and the head stay in the model's
+(`bux_vllm.common.quantization`); the embeddings and the head stay in the model's
 dtype, as vLLM keeps its own models'.
 """
 
@@ -68,6 +69,32 @@ class Embedding(Layer):
             ctx.embedding, given = self, ctx.inputs_embeds
         x = self.embed(ids) if given is None else given
         return x if self.positions is None else x + self.positions[ctx.positions]
+
+
+class ValueEmbedding(Layer):
+    """bux's ``value_embed``: the step's tokens' rows of its table, split by
+    vocabulary as the embedding's (in the model's dtype, unquantized), pushed to its
+    ``ve`` port for a ``gqa`` layer to add to its values; the stream goes on as it
+    is. Each rank gets every row's whole width, and keeps its kv heads' share."""
+
+    bux_types = ("value_embed",)
+
+    def __init__(self, c: dict, width: Any, site: Site):
+        super().__init__()
+        vocab = site.config.vocab_size
+        prefix = f"{site.path}.table"
+        self.table = VocabParallelEmbedding(vocab, c["features"], prefix=prefix)
+        self.taps = [tap for _, tap, mode in site.ports if mode == "write"]
+
+    def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
+        return {"table.weight": (self.table.weight, ())}
+
+    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        assert ctx.input_ids is not None, "value_embed looks up the step's token ids"
+        rows = self.table(ctx.input_ids)
+        for tap in self.taps:
+            ctx.push(tap, rows)
+        return x
 
 
 class Head(Layer):

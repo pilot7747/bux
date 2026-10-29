@@ -1,7 +1,8 @@
 """What a ``gqa`` layer does to its queries, keys and values besides attending, in
-plain PyTorch: its ports, the value residual of its ``v`` port, the kv heads a rank
-keeps under tensor parallelism, its conv's taps (``kv_conv_size``) as vLLM's conv
-kernels take them, and the queries' scale by their position.
+plain PyTorch: its ports, the value embeddings of its ``ve`` port, the value residual
+of its ``v`` port, the kv heads a rank keeps under tensor parallelism, its conv's
+taps (``kv_conv_size``) as vLLM's conv kernels take them, and the queries' scale by
+their position.
 
 A port is ``[name, tap, mode]``, as ``bux.export.plan`` writes it: ``attn(v=@v1)``
 writes the layer's values to the tap ``v1`` (``write``), ``attn(v=$v1)`` reads them
@@ -13,10 +14,13 @@ runs (`sources`), as vLLM's cross-layer KV sharing needs it.
 
 from __future__ import annotations
 
+import os
+
 import torch
+import torch.nn.functional as F
 
 #: The ports a ``gqa`` layer runs in vLLM.
-PORTS = ("v", "kv", "index")
+PORTS = ("v", "kv", "index", "ve")
 
 
 def reads(ports: list, name: str) -> tuple[str, bool] | None:
@@ -50,7 +54,11 @@ def check_ports(c: dict, ports: list) -> None:
         raise NotImplementedError(f"gqa: the {', '.join(others)} port not in vLLM yet")
     if not reads(ports, "kv"):
         return
-    if any(n == "v" for n, _, _ in ports) or c["indexer"] or reads(ports, "index"):
+    if (
+        any(n in ("v", "ve") for n, _, _ in ports)
+        or c["indexer"]
+        or reads(ports, "index")
+    ):
         raise NotImplementedError("gqa: a v port or an indexer beside reading kv")
 
 
@@ -115,6 +123,64 @@ def mix_values(
     return (a * v.float() + b * v1.float()).to(v.dtype)
 
 
+def add_value_embedding(
+    x: torch.Tensor,
+    v: torch.Tensor,
+    e: torch.Tensor,
+    w: torch.Tensor | None,
+    heads: tuple[int, int],
+) -> torch.Tensor:
+    """bux's value embeddings: the layer's values `v` plus the ``ve`` port's rows,
+    by a gate per kv head of the first channels of its input and of the rows,
+    ``v + 2 sigmoid(W [x[:n], e[:n]]) e``; ``v + e`` without one.
+
+    Args:
+        x: The layer's input, (T, d).
+        v: This rank's values, (T, g dv): its kv heads'.
+        e: The rows of every kv head, (T, kv dv), in the model's dtype.
+        w: The gate's weight of every kv head, (kv, 2n); None for no gate.
+        heads: This rank's first kv head and how many it keeps, g.
+
+    Returns:
+        The values, as v.
+    """
+    first, g = heads
+    dv = v.shape[-1] // g
+    rows = e[:, first * dv : (first + g) * dv]
+    if w is None:
+        return v + rows
+    n = w.shape[1] // 2
+    gate = F.linear(torch.cat([x[:, :n], e[:, :n]], -1), w[first : first + g])
+    return v + (2 * torch.sigmoid(gate)).repeat_interleave(dv, -1) * rows
+
+
+def keys_from_values(c: dict, ports: list) -> bool:
+    """Whether every key of the ``gqa`` layer `c` is its value times its key norm's
+    gain, so that one cached vector a token serves as both, the gain on the queries
+    (`bux_vllm.keyed`): values from the keys (``k_eq_v``), the keys' norm an RMSNorm
+    of each head, without a bias, at the values' eps, no RoPE, and no port that
+    mixes other values in (``v`` and ``ve`` read) or shares the cache (``kv``); and
+    asked for, by ``BUX_VLLM_K_EQ_V_CACHE=keys``. By default the cache keeps keys
+    and values apart, as vLLM's Gemma 4 does, on the backend vLLM picks."""
+    qk = c["qk_norm"]
+    norm = qk is not None and qk["type"] == "rmsnorm" and not qk["bias"]
+    plain = norm and not qk["scale_input"] and not c["qk_norm_all_heads"]
+    others = any(reads(ports, n) for n in ("v", "ve", "kv", "index")) or writes(
+        ports, "kv"
+    )
+    own = not (c["indexer"] or c["relative_bias"] or c["rope"] or others)
+    keyed = os.environ.get("BUX_VLLM_K_EQ_V_CACHE", "both") == "keys"
+    return bool(c["k_eq_v"] and plain and own and keyed)
+
+
+def value_norm(qk: dict | None) -> dict:
+    """The config of the norm of values made from the keys (``k_eq_v``): Gemma 4's
+    RMSNorm without a gain, at the eps of the layer's QK-norm `qk`, or 1e-6."""
+    eps = 1e-6 if qk is None else qk["eps"]
+    flags = ("affine", "bias", "zero_centered", "scale_input")
+    return {"type": "rmsnorm", "eps": eps} | dict.fromkeys(flags, False)
+
+
 def kv_heads(kv: int, tp: int, rank: int) -> tuple[int, int]:
     """The first kv head of `kv` a rank of `tp` keeps, and how many: a share each,
     or one head copied on each of ``tp // kv`` ranks where there are fewer heads
@@ -132,9 +198,10 @@ def head_dims(c: dict, width: int) -> tuple[int, int]:
 
 def conv_channels(c: dict, width: int, tp: int) -> int:
     """The channels of the conv on keys and values a rank of `tp` keeps: its kv
-    heads' keys, then their values."""
+    heads' keys, then their values; the keys alone for values made from them
+    (``k_eq_v``)."""
     dk, dv = head_dims(c, width)
-    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + dv)
+    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + (0 if c.get("k_eq_v") else dv))
 
 
 def conv_rows(taps: torch.Tensor, dims: int, first: int, n: int) -> torch.Tensor:

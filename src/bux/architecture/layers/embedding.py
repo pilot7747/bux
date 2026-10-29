@@ -1,4 +1,5 @@
-"""The token embedding and the layers that read it: the LM head and nextn."""
+"""The token embedding and the layers that read it, the LM head and nextn, and the
+value embeddings."""
 
 from typing import Literal
 
@@ -8,11 +9,12 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import initializers, parallel
+from bux.architecture.common.ports import write
 from bux.architecture.common.sharding import linear, projection
 from bux.architecture.copy import CopyPointer
 from bux.architecture.layers.norm import Norm
 from bux.architecture.logits import HeadOutput, Projection
-from bux.architecture.registry import Context, Taps, positions, register
+from bux.architecture.registry import Context, Stream, Taps, positions, register
 from bux.architecture.residual import widen, widening
 from bux.lang import ir
 
@@ -116,6 +118,60 @@ def _(
     if ctx.built.embedding is None:
         ctx.built.embedding = embedding
     return embedding
+
+
+class ValueEmbedding(nnx.Module):
+    """Value embeddings (modded-nanogpt's ``value_embeds``), ``value_embed``: a table
+    of a row per token, which pushes the input tokens' rows to its ``ve`` port and
+    leaves the stream as it is.
+
+    A ``gqa`` layer that reads the port adds the rows to its values, by a gate of its
+    own (`~bux.config.GQAConfig`'s ``value_embed_gate``). The rows start from
+    ``normal(std)``, as modded-nanogpt's, unless the model sets an init, which starts
+    them as its embedding. They split over the vocabulary as the embedding's do, and
+    Muon leaves them to the other optimizer (``no_muon``); weight decay takes them,
+    as modded-nanogpt's.
+
+    Args:
+        config: Its settings (`bux.config.ValueEmbeddingConfig`).
+        vocab: The rows of the table, the architecture's ``vocab_size``.
+        ports: The ports the source lists for it, as ``value_embed(ve=@ve1)``.
+        rngs: The random streams the table starts from.
+    """
+
+    no_muon = True
+
+    def __init__(
+        self,
+        config: cfg.ValueEmbeddingConfig,
+        vocab: int,
+        ports: tuple[ir.Port, ...],
+        rngs: nnx.Rngs,
+    ):
+        own = nnx.initializers.normal(config.std)
+        init = parallel.named("vocab", None, init=initializers.weight("embed", own=own))
+        self.table = nnx.Embed(vocab, config.features, embedding_init=init, rngs=rngs)
+        self.ports = ports
+
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
+        """Push the rows of the pass's input tokens, ``b t features``, to the ``ve``
+        port, and return the stream `x` unchanged."""
+        assert taps.tokens is not None
+        table = parallel.shard(self.table.embedding[...], "vocab", None)
+        rows = jnp.take(table, taps.tokens, axis=0)
+        write(taps, self.ports, "ve", parallel.shard(rows, "batch", "seq", None))
+        return x
+
+
+@register("value_embed")
+def _(
+    config: cfg.ValueEmbeddingConfig,
+    width: ir.Width,
+    ports: tuple[ir.Port, ...],
+    ctx: Context,
+) -> ValueEmbedding:
+    assert ctx.arch.vocab_size is not None
+    return ValueEmbedding(config, ctx.arch.vocab_size, ports, ctx.rngs)
 
 
 class Head(nnx.Module):

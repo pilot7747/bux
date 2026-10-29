@@ -1,4 +1,5 @@
-"""The embedding, the head, the dense MLP and the elementwise layers, exported."""
+"""The embedding, the value embeddings, the head, the dense MLP and the elementwise
+layers, exported."""
 
 from __future__ import annotations
 
@@ -36,6 +37,24 @@ class TokenEmbedding(nn.Module):
         ctx.embedding = ctx.embedding or self
         x = self.embed_tokens(ids)
         return x if self.positions is None else x + self.positions(ctx.positions)
+
+
+class ValueEmbedding(nn.Module):
+    """bux's ``value_embed``: a row per token, pushed to its ``ve`` port for a
+    ``gqa`` layer to add to its values; the stream goes on as it is."""
+
+    bux_types = ("value_embed",)
+
+    def __init__(self, c: dict, width: Any, site: Site):
+        super().__init__()
+        self.table = nn.Embedding(site.config.vocab_size, c["features"])
+        self.taps = [tap for name, tap, mode in site.ports if mode == "write"]
+
+    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        rows = self.table(ctx.tokens)
+        for tap in self.taps:
+            ctx.push(tap, rows)
+        return x
 
 
 class Head(nn.Module):

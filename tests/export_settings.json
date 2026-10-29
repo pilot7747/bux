@@ -54,13 +54,18 @@
  "GQAConfig": [
   "attention_dropout",
   "bias",
+  "exclusive",
   "fused_qkv",
   "gate_activation",
+  "gate_cross_head",
   "gate_head_bias",
+  "gate_input_rank",
+  "gate_output_rank",
   "gate_per_head",
   "gated",
   "head_dim",
   "indexer",
+  "k_eq_v",
   "kv_conv_size",
   "log_scale",
   "log_scale_floor",
@@ -81,12 +86,16 @@
   "softcap",
   "type",
   "v_head_dim",
+  "value_embed_gate",
   "value_residual"
  ],
  "MLAConfig": [
   "attention_dropout",
   "gate_activation",
+  "gate_cross_head",
   "gate_head_bias",
+  "gate_input_rank",
+  "gate_output_rank",
   "gate_per_head",
   "gated",
   "indexer",
@@ -113,7 +122,10 @@
   "attention_dropout",
   "compress_ratio",
   "gate_activation",
+  "gate_cross_head",
   "gate_head_bias",
+  "gate_input_rank",
+  "gate_output_rank",
   "gate_per_head",
   "gated",
   "head_dim",
@@ -271,6 +283,11 @@
   "max_positions",
   "norm",
   "scale_by_sqrt_dim",
+  "type"
+ ],
+ "ValueEmbeddingConfig": [
+  "features",
+  "std",
   "type"
  ],
  "LMHeadConfig": [

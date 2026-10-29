@@ -23,6 +23,7 @@ from bux.architecture.attention.gqa import build_gqa
 from bux.architecture.attention.indexer import _top
 from bux.architecture.attention.mla import MLA, build_mla
 from bux.architecture.attention.rope import rotate
+from bux.architecture.layers.embedding import ValueEmbedding
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
@@ -1052,6 +1053,134 @@ def test_a_value_residual_mixes_the_taps_values_into_the_layers(kind, learned, w
     assert jnp.allclose(v, a * own + b * first, atol=1e-6)
 
 
+VE_READ = ir.Port(name="ve", tap="ve1", mode="read")
+KV_WRITE = ir.Port(name="kv", tap="kv", mode="write")
+
+
+@pytest.mark.parametrize("gate", [6, None], ids=["gated", "plain"])
+def test_value_embeddings_add_to_the_values_by_a_gate_that_starts_at_one(gate):
+    """v + 2 sigmoid(W [x[:6], e[:6]]) e, W at 0 (modded-nanogpt), or v + e."""
+    attn = gqa((VE_READ, KV_WRITE), value_embed_gate=gate)
+    assert attn.v is not None
+    x, e = inputs(), jax.random.normal(jax.random.key(2), (2, 12, 16))
+    taps = Taps({"ve1": [e]})
+    attn(x, taps)
+    [(_, v)] = taps["kv"]
+    own = attn.v(x).reshape(2, 12, 2, 8)
+    assert jnp.allclose(v, own + e.reshape(2, 12, 2, 8), atol=1e-6)
+    if gate is None:
+        assert attn.ve_gate is None
+        return
+    assert attn.ve_gate is not None and attn.ve_gate.kernel.shape == (12, 2)
+    w = jax.random.normal(jax.random.key(3), (12, 2))
+    attn.ve_gate.kernel[...] = w
+    taps = Taps({"ve1": [e]})
+    attn(x, taps)
+    [(_, v)] = taps["kv"]
+    g = 2 * jax.nn.sigmoid(jnp.concatenate([x[..., :6], e[..., :6]], -1) @ w)
+    want = own + g[..., None] * e.reshape(2, 12, 2, 8)
+    assert jnp.allclose(v, want, atol=1e-5)
+
+
+def test_value_embeddings_go_in_before_the_value_residual():
+    v1 = ir.Port(name="v", tap="v1", mode="read")
+    attn = gqa((VE_READ, v1, KV_WRITE), value_embed_gate=None)
+    x, e = inputs(), jax.random.normal(jax.random.key(2), (2, 12, 16))
+    first = jax.random.normal(jax.random.key(4), (2, 12, 2, 8))
+    taps = Taps({"ve1": [e], "v1": [first]})
+    attn(x, taps)
+    [(_, v)] = taps["kv"]
+    assert attn.v is not None
+    own = attn.v(x).reshape(2, 12, 2, 8) + e.reshape(2, 12, 2, 8)
+    assert jnp.allclose(v, 0.5 * own + 0.5 * first, atol=1e-6)
+
+
+def test_a_value_embedding_pushes_the_rows_of_the_input_tokens():
+    c = cfg.ValueEmbeddingConfig(features=16)
+    write = ir.Port(name="ve", tap="t", mode="write")
+    table = ValueEmbedding(c, V, (write,), nnx.Rngs(0))
+    rows = table.table.embedding[...]
+    assert rows.shape == (V, 16)
+    assert jnp.allclose(rows.std(), 0.01, rtol=0.1)  # modded-nanogpt's init
+    ids, x = tokens(), inputs()
+    taps = Taps(tokens=ids)
+    assert table(x, taps) is x
+    assert jnp.array_equal(taps["t"][0], rows[ids])
+    m = model(
+        "ve = value_embed(features=16)\n"
+        "a = gqa(num_heads=4, num_kv_heads=2)\n"
+        "model = embed ve(ve=@t) [norm a(ve=$t)] [norm ve(ve=@u) a(ve=$u!)] norm head"
+    )
+    assert m(ids).shape == (2, 12, V)
+
+
+def test_value_embeddings_must_match_the_kv_heads_and_have_values_to_add_to():
+    narrow = "ve = value_embed(features=8)\na = gqa(num_heads=4, num_kv_heads=2)\n"
+    m = model(narrow + "model = embed ve(ve=@t) [norm a(ve=$t)] norm head")
+    with pytest.raises(ValueError, match="features=16"):
+        m(tokens())
+    with pytest.raises(ValueError, match="reads kv"):
+        gqa((VE_READ, ir.Port(name="kv", tap="kv", mode="read")))
+
+
+def test_value_embeddings_pass_a_widened_stream_through():
+    arch = compile(
+        PRELUDE + "residual = hc(expansion=2)\n"
+        "ve = value_embed(features=16)\n"
+        "a = gqa(num_heads=4, num_kv_heads=2)\n"
+        "model = embed ve(ve=@t) [norm a(ve=$t)] [norm ffn] norm head"
+    )
+    first = list(ir.unrolled_layers(arch.graph))[1]
+    assert first.config.type == "value_embed" and first.width == "streams"
+    assert Model(arch, rngs=nnx.Rngs(0))(tokens()).shape == (2, 12, V)
+
+
+KV_WRITE = ir.Port(name="kv", tap="kv", mode="write")
+
+
+def rms(x, eps):
+    return x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
+
+
+@pytest.mark.parametrize("conv", [None, 3], ids=["plain", "conv"])
+@pytest.mark.parametrize("fused", [False, True], ids=["split", "fused"])
+def test_values_from_the_keys_are_each_heads_key_rms_normalized(conv, fused):
+    """Gemma 4's K=V: v = rmsnorm(W_k x) per head, with no gain and no RoPE, at the
+    key norm's eps; the keys go on through their norm and RoPE."""
+    kw = {
+        "qk_norm": cfg.NormalizationConfig(type="rmsnorm", eps=1e-5),
+        "kv_conv_size": conv,
+    }
+    attn = gqa((KV_WRITE,), k_eq_v=True, fused_qkv=fused, **kw)
+    assert attn.v is None and attn.v_conv is None and attn.v_norm is not None
+    x = inputs()
+    taps = Taps()
+    attn(x, taps)
+    [(k, v)] = taps["kv"]
+    raw = attn.qkv(x)[..., 32:] if attn.qkv is not None else attn.k(x)
+    assert raw.shape == (2, 12, 16)
+    if attn.k_conv is not None:
+        raw = raw + attn.k_conv(raw, Taps())
+    heads = raw.reshape(2, 12, 2, 8)
+    assert jnp.allclose(v, rms(heads, 1e-5), atol=1e-5)
+    assert attn.k_norm is not None and attn.rope is not None
+    assert jnp.allclose(k, rotate(attn.k_norm(heads), attn.rope), atol=1e-5)
+
+
+def test_values_from_the_keys_take_no_parameters_and_default_off_changes_nothing():
+    plain, same = gqa(), gqa(k_eq_v=False)
+    shared = gqa(k_eq_v=True)
+    params = lambda m: jax.tree.leaves(nnx.state(m, nnx.Param))
+    assert all(jnp.array_equal(a, b) for a, b in zip(params(plain), params(same)))
+    assert num_params(plain) - num_params(shared) == 32 * 16  # no v projection
+    x = inputs()
+    assert jnp.array_equal(plain(x, Taps()), same(x, Taps()))
+    with pytest.raises(ValueError, match="v_head_dim"):
+        cfg.GQAConfig(
+            num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=4, k_eq_v=True
+        )
+
+
 # --- Split over devices (bux.parallel) -------------------------------------------------
 
 ONE = "mesh(data=1)"
@@ -1067,6 +1196,14 @@ SPLIT = {
     "power_scale": (
         "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_head_bias=true,"
         " power_scale=0.5, power_scale_length=2)"
+    ),
+    # XSA, learned: each query head takes its group's value, which on tensor=4 stays
+    # whole
+    "xsa": "gqa(num_heads=4, num_kv_heads=2, gated=true, exclusive=learned)",
+    # HyGA: per-head matrices of the gate, and a gate of each head from all of them
+    "hyga": (
+        "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_input_rank=4,"
+        " gate_output_rank=4, gate_cross_head=true)"
     ),
     # MiniMax-M2's QK-norm of all heads together, whose mean square spans the devices
     "qk_norm_all_heads": (
@@ -1116,7 +1253,9 @@ def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
     trains_the_same(losses, involuntary, layer, BY_HEAD)
 
 
-@pytest.mark.parametrize("layer", ["gqa", "power_scale", "mla", "msa", "csa"])
+@pytest.mark.parametrize(
+    "layer", ["gqa", "power_scale", "xsa", "hyga", "mla", "msa", "csa"]
+)
 def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
     trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)
 
