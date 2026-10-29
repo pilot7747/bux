@@ -26,7 +26,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture import observe
 from bux.architecture.attention import sparse
 from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
@@ -62,6 +62,7 @@ from bux.parallel.context import (
     softcap,
     weighted_values,
 )
+from bux.parallel.flash import per_query_head
 from bux.train import flops
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
@@ -73,7 +74,8 @@ class SoftmaxAttention(nnx.Module):
     """What the softmax attention layers share once they have q, k and v.
 
     It holds the attention method's settings (the scale, softcap, sliding window and
-    sinks) and the output's norm, gate, projection and dropout. A layer makes its own
+    sinks) and the output's norm, gate (with HyGA's, `_gate`), projection and dropout.
+    A layer makes its own
     projections, `o` among them, before it calls this constructor, so that a seed
     draws them first. Its forward then makes q, k and v and calls `_attend` and
     `_output`.
@@ -112,7 +114,8 @@ class SoftmaxAttention(nnx.Module):
     ):
         self.heads, self.kv_heads = heads, kv_heads
         self.ports = tuple(ports)
-        gate_width = heads if config.gate_per_head else heads * v_head_dim
+        gate_dims = config.gate_input_rank or v_head_dim
+        gate_width = heads if config.gate_per_head else heads * gate_dims
         names = ("embed", ("heads", heads))
 
         # The randomly initialized layers, after the layer's own projections.
@@ -142,6 +145,27 @@ class SoftmaxAttention(nnx.Module):
             Norm(config.output_norm, v_head_dim) if config.output_norm else None
         )
         self.gate_activation = config.gate_activation
+        self._init_hybrid_gate(config, v_head_dim, bias, rngs)
+
+    def _init_hybrid_gate(
+        self, config: SoftmaxConfig, dv: int, bias: bool, rngs: nnx.Rngs
+    ) -> None:
+        """Make HyGA's parts of the gate (`_gate`): each head's up projection of a
+        low-rank input gate, its down and up projections of its own output, and the
+        gate of each head from all of them."""
+        h, init = self.heads, initializers.weight(batch_axis=(0,))
+
+        def per_head(n_in: int, n_out: int) -> nnx.Param:
+            shape = (h, n_in, n_out)
+            return nnx.Param(init(rngs.params(), shape), names=("heads", None, None))
+
+        rank, own = config.gate_input_rank, config.gate_output_rank
+        self.gate_up = per_head(rank, dv) if rank else None
+        self.output_gate_down = per_head(dv, own) if own else None
+        self.output_gate_up = per_head(own, dv) if own else None
+        names = (("heads", h), None)
+        cross = config.gate_cross_head
+        self.cross_gate = linear(h * dv, h, names, bias, rngs) if cross else None
 
     def _init_logit_layers(
         self, config: SoftmaxConfig, width: int, bias: bool, rngs: nnx.Rngs
@@ -217,19 +241,47 @@ class SoftmaxAttention(nnx.Module):
     def _output(
         self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
     ) -> Float[Array, "b t d"]:
-        """Normalize and gate the head outputs (the gate plus its bias per head, if
-        any), then project them back to the width."""
-        b, t, _ = x.shape
+        """Normalize and gate the head outputs (`_gate`), then project them back to
+        the width."""
         out = checkpoint_name(out, "attention.out")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
-            gate = self.gate(x).reshape(b, t, self.heads, -1)
-            if self.gate_bias is not None:
-                gate = gate + self.gate_bias[...].astype(gate.dtype)[:, None]
-            out = out * activation(self.gate_activation, gate)
+            out = out * self._gate(x, out)
         y = self._project(shard_heads(out))
         return y if self.output_dropout is None else self.output_dropout(y)
+
+    def _gate(
+        self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
+    ) -> Float[Array, "b t h _"]:
+        """Return the gate on the heads' outputs `out`: ``act(x W + b_h)``, `x` the
+        layer's input and b_h a bias per head, if any.
+
+        HyGA (Zhou et al., 2026, arXiv 2608.11805) adds to it, each part a setting:
+        the input's projection low-rank, ``SiLU(x W_d) W_u`` (its X-gate); the head's
+        own output in the logits, ``+ SiLU(o W_d) W_u`` (its H-gate, added before the
+        activation, the paper's fused form); and a gate of each head from all heads'
+        outputs, ``sigmoid(o W_c)``, which multiplies the first (its C-gate). Each
+        head has its own W_u, and its own W_d of its output. The paper's gate reads
+        the heads' outputs as attention made them; here they are what the gate
+        multiplies, after ``output_norm``. It sets no init: its matrices start as the
+        model's others.
+        """
+        assert self.gate is not None
+        b, t, _ = x.shape
+        logits = self.gate(x).reshape(b, t, self.heads, -1)
+        if self.gate_up is not None:
+            logits = _by_head(jax.nn.silu(logits), self.gate_up)
+        if self.output_gate_down is not None and self.output_gate_up is not None:
+            low = jax.nn.silu(_by_head(out, self.output_gate_down))
+            logits = logits + _by_head(low, self.output_gate_up)
+        if self.gate_bias is not None:
+            logits = logits + self.gate_bias[...].astype(logits.dtype)[:, None]
+        gate = activation(self.gate_activation, logits)
+        if self.cross_gate is None:
+            return gate
+        heads = jax.nn.sigmoid(self.cross_gate(out.reshape(b, t, -1)))
+        return gate * heads[..., None]
 
     def _project(self, out: Float[Array, "b t h dv"]) -> Float[Array, "b t d"]:
         """Project the heads back to the width."""
@@ -246,8 +298,10 @@ class Attention(SoftmaxAttention):
     to k and v under ``kv_conv_size`` (Inkling), applies QK-norm (of each head, or of
     all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
-    run's ``methods.attention`` (`bux.parallel.context`). The heads' outputs then go
-    through `SoftmaxAttention`'s norm, gate, output projection and dropout.
+    run's ``methods.attention`` (`bux.parallel.context`). Under ``exclusive`` (XSA)
+    each head's output loses its part along the query's own value (`exclusive`).
+    The heads' outputs then go through `SoftmaxAttention`'s norm, gate, output
+    projection and dropout.
     `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
     the config needs them.
 
@@ -341,6 +395,24 @@ class Attention(SoftmaxAttention):
         trained = reads(ports, "v") and config.value_residual != "fixed"
         self.v_mix = nnx.Param(jnp.full(shape, 0.5, jnp.float32)) if trained else None
         self.ve_gate = _value_embed_gate(config, ports, projects_kv, rngs)
+        self._exclusion(config, projects_kv)
+
+    def _exclusion(self, config: cfg.GQAConfig, projects_kv: bool) -> None:
+        """Keep XSA's setting, and its strength for each head where it learns them.
+
+        Raises:
+            ValueError: XSA in a layer that reads its kv port, whose values are
+                another layer's.
+        """
+        self.exclusive = config.exclusive
+        if self.exclusive and not projects_kv:
+            raise ValueError(
+                "gqa: exclusive (XSA) takes the layer's own values, which a layer that "
+                "reads the kv port does not make"
+            )
+        learned = config.exclusive == "learned"
+        zeros = jnp.zeros(self.heads)
+        self.xsa_alpha = nnx.Param(zeros, names=("heads",)) if learned else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         """Attend each position to those before it in its document, and to itself.
@@ -357,7 +429,17 @@ class Attention(SoftmaxAttention):
         x, projected = self._projections(x)
         q, k, v = self._heads(x, projected, docs, taps)
         self._observe(q, k, docs, taps)
-        return self._output(x, self._attend(x, q, k, v, docs))
+        return self._output(x, self._exclude(self._attend(x, q, k, v, docs), v))
+
+    def _exclude(
+        self, out: Float[Array, "b t h dv"], v: Float[Array, "b t g dv"]
+    ) -> Float[Array, "b t h dv"]:
+        """Return the heads' outputs by XSA (`exclusive`) under ``exclusive``, else
+        as they are."""
+        if not self.exclusive:
+            return out
+        strength = None if self.xsa_alpha is None else jnp.tanh(self.xsa_alpha[...])
+        return exclusive(out, v, strength)
 
     def _heads(
         self,
@@ -482,6 +564,41 @@ class Attention(SoftmaxAttention):
         if self.value_residual == "learned":
             return w[0] * v + w[1] * v1
         return w * v + (1 - w) * v1
+
+
+def exclusive(
+    out: Float[Array, "b t h dv"],
+    v: Float[Array, "b t g dv"],
+    strength: Float[Array, " h"] | None = None,
+) -> Float[Array, "b t h dv"]:
+    """Return each head's output y less its part along its query's own value v:
+    exclusive self-attention (XSA; Zhai, 2026, arXiv 2603.09078).
+
+    ``y - s (y . u) u`` with ``u = v / max(norm(v), 1e-12)``, as ``F.normalize`` makes it,
+    computed in float32. A query head takes the value of its group's kv head at its
+    own position. The paper removes the whole part, s = 1; modded-nanogpt's learned
+    XSA scales it by ``s = tanh(a)`` for each head (`strength`).
+
+    Args:
+        out: The heads' outputs, of t queries.
+        v: The values the heads attended to at the same t positions.
+        strength: The share s of the part removed for each head; None for all of it.
+
+    Returns:
+        The outputs, in their dtype.
+    """
+    y = out.astype(jnp.float32)
+    u = per_query_head(v, out.shape[2]).astype(jnp.float32)
+    u = u * jax.lax.rsqrt(jnp.maximum(jnp.sum(u * u, -1, keepdims=True), 1e-24))
+    along = jnp.sum(y * u, -1, keepdims=True) * u
+    if strength is not None:
+        along = along * strength.astype(jnp.float32)[:, None]
+    return (y - along).astype(out.dtype)
+
+
+def _by_head(x: Float[Array, "b t h i"], w: nnx.Param) -> Float[Array, "b t h o"]:
+    """Return each head's `x` times its own matrix of `w`, h by i by o."""
+    return jnp.einsum("bthi,hio->btho", x, w[...].astype(x.dtype))
 
 
 def _value_embed_gate(
@@ -971,7 +1088,8 @@ class SparseAttention(Sparse, Attention):
         docs = segments(taps)
         x, projected = self._projections(x)
         heads = self._heads(x, projected, docs, taps)
-        return self._output(x, self._attend_tokens(x, x, heads, docs, taps))
+        out = self._attend_tokens(x, x, heads, docs, taps)
+        return self._output(x, self._exclude(out, heads[2]))
 
 
 def pick[L: SoftmaxAttention](

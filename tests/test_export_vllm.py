@@ -19,6 +19,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
@@ -53,6 +54,7 @@ from bux_vllm import (
     latent,
     linear,
     ngram,
+    outputs,
     plan,
     residual,
     routing,
@@ -1015,6 +1017,50 @@ def test_the_value_residual_mixes_as_bux(kind: str) -> None:
     flat = [torch.from_numpy(np.array(a)[0].reshape(8, 32)) for a in (v, v1)]
     got = kv.mix_values(kind, w, *flat)
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-6)
+
+
+@pytest.mark.parametrize("learned", [False, True], ids=["fixed", "learned"])
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
+    y = jax.random.normal(jax.random.key(1), (1, 8, 4, 16))
+    v = jax.random.normal(jax.random.key(2), (1, 8, groups, 16))
+    s = jax.random.normal(jax.random.key(3), (4,)) if learned else None
+    want = bux_gqa.exclusive(y, v, None if s is None else jnp.tanh(s))[0]
+    strength = None if s is None else torch.from_numpy(np.array(s)).tanh()
+    got = outputs.exclusive(
+        *(torch.from_numpy(np.array(a)[0]) for a in (y, v)), strength
+    )
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
+
+
+def test_hyga_s_gate_is_bux_s() -> None:
+    c = cfg.GQAConfig(
+        num_heads=4,
+        num_kv_heads=2,
+        gated=True,
+        gate_input_rank=3,
+        gate_output_rank=5,
+        gate_cross_head=True,
+        gate_head_bias=True,
+    )
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.gate is not None and attn.cross_gate is not None
+    assert attn.gate_up is not None and attn.gate_bias is not None
+    attn.gate_bias[...] = jax.random.normal(jax.random.key(3), (4,))
+    assert attn.output_gate_down is not None and attn.output_gate_up is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    out = jax.random.normal(jax.random.key(2), (1, 8, 4, 16))
+    want = attn._gate(x, out)[0]
+
+    def t(a: Any) -> torch.Tensor:
+        return torch.from_numpy(np.array(a))
+
+    weights = (attn.gate_up, attn.output_gate_down, attn.output_gate_up)
+    logits = t(attn.gate(x)[0]).view(8, 4, -1)
+    logits = outputs.hybrid_logits(logits, t(out[0]), *(t(w[...]) for w in weights))
+    gate = torch.sigmoid(logits + t(attn.gate_bias[...])[:, None])
+    cross = torch.sigmoid(t(attn.cross_gate(out.reshape(1, 8, -1))[0]))[..., None]
+    np.testing.assert_allclose((gate * cross).numpy(), np.asarray(want), atol=1e-6)
 
 
 @pytest.mark.parametrize("gate", [6, None], ids=["gated", "plain"])
@@ -2501,10 +2547,11 @@ def built(
 
 def kept(model: Any, path: str) -> bool:
     """Whether the plugin keeps the vLLM linear layer at `path` in the model's
-    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's, and
-    a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
+    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's,
+    HyGA's cross-head gate of an output a head, and a sparse MLA's ``kv_b``, whose
+    weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name == "shared_gate":
+    if name in ("shared_gate", "cross_gate"):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 

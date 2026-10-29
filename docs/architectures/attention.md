@@ -57,6 +57,7 @@ model = embed block^12 norm head(tied=true)
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
+| `exclusive` | `false` | each head's output less its part along the token's own value: `true` or `learned` ([below](#exclusive-self-attention-xsa)) (XSA) |
 | `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
 
 GPT-2 small is MHA with biases and one fused projection
@@ -191,6 +192,9 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `gate_per_head` | `false` | one gate value per head instead (with `gated`, as the next two) | Laguna |
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
+| `gate_input_rank` | `none` | the gate's projection of the input low-rank, `SiLU(x W_d) W_u` ([Gated attention](#gated-attention)) | HyGA |
+| `gate_output_rank` | `none` | the gate also reads each head's own output, by a rank of this many dims | HyGA |
+| `gate_cross_head` | `false` | a second gate, a value a head, from all the heads' outputs | HyGA |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
 | `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3 |
 | `softcap` | `none` | `c * tanh(logits / c)` on the logits | Gemma 2 |
@@ -271,6 +275,30 @@ main ones:
   attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
              gated=true, gate_head_bias=true)
   ```
+
+- **G1 by HyGA** (Zhou et al., 2026, arXiv 2608.11805): the gate of head $i$ also
+  reads the head's output $o_i$, and a gate of each head from all of them multiplies
+  it:
+
+  $$
+  o_i' = o_i \odot \sigma\big(x W_i + \mathrm{SiLU}(o_i W^d_i) W^u_i\big)
+  \odot \sigma\big((o W_c)_i\big).
+  $$
+
+  `gate_output_rank=r` adds the second term, $W^d_i$ and $W^u_i$ of rank $r$ each
+  head's own (the H-gate). `gate_cross_head=true` adds the last factor, $o$ all the
+  heads' outputs side by side (the C-gate). `gate_input_rank=r` makes the first term
+  low-rank, $\mathrm{SiLU}(x \bar W^d_i) \bar W^u_i$ (the paper's cheaper X-gate). The
+  paper's main runs have the H-gate as wide as the head, the X-gate full and learned
+  sinks:
+
+  ```bux
+  attn = gqa(num_heads=8, num_kv_heads=2, gated=true, gate_output_rank=64,
+             gate_cross_head=true, sinks=true)
+  ```
+
+  The H-gate reads the outputs the gate multiplies: after `output_norm`, under one.
+  The paper sets no init for the new matrices; they start as the model's others.
 
 - **G5**, after the output projection: write the gate with the algebra, as
   `examples/architectures/primitives.bux` does:
@@ -382,6 +410,33 @@ global = attn(power_scale=0.1, power_scale_length=2048)
 
 It scales the queries, not the logits, so unlike `log_scale` it runs under every
 attention method.
+
+### Exclusive self-attention (XSA)
+
+`exclusive=true`, a setting of `gqa`, takes out of each head's output $y_i$ its part
+along the token's own value $v_i$, before the output's norm and gate (Zhai, 2026,
+arXiv 2603.09078):
+
+$$
+z_i = y_i - \frac{y_i^\top v_i}{\lVert v_i \rVert^2}\, v_i.
+$$
+
+Attention then passes on only what the context adds to the token, and a query can
+park attention on its own key, as on a sink. A query head takes the value of its
+group's kv head. The paper finds the gain grows with the sequence length. It adds no
+parameters, and runs after the attention, so under every attention method and with
+an indexer.
+
+`exclusive=learned` takes a learned share of that part, $\tanh(a)$ for each head,
+from $a = 0$, so that the layer starts as plain attention (modded-nanogpt's learned
+XSA):
+
+```bux
+global = attn(exclusive=learned)
+```
+
+XSA reads the values the layer attends to: those its `v` port mixed in, under a value
+residual. A layer that reads the `kv` port has no values of its own, and raises.
 
 ## Positions
 
