@@ -34,6 +34,7 @@ from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts import moe as bux_moe
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
+from bux.architecture.registry import Taps
 from bux.export import check
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
@@ -55,6 +56,7 @@ from bux_vllm import (
     latent,
     linear,
     ngram,
+    outputs,
     plan,
     residual,
     routing,
@@ -1091,6 +1093,128 @@ def test_the_value_residual_mixes_as_bux(kind: str) -> None:
     flat = [torch.from_numpy(np.array(a)[0].reshape(8, 32)) for a in (v, v1)]
     got = kv.mix_values(kind, w, *flat)
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-6)
+
+
+@pytest.mark.parametrize("learned", [False, True], ids=["fixed", "learned"])
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
+    y = jax.random.normal(jax.random.key(1), (1, 8, 4, 16))
+    v = jax.random.normal(jax.random.key(2), (1, 8, groups, 16))
+    s = jax.random.normal(jax.random.key(3), (4,)) if learned else None
+    want = bux_gqa.exclusive(y, v, None if s is None else jnp.tanh(s))[0]
+    strength = None if s is None else torch.from_numpy(np.array(s)).tanh()
+    got = outputs.exclusive(
+        *(torch.from_numpy(np.array(a)[0]) for a in (y, v)), strength
+    )
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
+
+
+def test_hyga_s_gate_is_bux_s() -> None:
+    c = cfg.GQAConfig(
+        num_heads=4,
+        num_kv_heads=2,
+        gated=True,
+        gate_input_rank=3,
+        gate_output_rank=5,
+        gate_cross_head=True,
+        gate_head_bias=True,
+    )
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.gate is not None and attn.cross_gate is not None
+    assert attn.gate_up is not None and attn.gate_bias is not None
+    attn.gate_bias[...] = jax.random.normal(jax.random.key(3), (4,))
+    assert attn.output_gate_down is not None and attn.output_gate_up is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    out = jax.random.normal(jax.random.key(2), (1, 8, 4, 16))
+    want = attn._gate(x, out)[0]
+
+    def t(a: Any) -> torch.Tensor:
+        return torch.from_numpy(np.array(a))
+
+    weights = (attn.gate_up, attn.output_gate_down, attn.output_gate_up)
+    logits = t(attn.gate(x)[0]).view(8, 4, -1)
+    logits = outputs.hybrid_logits(logits, t(out[0]), *(t(w[...]) for w in weights))
+    gate = torch.sigmoid(logits + t(attn.gate_bias[...])[:, None])
+    cross = torch.sigmoid(t(attn.cross_gate(out.reshape(1, 8, -1))[0]))[..., None]
+    np.testing.assert_allclose((gate * cross).numpy(), np.asarray(want), atol=1e-6)
+
+
+@pytest.mark.parametrize("gate", [6, None], ids=["gated", "plain"])
+@pytest.mark.parametrize(("kv_heads", "tp"), [(2, 1), (2, 2), (1, 2)])
+def test_value_embeddings_add_to_each_ranks_values_as_bux(
+    gate: int | None, kv_heads: int, tp: int
+) -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=kv_heads, value_embed_gate=gate)
+    port = ir.Port(name="ve", tap="ve1", mode="read")
+    attn = BuxAttention(c, 64, (port,), rngs=nnx.Rngs(0))
+    w = None
+    if attn.ve_gate is not None:
+        kernel = jax.random.normal(jax.random.key(1), attn.ve_gate.kernel[...].shape)
+        attn.ve_gate.kernel[...] = kernel
+        w = torch.from_numpy(np.array(kernel)).T.contiguous()
+    x = jax.random.normal(jax.random.key(2), (1, 8, 64))
+    v = jax.random.normal(jax.random.key(3), (1, 8, kv_heads, 16))
+    e = jax.random.normal(jax.random.key(4), (1, 8, kv_heads * 16))
+    want = np.asarray(attn._add_value_embedding(x, v, e)[0])
+    xt, et = (torch.from_numpy(np.array(a)[0]) for a in (x, e))
+    for rank in range(tp):
+        first, g = kv.kv_heads(kv_heads, tp, rank)
+        mine = torch.from_numpy(np.array(v)[0, :, first : first + g].reshape(8, -1))
+        got = kv.add_value_embedding(xt, mine, et, w, (first, g))
+        np.testing.assert_allclose(
+            got.numpy(), want[:, first : first + g].reshape(8, -1), rtol=1e-5, atol=1e-6
+        )
+
+
+def test_values_from_the_keys_are_normalized_as_bux_and_convolved_alone() -> None:
+    qk = cfg.NormalizationConfig(type="rmsnorm", eps=1e-5)
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, qk_norm=qk, k_eq_v=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    k = jax.random.normal(jax.random.key(1), (1, 8, 32))
+    _, want = attn._keys_as_values(k, None, Taps())
+    norm = common.Norm(kv.value_norm(c.model_dump(mode="json")["qk_norm"]), 16)
+    assert not list(norm.parameters())
+    got = norm(torch.from_numpy(np.array(k)[0]).view(8, 2, 16))
+    np.testing.assert_allclose(got.numpy(), np.asarray(want[0]), rtol=1e-5, atol=1e-6)
+    conv = c.model_copy(update={"kv_conv_size": 4}).model_dump(mode="json")
+    assert kv.conv_channels(conv, 64, 1) == 2 * 16
+    assert kv.conv_channels(conv | {"k_eq_v": False}, 64, 2) == 16 + 16
+
+
+KEYED = {
+    "nope": ({}, (), True),
+    "zero-centered gain": ({"qk_norm": {"zero_centered": True}}, (), True),
+    "writes v": ({}, (["v", "v1", "write"],), True),
+    "rope": ({"rope": cfg.RoPEConfig()}, (), False),
+    "reads v": ({}, (["v", "v1", "read"],), False),
+    "writes kv": ({}, (["kv", "kv", "write"],), False),
+    "layernorm": ({"qk_norm": {"type": "layernorm"}}, (), False),
+}
+
+
+@pytest.mark.parametrize(("change", "ports", "keyed"), KEYED.values(), ids=KEYED)
+def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
+    change: dict, ports: tuple, keyed: bool
+) -> None:
+    """bux's keys are its values times the key norm's gain wherever the plugin
+    caches the values alone, and puts the gain on the queries instead."""
+    qk = {"type": "rmsnorm", "eps": 1e-5} | change.pop("qk_norm", {})
+    c = cfg.GQAConfig.model_validate(
+        {"num_heads": 4, "num_kv_heads": 2, "k_eq_v": True, "qk_norm": qk} | change
+    )
+    assert kv.keys_from_values(c.model_dump(mode="json"), list(ports)) == keyed
+    if not keyed:
+        return
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.k_norm is not None and attn.k_norm.scale is not None
+    attn.k_norm.scale[...] = jax.random.normal(jax.random.key(2), (16,))
+    k, v = attn._keys_as_values(
+        jax.random.normal(jax.random.key(1), (1, 8, 32)), None, Taps()
+    )
+    gain = attn.k_norm.scale[...] + (1 if attn.k_norm.zero_centered else 0)
+    np.testing.assert_allclose(
+        np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
+    )
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
@@ -2550,10 +2674,11 @@ def built(
 
 def kept(model: Any, path: str) -> bool:
     """Whether the plugin keeps the vLLM linear layer at `path` in the model's
-    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's, and
-    a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
+    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's,
+    HyGA's cross-head gate of an output a head, and a sparse MLA's ``kv_b``, whose
+    weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name == "shared_gate":
+    if name in ("shared_gate", "cross_gate"):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 
