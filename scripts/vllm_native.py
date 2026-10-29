@@ -564,14 +564,14 @@ def check_qsa(decoding: bool) -> bool:
     return best
 
 
-def check_msa(decoding: bool) -> bool:
+def check_msa(decoding: bool, g: int = 2) -> bool:
     """MSA on vLLM's MiniMax-M3 kernels (`bux_vllm.msa`): its picks of blocks of
     128 per kv head's group against bux's (`bux_vllm.picks.choose`), which must
     agree but at ties, and its attention against PyTorch's over the same picks."""
     from bux_vllm import dsa, msa, picks
 
     torch.manual_seed(0)
-    h, g, dk, dims, top_k, block = 8, 2, 64, 64, 512, 128
+    h, dk, dims, top_k, block = 4 * g, 64, 64, 512, 128
     lengths = [300, 97, 3, 1000] if decoding else [1000]
     blocks = sum(-(-n // block) for n in lengths) + 1
     raw_slots = dsa.raw_slots(dims, 256)
@@ -623,7 +623,8 @@ def check_msa(decoding: bool) -> bool:
     share = sum(agree) / len(agree)
     layout = "decoding" if decoding else "prefill"
     print(
-        f"plugin msa {layout}: picks agreeing with bux's {share:.3f}, output error {error:.1e}"
+        f"plugin msa {layout}, {g} kv heads: picks agreeing with bux's {share:.3f}, "
+        f"output error {error:.1e}"
     )
     return share > 0.95 and error < 2e-2
 
@@ -830,7 +831,10 @@ def main() -> int:
     for decoding in (False, True):
         results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
         results.append(attempt("plugin qsa", lambda d=decoding: check_qsa(d)))
-        results.append(attempt("plugin msa", lambda d=decoding: check_msa(d)))
+        for g in (2, 3):  # 3 kv heads: the index kernels' heads padded to 4
+            results.append(
+                attempt("plugin msa", lambda d=decoding, n=g: check_msa(d, n))
+            )
     attempt("attention", lambda: time_attention(16384, 64, 20000))
     attempt("heads", lambda: time_heads(16384, 64, 20000))
     print("all agree" if all(results) else "MISMATCH")

@@ -346,9 +346,9 @@ def test_vllm_s_sparse_gqa_attention_takes_plain_bfloat16_groups() -> None:
 
 def test_msa_takes_minimax_s_settings_alone() -> None:
     """vLLM's MiniMax-M3 kernels take MSA of blocks of 128, an unweighted index head
-    a kv head, plain dots, heads of a power of two of dims, a power of two of kv
-    heads on a rank and fewer than 64 blocks a query, in bfloat16; their picks of
-    blocks are bux's keys of them."""
+    a kv head, plain dots, heads of a power of two of dims and fewer than 64 blocks
+    a query, in bfloat16, any count of kv heads padded to a power of two for their
+    index kernels; their picks of blocks are bux's keys of them."""
     from bux_vllm import msa, picks
 
     def spec(**c: Any) -> picks.Sparse:
@@ -371,8 +371,11 @@ def test_msa_takes_minimax_s_settings_alone() -> None:
         assert not msa.takes(spec(relu=True), ix, 4, 128, torch.bfloat16)
         assert not msa.takes(spec(window=512), ix, 4, 128, torch.bfloat16)
         assert not msa.takes(spec(top_k=128 * 64), ix, 4, 128, torch.bfloat16)
-        six = ix | {"num_heads": 6}
-        assert not msa.takes(spec(kv_heads=6), six, 6, 128, torch.bfloat16)
+        six = ix | {"num_heads": 6}  # padded to 8 for the index kernels
+        assert msa.takes(spec(kv_heads=6), six, 6, 128, torch.bfloat16)
+    padded = msa.padded(torch.ones(3, 13, 64))
+    assert padded.shape == (3, 16, 64) and not padded[:, 13:].any()
+    assert msa.padded(torch.ones(3, 4, 64)).shape == (3, 4, 64)
     blocks = torch.tensor([[[2, -1]], [[0, 1]]], dtype=torch.int32)  # (g, Q, k)
     keys, valid = msa.as_picks(blocks, torch.tensor([300]))
     assert keys.shape == (1, 2, 256)

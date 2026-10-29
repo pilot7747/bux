@@ -9,8 +9,9 @@ it sees by a plain dot product, a block of 128 keys by its best, and the kv head
 group of query heads attends to the group's best ``top_k / 128`` blocks, its own
 block among them. The kernels take it where its blocks are 128 keys and its heads
 unweighted, with no window, sinks or softcap, index and attention heads of a power
-of two of dims, a power of two of kv heads on a rank, and fewer than 64 blocks a
-query (`takes`). They rank the blocks as
+of two of dims, and fewer than 64 blocks a query (`takes`). Their index kernels
+span a rank's index heads in one range, which must be a power of two: other counts
+are padded with heads of no query (`padded`), whose picks go unread. They rank the blocks as
 bux does, but break ties their own way.
 
 The index keys, normalized and rotated, are cached in bfloat16 in head slots after
@@ -42,7 +43,6 @@ def takes(spec: Sparse, ix: dict, kv_heads: int, dims: int, dtype: torch.dtype) 
     plain = not spec.relu and not ix["weighted"] and spec.window is None
     plain = plain and spec.sinks is None and spec.softcap is None and not spec.latent
     heads = ix["num_heads"] == kv_heads and _power(ix["head_dim"]) and _power(dims)
-    heads = heads and _power(spec.groups[1], 1)  # a rank's index heads, an arange
     count = 0 < spec.top_k // BLOCK < MOST_BLOCKS
     return on and blocks and plain and heads and count and available()
 
@@ -60,6 +60,14 @@ def available() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("vllm.models.minimax_m3") is not None
+
+
+def padded(iq: torch.Tensor) -> torch.Tensor:
+    """Index queries, (T, g, i), padded with zeros to a power of two of heads, as
+    the index kernels take them; their picks for the padding are not read."""
+    g = iq.shape[1]
+    pad = (1 << (g - 1).bit_length()) - g
+    return iq if not pad else torch.nn.functional.pad(iq, (0, 0, 0, pad))
 
 
 def _scales(kv: torch.Tensor, scales: tuple[float, float]) -> tuple:
@@ -96,8 +104,10 @@ def prompt(
     cu = torch.tensor([0, count], dtype=torch.int32, device=device)
     lens = torch.tensor([n], dtype=torch.int32, device=device)
     before = lens - count
-    score = minimax_m3_index_score(iq, keys, rows, cu, lens, before, count, n, g)
-    picked = minimax_m3_index_topk(score, cu, before, count, top, 0, 1)
+    iq = padded(iq)
+    heads = iq.shape[1]
+    score = minimax_m3_index_score(iq, keys, rows, cu, lens, before, count, n, heads)
+    picked = minimax_m3_index_topk(score, cu, before, count, top, 0, 1)[:g]
     out = torch.empty_like(q)
     args = (picked, rows, cu, lens, before, count, g, scale, out)
     minimax_m3_sparse_attn(q, kv, *args, *_scales(kv, scales))
@@ -124,8 +134,9 @@ def decode(
     )
 
     top, scale, scales = attending
-    g = kv.shape[1]
-    picked = minimax_m3_index_decode(iq, keys, table, lens, longest, top, 0, 1, g, 1, 1)
+    g, iq = kv.shape[1], padded(iq)
+    args = (keys, table, lens, longest, top, 0, 1, iq.shape[1], 1, 1)
+    picked = minimax_m3_index_decode(iq, *args)[:g]
     out = torch.empty_like(q)
     args = (picked, table, lens, g, scale, out, 1)
     minimax_m3_sparse_attn_decode(q, kv, *args, *_scales(kv, scales))
@@ -135,8 +146,8 @@ def decode(
 def reserve(q: torch.Tensor, groups: int, longest: int) -> None:
     """Claim, in vLLM's profiling run of `q`'s tokens, the block scores a step's
     prompt chunks make at their most, which the profile counts as they are freed."""
-    blocks = -(-longest // BLOCK) + 16
-    torch.empty(groups * q.shape[0] * blocks, dtype=torch.float32, device=q.device)
+    blocks, heads = -(-longest // BLOCK) + 16, 1 << (groups - 1).bit_length()
+    torch.empty(heads * q.shape[0] * blocks, dtype=torch.float32, device=q.device)
 
 
 def as_picks(
