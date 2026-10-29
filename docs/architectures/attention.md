@@ -61,6 +61,7 @@ model = embed block^12 norm head(tied=true)
 | `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
 | `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
 | `differential` | `false` | two query heads for each output head, the second's map subtracted from the first's ([below](#differential-attention-diff-v2)) (DIFF V2) |
+| `paired` | `false` | pairs of heads interleaved along the sequence, each query seeing both heads' keys in one softmax ([below](#paired-heads)) (modded-nanogpt) |
 | `mimetic_vo`, `mimetic_noise` | `none`, `0.01` | values and output started at a value-output map of $-\beta I$, plus noise ([Initialization](initialization.md#mimetic-values-and-output)) (modded-nanogpt) |
 
 GPT-2 small is MHA with biases and one fused projection
@@ -489,6 +490,32 @@ values, and both ports. With XSA, the pair shares one value, so removing the par
 along it from the difference is removing it from each map: `exclusive` takes the
 output heads. An indexer and a relative bias, which see each query head alone, are
 not yet supported with it.
+
+### Paired heads
+
+`paired=true`, a setting of `gqa`, lets a query attend to two heads' keys in one
+softmax, as modded-nanogpt's paired-head attention does (its record 58). Query head
+$j$ and head $j + h/2$, and kv head $m$ and $m + g/2$, interleave along the sequence
+into one of twice its length: token $n$'s first half of the heads at position $2n$,
+its second half at $2n + 1$. The pair attends causally over it. Head $j$'s query at
+token $n$ sees both heads' keys of the tokens before $n$ and its own head's key at
+$n$; head $j + h/2$'s sees both at $n$ too. The KV cache is as without it, and the
+attention's FLOPs and its keys per query double.
+
+```bux
+global = attn(paired=true)
+```
+
+As record 58's code has it:
+
+- **A window** counts the interleaved positions, so `sliding_window_size=128` sees
+  64 tokens back.
+- **RoPE** turns head $i$ of the token at position $p$ at $2p + (i \bmod 2)$.
+
+It takes an even number of heads and of kv heads. It composes with the gate, HyGA,
+QK-norm, the conv on keys and values and both ports. It is not yet supported with
+an indexer, a relative bias, `log_scale`, attention dropout, sinks,
+`differential` or `exclusive` (record 58 leaves its paired layers without XSA).
 
 ## Positions
 

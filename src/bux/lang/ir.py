@@ -340,6 +340,7 @@ _NEWER_LAYER_FIELDS = {
         "qk_norm_all_heads": False,
         "exclusive": False,
         "differential": False,
+        "paired": False,
         **_HYGA,
         "value_embed_gate": 6,
         "k_eq_v": False,

@@ -79,6 +79,7 @@
   "output_bias",
   "output_dropout",
   "output_norm",
+  "paired",
   "power_scale",
   "power_scale_length",
   "qk_norm",

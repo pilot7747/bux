@@ -681,6 +681,42 @@ class GQAConfig(QuadraticAttentionConfig):
             raise ValueError(f"gqa: differential with {', '.join(given)} not yet")
         return self
 
+    # Paired-head attention (modded-nanogpt's record 58): query head j and head
+    # j + num_heads / 2, and kv head m and m + num_kv_heads / 2, interleaved along the
+    # sequence into one of twice its length, so that a query sees both heads' keys
+    # in one softmax: its own head's up to its own and the other's before it, or up
+    # to its own for the second. A window counts the interleaved positions, and RoPE
+    # turns head i of token n at 2n + (i mod 2). Not in vLLM yet.
+    paired: bool = False
+
+    @model_validator(mode="after")
+    def _paired(self) -> Self:
+        """Check that paired heads come in pairs of query and kv heads, without the
+        settings that see each query head alone."""
+        if not self.paired:
+            return self
+        if self.num_heads % 2 or self.num_kv_heads % 2:
+            raise ValueError(
+                f"gqa: paired takes an even number of heads and kv heads, not "
+                f"{self.num_heads} and {self.num_kv_heads}"
+            )
+        given = [
+            name
+            for name, on in (
+                ("indexer", self.indexer is not None),
+                ("relative_bias", self.relative_bias is not None),
+                ("log_scale", self.log_scale is not None),
+                ("attention_dropout", self.attention_dropout > 0),
+                ("sinks", self.sinks),
+                ("differential", self.differential),
+                ("exclusive", bool(self.exclusive)),
+            )
+            if on
+        ]
+        if given:
+            raise ValueError(f"gqa: paired with {', '.join(given)} not yet")
+        return self
+
     # Mimetic init of the values and the output at this beta (modded-nanogpt's 0.05;
     # Trockman & Kolter, 2023): v's and o's kernels start as blocks of +sqrt(beta)
     # and -sqrt(beta) identities, so that the layer's value-output map starts at

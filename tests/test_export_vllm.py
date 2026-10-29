@@ -2842,6 +2842,14 @@ def test_fp8_weights_quantize_every_layer_s_projections(
     assert assert_quantized(model, quant)
 
 
+def test_paired_heads_say_vllm_has_no_attention_for_them(
+    stood_in: ModuleType, tmp_path: Path
+) -> None:
+    source = vllm_parity.LLAMA.replace("rope=rope()", "rope=rope(), paired=true")
+    with pytest.raises(NotImplementedError, match="paired .* two heads' keys"):
+        built(source + "model = embed block rmsnorm head", tmp_path, stood_in, None)
+
+
 #: The parity cases whose attention keeps a cache of the plugin's own
 #: (bux_vllm.sparse's, csa's), which takes no FP8 KV cache, by the layer it names:
 #: on the CPU, where vLLM's DSA kernels pick none (see the test after).

@@ -83,6 +83,11 @@ class Attention(Layer):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         kv.check_ports(c, site.ports)
+        if c["paired"]:
+            raise NotImplementedError(
+                "gqa: paired (paired-head attention) not in vLLM yet: it needs an "
+                "attention over two heads' keys in one softmax"
+            )
         self.rel, self.rel_proj, self.rel_table = c["relative_bias"], None, None
         if self.rel and (c["indexer"] or site.ports):
             raise NotImplementedError("gqa: a relative bias beside an indexer or ports")
