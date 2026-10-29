@@ -488,7 +488,9 @@ def test_3_without_repetition_the_pointer_gains_nothing(capsys):
         print(
             f"\n[audit] unique: eval loss off {off:.4f}, on {on:.4f} ({on - off:+.4f})"
         )
-    assert on >= off - 0.01
+    # Within noise on any CPU: an x86 run's trajectory drifts from an arm64 one's, and
+    # a pointer that saw its target would gain about 4.4 nats here.
+    assert on >= off - 0.05
 
 
 def test_3_with_repetition_the_pointer_copies_the_repeats(capsys):
