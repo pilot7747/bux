@@ -70,6 +70,9 @@ class Scored(NamedTuple):
     block: Int[Array, "b s"] | None = None
     #: The slots each query may attend to, for a loss over its kept keys' tokens.
     span: sparse.Span | None = None
+    #: The log-softmax of its scores for the kept keys, made once for its own loss
+    #: and the loss of the layers that read them (``loss_over=served``); else None.
+    predicted: Float[Array, "b t k"] | None = None
 
 
 Target = Callable[[Any], Float[Array, "b c *g s"]]  # a chunk's attention to the keys
@@ -87,6 +90,35 @@ def _kl(
     p = p / jnp.maximum(p.sum(-1, keepdims=True), jnp.finfo(p.dtype).tiny)
     log_p = jnp.log(jnp.where(p > 0, p, 1))
     return jnp.where(p > 0, p * (log_p - log_q), 0).sum(-1)
+
+
+def distilled(kept: Kept, target: "Target", xs: Any, width: int) -> Float[Array, ""]:
+    """Return the loss a layer that reads another's picks adds to that layer's
+    indexer (``loss_over=served``, IndexCache's multi-layer distillation): ``KL(p ||
+    q)`` over the picks, averaged over the queries, p this layer's attention summed
+    over heads and normalized over them, q the indexer's (``kept.predicted``).
+
+    Args:
+        kept: the picks it reads, with the indexer's log-softmax over them.
+        target: gives a chunk of queries' attention to the keys, from that chunk of
+            `xs`; it passes no gradient.
+        xs: what `target` takes, arrays of (b, t, ...) split into chunks of queries.
+        width: the elements a query makes of `target`'s output, which sets the
+            chunks.
+
+    Returns:
+        The loss, a scalar, which trains only the indexer that picked the keys.
+    """
+    assert kept.predicted is not None
+
+    def kept_target(both: tuple) -> Float[Array, "b c k"]:
+        index, xs = both
+        p = target(xs).astype(jnp.float32)
+        return jnp.take_along_axis(p, jnp.maximum(index, 0), axis=-1)
+
+    count = chunks(kept.index.shape[1], width)
+    p = jax.lax.stop_gradient(chunked(kept_target, (kept.index, xs), count))
+    return _kl(p, kept.predicted, kept.index >= 0).mean()
 
 
 def _starts(order: Int[Array, "b s"], size: int) -> Bool[Array, "b s"]:
@@ -290,7 +322,7 @@ class Indexer(nnx.Module):
         self.split: parallel.Name = "kv_heads" if config.per_group else "heads"
         self.candidate_block_size = config.candidate_block_size
         self.candidate_top_k = config.candidate_top_k
-        self.loss_weight = config.loss_weight
+        self.loss_weight, self.loss_over = config.loss_weight, config.loss_over
 
         def linear(
             n_in: int, n_out: int, role: str, *names: parallel.Name
@@ -493,6 +525,46 @@ class Indexer(nnx.Module):
         pool = None if best is None else Kept(best, pooled)
         return Kept(index), pool, Scored(x, query, pos, keys, index, span=span)
 
+    def predicted(self, scored: Scored) -> Float[Array, "b t k"]:
+        """Return each query's log-softmax of its scores for its kept keys, as its
+        loss computes them, a chunk of queries at a time (``loss_over=served``).
+
+        Args:
+            scored: what the indexer kept, from its call.
+
+        Returns:
+            The log-probabilities, (b, t, k), which pass gradients to the indexer's
+            parameters alone.
+        """
+
+        def log_q(own: tuple) -> Float[Array, "b c k"]:
+            x, query, pos, kept = own
+            return self._log_predicted(x, query, pos, scored.keys, kept)
+
+        own = (scored.x, scored.query, scored.pos, scored.kept)
+        return chunked(jax.checkpoint(log_q), own, self._loss_chunks(scored, 1))
+
+    def _loss_chunks(self, scored: Scored, width: int) -> int:
+        """Return how many chunks of queries the loss scores their kept keys in:
+        as many as keep cuDNN's or XLA's intermediates in bounds, or 1 where
+        ``scoring``'s kernels make none of every head; `width` the elements a query
+        makes of its target."""
+        b, t, _ = scored.x.shape
+        k, n = scored.kept.shape[-1], scored.keys.shape[1]
+        if self._loss_by_cudnn(k, scored.keys.dtype):
+            return chunks(t, b * k * ELEMENTS // LOSS_PICKS)
+        if not _dense(k, n) and self._picked_by_kernel(k):
+            return 1  # its kernels make no intermediate of every head
+        return chunks(t, max(self._per_pick(scored), width))
+
+    def _per_pick(self, scored: Scored) -> int:
+        """Return the elements a query makes in scoring its kept keys again: those of
+        every head for every key where it scores them all (`_dense`), else for each
+        kept key."""
+        k, n = scored.kept.shape[-1], scored.keys.shape[1]
+        dense = _dense(k, n) and not self._loss_by_cudnn(k, scored.keys.dtype)
+        return self.heads * n if dense else k * max(self.heads, self.head_dim)
+
     def loss(
         self, scored: Scored, target: Target, xs: Any, width: int, picks: bool = False
     ) -> Float[Array, ""]:
@@ -523,6 +595,9 @@ class Indexer(nnx.Module):
         """
         if self.per_group or self.max_pool:
             return self._token_loss(scored, target, xs, width)
+        if scored.predicted is not None:  # made once, for the readers' losses too
+            kept = Kept(scored.kept, predicted=scored.predicted)
+            return distilled(kept, target, xs, width)
 
         def kept_target(both: tuple) -> Float[Array, "b c k"]:
             (*_, kept), xs = both
@@ -539,17 +614,9 @@ class Indexer(nnx.Module):
             return _kl(p, log_q, kept >= 0)
 
         own = (scored.x, scored.query, scored.pos, scored.kept)
-        b, t, _ = scored.x.shape
-        k, n = scored.kept.shape[-1], scored.keys.shape[1]
-        cudnn = self._loss_by_cudnn(k, scored.keys.dtype)
-        dense = _dense(k, n) and not cudnn
-        per = self.heads * n if dense else k * max(self.heads, self.head_dim)
-        count = chunks(t, max(per, width))
+        count = chunks(scored.x.shape[1], max(self._per_pick(scored), width))
         p = jax.lax.stop_gradient(chunked(kept_target, (own, xs), count))
-        if cudnn:
-            count = chunks(t, b * k * ELEMENTS // LOSS_PICKS)
-        elif not dense and self._picked_by_kernel(k):
-            count = 1  # its kernels make no intermediate of every head
+        count = self._loss_chunks(scored, width)
         return chunked(jax.checkpoint(kl), (own, p), count).mean()
 
     def _log_predicted(

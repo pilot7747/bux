@@ -63,6 +63,10 @@ class Kept(NamedTuple):
     index: Int[Array, "b t *g k"]
     #: Which block each slot is in, if it keeps blocks; else None.
     block: Int[Array, "b s"] | None = None
+    #: In training, the log-softmax of the indexer's scores for the kept slots,
+    #: which a layer that reads them distills the indexer by (``loss_over=served``);
+    #: else None.
+    predicted: Float[Array, "b t k"] | None = None
 
 
 class Part(NamedTuple):

@@ -29,7 +29,13 @@ from bux import config as cfg
 from bux import initializers, parallel
 from bux.architecture import observe
 from bux.architecture.attention import sparse
-from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
+from bux.architecture.attention.indexer import (
+    Indexer,
+    Scored,
+    Target,
+    distilled,
+    from_stream,
+)
 from bux.architecture.attention.norm_rope import norm_and_rotate
 from bux.architecture.attention.rope import logit_gain, rotated_dims
 from bux.architecture.common.functional import activation
@@ -954,6 +960,8 @@ def indexer_config(
             f"{config.type}: the '{needs[0]}' port needs an indexer that the layer "
             "runs: give it indexer=indexer(...), and do not read index"
         )
+    if indexer is not None and indexer.loss_over == "served" and config.type == "csa":
+        raise NotImplementedError("csa: indexer(loss_over=served)")
     if indexer is None or indexer.block_size == 1:
         return indexer
     if "candidates" in needs:
@@ -983,6 +991,34 @@ def _summed(
     return jnp.moveaxis(probs.reshape(b, groups, h // groups, t, s).sum(2), 1, 2)
 
 
+def _served(
+    indexer: Indexer, kept: sparse.Kept, scored: Scored
+) -> tuple[sparse.Kept, Scored]:
+    """Return the picks and what was scored, each with the indexer's log-softmax over
+    the picks, made once: the picks' passes ``loss_weight`` times the gradient back,
+    so that a reader's term of weight 1 weighs as the indexer's own."""
+    predicted = indexer.predicted(scored)
+    w = indexer.loss_weight
+    passed = (
+        predicted
+        if w == 1
+        else w * predicted + (1 - w) * jax.lax.stop_gradient(predicted)
+    )
+    return kept._replace(predicted=passed), scored._replace(predicted=predicted)
+
+
+def _distills(kept: sparse.Kept | None, taps: Taps) -> bool:
+    """Return whether a layer that reads these picks adds to their indexer's loss: in
+    training, where the writer gave its log-softmax over them."""
+    return kept is not None and kept.predicted is not None and training(taps)
+
+
+def _report_distilled(loss: Float[Array, ""], taps: Taps) -> None:
+    """Report a reader's term of its writer's indexer loss, which carries the
+    writer's weight in its gradient (`_served`)."""
+    report(taps, "indexer_loss", 1.0, loss)
+
+
 def documents_or_rows(docs: Segments | None, b: int, t: int) -> Segments:
     """Return the documents packed into b rows of t, or one document a row if None."""
     if docs is not None:
@@ -1007,7 +1043,9 @@ class Sparse(FullLogits):
 
     - ``index``: written, it pushes the kept keys
       (`~bux.architecture.attention.sparse.Kept`); read, the layer uses the tap's
-      instead of running an indexer, and builds none (GLM-5's IndexCache).
+      instead of running an indexer, and builds none (GLM-5's IndexCache). With
+      ``indexer(loss_over=served)``, a reader adds its own term to the writer's
+      indexer loss in training, from its attention over the picks.
     - ``candidates``: written, it pushes the indexer's candidate pool; read, the
       indexer keeps keys only inside the tap's pool (DeepSeek-V4.1).
     """
@@ -1032,12 +1070,16 @@ class Sparse(FullLogits):
         # The indexer's loss reads them too, so that a policy keeps them for both.
         q, parts = remat.label("attention.in", (q, tuple(parts)))
         out, lse = remat.named("attention", self._sparse, q, parts, self._sinks())
-        if self._trains(scored, taps):
-            assert scored is not None
-            last = parts[-1]
+        last = parts[-1]
+        if self._trains(scored, taps) or _distills(last.kept, taps):
             xs = (q, lse, *sparse.rows(last))
             width = q.shape[2] * last.k.shape[1]
-            self._train_indexer(scored, partial(self._target, last), xs, width, taps)
+            target = partial(self._target, last)
+            if scored is None:  # a reader of another layer's picks
+                assert last.kept is not None
+                _report_distilled(distilled(last.kept, target, xs, width), taps)
+            else:
+                self._train_indexer(scored, target, xs, width, taps)
         return out
 
     def _sparse(
@@ -1075,12 +1117,16 @@ class Sparse(FullLogits):
         k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
         mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
         probs = self._probabilities(x, q, k, docs, _per_head(mask, self.heads))
-        if self._trains(scored, taps):
-            assert scored is not None
+        kept = parts[-1].kept
+        if self._trains(scored, taps) or _distills(kept, taps):
             n = parts[-1].k.shape[1]
             groups = mask.shape[2] if mask.ndim == 4 else None
             attention = _summed(probs[..., -n:].astype(jnp.float32), groups)
-            self._train_indexer(scored, lambda a: a, attention, n, taps)
+            if scored is None:  # a reader of another layer's picks
+                assert kept is not None
+                _report_distilled(distilled(kept, lambda a: a, attention, n), taps)
+            else:
+                self._train_indexer(scored, lambda a: a, attention, n, taps)
         return self._values(probs, v)
 
     def _trains(self, scored: Scored | None, taps: Taps) -> bool:
@@ -1127,10 +1173,20 @@ class Sparse(FullLogits):
                 x, query, pos, keys, span, order, candidates, export
             )
             write(taps, self.ports, "candidates", candidates)
+            if self._serves(taps):
+                kept, scored = _served(self.indexer, kept, scored)
         else:
             return None, None
         write(taps, self.ports, "index", kept)
         return kept, scored
+
+    def _serves(self, taps: Taps) -> bool:
+        """Return whether layers that read its picks distill its indexer, in this
+        forward: in training, with ``loss_over=served``, if it trains and writes
+        them."""
+        ix = self.indexer
+        serves = ix is not None and ix.loss_over == "served" and ix.loss_weight > 0
+        return serves and writes(self.ports, "index") and training(taps)
 
     def _check_groups(self, kept: sparse.Kept) -> None:
         """Raise unless an index read for each group has one for each kv head."""

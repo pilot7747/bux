@@ -351,7 +351,7 @@ _NEWER_LAYER_FIELDS = {
     },
     "mla": {"gate_head_bias": False, **_HYGA},
     "csa": {"gate_head_bias": False, **_HYGA},
-    "indexer": {"pool": "mean", "per_group": False, "relu": True},
+    "indexer": {"pool": "mean", "per_group": False, "relu": True, "loss_over": "own"},
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
     "normal": {"embed": None, "head": None, "out": None},  # the model's init

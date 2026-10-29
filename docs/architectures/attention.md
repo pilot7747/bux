@@ -644,7 +644,7 @@ A config lists its ports; using a port the layer does not have is a compile erro
 | `gqa` | `kv` | pushes the keys and values | uses them instead of projecting its own (cross-layer KV sharing, YOCO, CLA) |
 | `gqa` | `ve` | - | adds a `value_embed` table's rows to its values (value embeddings) |
 | `value_embed` | `ve` | pushes the input tokens' rows of its table | - |
-| `gqa`, `mla`, `csa` | `index` | pushes the keys the indexer kept for each query | attends to them, and runs no indexer (IndexCache) |
+| `gqa`, `mla`, `csa` | `index` | pushes the keys the indexer kept for each query | attends to them, and runs no indexer (IndexCache); with `loss_over=served`, distills the writer's indexer (`gqa`, `mla`) |
 | `csa` | `kv` | pushes the compressed latents, with the indexer's keys | uses them instead of compressing its own; an indexer it runs scores those keys |
 | `csa` | `candidates` | pushes a pool of coarse blocks of compressed positions | its indexer keeps keys only inside the pool |
 
@@ -828,9 +828,10 @@ heads and their picks split with the kv heads.
 ### Sharing an index: IndexCache
 
 A layer that writes the `index` port exports its indexer's picks. A layer that reads
-it attends to the same keys without running an indexer, and adds no loss. GLM-5.3
-runs an indexer in layers 0, 1, 2, 6, 10, ..., 74 only
-(`examples/architectures/glm/glm_5.3.bux`):
+it attends to the same keys without running an indexer: it scores no key, forward or
+backward, caches no indexer keys when served, and adds no loss of its own. GLM-5.2's
+IndexShare (IndexCache, Bai et al. 2026) runs an indexer in layers 0, 1, 2, 6, 10,
+..., 74 only, as GLM-5.3 does (`examples/architectures/glm/glm_5.3.bux`):
 
 ```bux
 A = layer(attn(index=@topk), dense)
@@ -839,6 +840,23 @@ S = layer(attn(index=$topk))
 
 model = embed "AAA" "SSS" "FSSS"^18 norm @h out mtp^3
 ```
+
+With `indexer(loss_over=served)`, every layer that reads the picks also distills the
+writer's indexer towards its own attention over them, IndexCache's multi-layer
+distillation ([The indexer's loss](#indexer-loss)). The writer's indexer then learns to
+pick keys for the layers it serves, not for its own alone:
+
+```bux
+F = layer(attn(indexer=indexer(top_k=2048, loss_over=served), index=@topk))
+S = layer(attn(index=$topk))
+E = layer(attn(index=$topk!))   # the group's last reader pops the picks
+
+model = embed "FSSE"^8 norm head
+```
+
+A count of 0 leaves a block out, so a model whose global layers make whole groups
+and a few left over can count them from the width: `(F S^3)^(n // 4) S^(n - n // 4 *
+4)` ([Repetition](../language/operators.md#repetition-fn)).
 
 ### Candidate pools
 
@@ -890,7 +908,12 @@ normalized over the kept keys.
 - The indexer's inputs and $p$ are detached, so this loss trains the indexer alone,
   and the language-modeling loss trains the rest. The weight only scales the
   indexer's gradient, and its part of the norm that `clip` bounds.
-- A layer that reads `index` runs no indexer and adds nothing.
+- A layer that reads `index` runs no indexer and adds nothing, unless the writer's
+  indexer sets `loss_over=served` (IndexCache's multi-layer distillation). Then each
+  reader adds a term of its own: the same KL with $p$ its attention over the picks
+  and $I$ the writer's scores, weighted by the writer's `loss_weight`. Its gradient
+  reaches the writer's indexer alone. The terms are summed, where IndexCache averages
+  them, which changes the indexer's gradient by a constant factor.
 - The log's `indexer_loss` is the sum over layers. Only a training step adds it;
   eval does not.
 
