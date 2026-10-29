@@ -45,7 +45,8 @@ class Attention(Layer):
     ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
     as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
     causal softmax attention with its sliding window, soft-capping and sinks by
-    vLLM's attention layer, XSA on each head's output (``exclusive``,
+    vLLM's attention layer (twice the query heads under ``differential``, each
+    pair's maps subtracted, DIFF V2's), XSA on each head's output (``exclusive``,
     `bux_vllm.outputs`), its norm and gate (with a bias per head, and HyGA's input,
     output and cross-head gates), and the row-parallel output projection.
 
@@ -81,13 +82,16 @@ class Attention(Layer):
         dk, dv = kv.head_dims(c, width)
         self.path, self.dk, self.dv, self.fused = site.path, dk, dv, c["fused_qkv"]
         self.h, self.g = h // tp, max(1, g // tp)  # this rank's
+        self.hq = (2 * h if c["differential"] else h) // tp  # its query heads
+        if c["differential"] and self.reads_index:
+            raise NotImplementedError("gqa: differential with the index port")
         self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
         self.c, self.scale = c, (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
         self._projections(c, width, site)
         self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
-        self.sinks = sink_logits(self.h) if c["sinks"] else None
+        self.sinks = sink_logits(self.hq) if c["sinks"] else None
         self._exclusion(c)
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
@@ -106,17 +110,18 @@ class Attention(Layer):
         layer that reads its ``kv`` port), the gate's, and the row-parallel output
         projection, each with the engine's quantization config."""
         h, g, dk, dv = c["num_heads"], c["num_kv_heads"], self.dk, self.dv
+        hq = 2 * h if c["differential"] else h
         path, kw = site.path, {"return_bias": False, "quant_config": site.quant}
         self.qkv, self.q = None, None
         if self.reads_kv:
             self.q = ColumnParallelLinear(
-                width, h * dk, bias=c["bias"], prefix=f"{path}.q", **kw
+                width, hq * dk, bias=c["bias"], prefix=f"{path}.q", **kw
             )
         else:
             self.qkv = QKVParallelLinear(
                 width,
                 dk,
-                h,
+                hq,
                 g,
                 bias=c["bias"],
                 v_head_size=dv,
@@ -124,6 +129,11 @@ class Attention(Layer):
                 **kw,
             )
         self._gate(c, width, site)
+        self.lambda_proj = None
+        if c["differential"]:  # an output a head: too few for FP8's GEMMs
+            self.lambda_proj = ColumnParallelLinear(
+                width, h, bias=False, return_bias=False, prefix=f"{path}.lambda_proj"
+            )
         out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
         self.o = RowParallelLinear(
             h * dv, width, bias=out_bias, prefix=f"{path}.o", **kw
@@ -136,17 +146,12 @@ class Attention(Layer):
         Raises:
             NotImplementedError: QK-norm of all heads where ranks copy kv heads.
         """
-        qk, out, h, g = (
-            c["qk_norm"],
-            c["output_norm"],
-            c["num_heads"],
-            c["num_kv_heads"],
-        )
+        qk, out, g = c["qk_norm"], c["output_norm"], c["num_kv_heads"]
         self.all_heads = bool(qk and c["qk_norm_all_heads"])
         if self.all_heads and g % tp:
             raise NotImplementedError("gqa: qk_norm_all_heads with kv heads copied")
         if self.all_heads:
-            self.q_norm = AllHeads(qk, h, self.dk, tp)
+            self.q_norm = AllHeads(qk, self.hq * tp, self.dk, tp)
             self.k_norm = AllHeads(qk, g, self.dk, tp)
         else:
             self.q_norm = Norm(qk, self.dk) if qk else None
@@ -162,7 +167,7 @@ class Attention(Layer):
         to the KV cache it `shares`, a writer's through the ``kv`` port."""
         self.caches = nn.ModuleList(
             PagedAttention(
-                self.h,
+                self.hq,
                 self.dk,
                 self.scale,
                 num_kv_heads=self.g,
@@ -326,7 +331,7 @@ class Attention(Layer):
             if (fused := getattr(self.qkv, kind, None)) is not None:
                 shards = {"qkv": None} if self.fused else {s: s for s in "qkv"}
                 out |= {f"{n}.{kind}": (fused, (s,)) for n, s in shards.items()}
-            for name in ("q", "gate", "o", "rel_proj", "cross_gate"):
+            for name in ("q", "gate", "o", "rel_proj", "cross_gate", "lambda_proj"):
                 layer = getattr(self, name)
                 if layer is not None and getattr(layer, kind) is not None:
                     out[f"{name}.{kind}"] = (getattr(layer, kind), ())
@@ -372,8 +377,8 @@ class Attention(Layer):
         if self.reads_kv:  # its writer's keys and values, as vLLM shares them
             assert self.q is not None
             q = self._queries(self.q(x), ctx).reshape(t, -1).contiguous()
-            out = self.caches[call](q, None, None).view(t, self.h, self.dv)
-            return self.o(self._gated(x, out).reshape(t, -1))
+            out = self.caches[call](q, None, None).view(t, self.hq, self.dv)
+            return self.o(self._gated(x, self._difference(x, out)).reshape(t, -1))
         q, k, v = self._project(x, call)
         v = self._v_port(v, ctx)
         q, k = self._queries(q, ctx), self._normed(k, self.k_norm, self.g)
@@ -385,8 +390,17 @@ class Attention(Layer):
             out = self._biased(x, q, k, v, call, ctx)
         else:
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
-            out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
-        return self.o(self._gated(x, self._exclude(out, v)).reshape(t, -1))
+            out = self.caches[call](q, k, v.contiguous()).view(t, self.hq, self.dv)
+        out = self._exclude(self._difference(x, out), v)
+        return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _difference(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """The output heads, (T, h, dv), of the query heads' outputs `out`, (T, hq,
+        dv): under ``differential``, each ``a1 - sigmoid(x W) a2`` of its pair of
+        query heads (`bux_vllm.outputs.differential`); `out` itself without it."""
+        if self.lambda_proj is None:
+            return out
+        return outputs.differential(out, self.lambda_proj(x))
 
     def _exclude(self, out: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """The heads' outputs, (T, h, dv), by XSA under ``exclusive``: each less
@@ -402,7 +416,7 @@ class Attention(Layer):
         """The projected queries, (T, h dk), as heads, (T, h, dk): QK-norm then RoPE
         (in float32, as bux), and their scale by position (``power_scale``,
         ``log_scale``)."""
-        q = self._normed(q, self.q_norm, self.h)
+        q = self._normed(q, self.q_norm, self.hq)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
         scales = kv.power_scale if self.rel else kv.query_scale  # biased: its op's
@@ -472,7 +486,7 @@ class Attention(Layer):
         `call`-th call's state) under ``kv_conv_size``."""
         assert self.qkv is not None, "a layer that reads kv projects q alone"
         q, keys_values = self.qkv(x).split(
-            [self.h * self.dk, self.g * (self.dk + self.dv)], -1
+            [self.hq * self.dk, self.g * (self.dk + self.dv)], -1
         )
         if self.convs is not None:
             keys_values = keys_values + self.convs[call](keys_values)

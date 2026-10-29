@@ -298,8 +298,10 @@ class Attention(SoftmaxAttention):
     to k and v under ``kv_conv_size`` (Inkling), applies QK-norm (of each head, or of
     all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
-    run's ``methods.attention`` (`bux.parallel.context`). Under ``exclusive`` (XSA)
-    each head's output loses its part along the query's own value (`exclusive`).
+    run's ``methods.attention`` (`bux.parallel.context`). Under ``differential``
+    (DIFF V2) it has two query heads for each output head, and takes the difference
+    of their maps (`_difference`). Under ``exclusive`` (XSA) each head's output
+    loses its part along the query's own value (`exclusive`).
     The heads' outputs then go through `SoftmaxAttention`'s norm, gate, output
     projection and dropout.
     `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
@@ -350,9 +352,10 @@ class Attention(SoftmaxAttention):
         rngs: nnx.Rngs,
     ):
         h, g = config.num_heads, config.num_kv_heads
+        hq = 2 * h if config.differential else h  # query heads
         dk = config.head_dim or width // h
         dv = config.v_head_dim or dk
-        self.head_dim, self.v_head_dim = dk, dv
+        self.head_dim, self.v_head_dim, self.query_heads = dk, dv, hq
         projects_kv = not reads(ports, "kv")  # else it takes the kv tap's
         heads, kv_heads = ("heads", h), ("kv_heads", g)  # flattened with their dims
 
@@ -370,9 +373,12 @@ class Attention(SoftmaxAttention):
         split = projects_kv and not config.fused_qkv
         # Fused, the split points of q, k and v do not fall on shard boundaries.
         self.qkv = (
-            proj(width, h * dk + g * (dk + dv), ("embed", None), "q") if fused else None
+            proj(width, hq * dk + g * (dk + dv), ("embed", None), "q")
+            if fused
+            else None
         )
-        self.q = None if fused else proj(width, h * dk, ("embed", heads), "q")
+        queries = ("embed", ("heads", hq))
+        self.q = None if fused else proj(width, hq * dk, queries, "q")
         self.k = proj(width, g * dk, ("embed", kv_heads), "kv") if split else None
         self.v = proj(width, g * dv, ("embed", kv_heads), "kv") if split else None
         self.o = proj(h * dv, width, (heads, "embed"), "o", config.output_bias)
@@ -383,7 +389,7 @@ class Attention(SoftmaxAttention):
 
         qk_norm, whole = config.qk_norm, config.qk_norm_all_heads
         self.qk_norm_all_heads = whole
-        self.q_norm = Norm(qk_norm, h * dk if whole else dk) if qk_norm else None
+        self.q_norm = Norm(qk_norm, hq * dk if whole else dk) if qk_norm else None
         self.k_norm = (
             Norm(qk_norm, g * dk if whole else dk) if qk_norm and projects_kv else None
         )
@@ -395,6 +401,22 @@ class Attention(SoftmaxAttention):
         trained = reads(ports, "v") and config.value_residual != "fixed"
         self.v_mix = nnx.Param(jnp.full(shape, 0.5, jnp.float32)) if trained else None
         self._exclusion(config, projects_kv)
+        self._init_differential(config, width, rngs)
+
+    def _init_differential(
+        self, config: cfg.GQAConfig, width: int, rngs: nnx.Rngs
+    ) -> None:
+        """Make differential attention's projection of the input to each output
+        head's weight on its second map, without a bias as DIFF V2's code has it, and
+        a sink for each query head."""
+        hq, names = self.query_heads, ("embed", ("heads", self.heads))
+        self.lambda_proj = (
+            linear(width, self.heads, names, False, rngs, role="q")
+            if config.differential
+            else None
+        )
+        if config.differential and config.sinks:
+            self.sinks = nnx.Param(jnp.zeros(hq), names=("heads",))
 
     def _exclusion(self, config: cfg.GQAConfig, projects_kv: bool) -> None:
         """Keep XSA's setting, and its strength for each head where it learns them.
@@ -428,7 +450,21 @@ class Attention(SoftmaxAttention):
         x, projected = self._projections(x)
         q, k, v = self._heads(projected, docs, taps)
         self._observe(q, k, docs, taps)
-        return self._output(x, self._exclude(self._attend(x, q, k, v, docs), v))
+        out = self._difference(x, self._attend(x, q, k, v, docs))
+        return self._output(x, self._exclude(out, v))
+
+    def _difference(
+        self, x: Float[Array, "b t d"], out: Float[Array, "b t hq dv"]
+    ) -> Float[Array, "b t h dv"]:
+        """Return each output head's ``a1 - sigmoid(x W) a2`` of its pair of query
+        heads' outputs, side by side in `out`, under ``differential`` (DIFF V2); the
+        outputs as they are without it."""
+        if self.lambda_proj is None:
+            return out
+        b, t, _, dv = out.shape
+        pairs = out.reshape(b, t, self.heads, 2, dv)
+        lam = jax.nn.sigmoid(self.lambda_proj(x)).astype(out.dtype)[..., None]
+        return shard_heads(pairs[..., 0, :] - lam * pairs[..., 1, :])
 
     def _exclude(
         self, out: Float[Array, "b t h dv"], v: Float[Array, "b t g dv"]
@@ -468,7 +504,7 @@ class Attention(SoftmaxAttention):
         projections: the queries, then the keys and values unless the layer reads them
         from its kv port, as slices of one projection when fused, else one each."""
         if self.qkv is not None:
-            q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
+            q, k = self.query_heads * self.head_dim, self.kv_heads * self.head_dim
             x, [qkv] = project_input(x, self.qkv)
             qkv = checkpoint_name(qkv, "qkv")
             return x, jnp.split(qkv, [q, q + k], axis=-1)
@@ -482,7 +518,7 @@ class Attention(SoftmaxAttention):
         """Split the projected queries into heads with QK-norm and RoPE
         (`_split_normed`), then apply the power scale."""
         t = q.shape[1]
-        q = self._split_normed(q, self.heads, self.q_norm, pos, "heads")
+        q = self._split_normed(q, self.query_heads, self.q_norm, pos, "heads")
         if self.power_scale is not None:
             at = jnp.arange(t) if pos is None else pos
             scale = _power_scale(at, self.power_scale, self.power_scale_length)
@@ -1012,6 +1048,8 @@ class SparseAttention(Sparse, Attention):
         rngs: nnx.Rngs,
     ):
         indexer = indexer_config(config, ports)
+        if config.differential:
+            raise ValueError("gqa: differential with the index port not yet")
         super().__init__(config, width, ports, rngs)
         rope = config.rope
         rotated = rotated_dims(self.head_dim, rope)

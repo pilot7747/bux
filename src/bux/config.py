@@ -586,6 +586,27 @@ class GQAConfig(QuadraticAttentionConfig):
     # takes tanh(a) of that part, a learned for each head from 0 (modded-nanogpt).
     # The values are those the layer attends to: not with its kv port read.
     exclusive: bool | Literal["learned"] = False
+    # Differential attention (DIFF V2; Ye et al., 2026): twice the query heads, both
+    # of each pair in the group of one kv head, and each of the num_heads outputs
+    # a1 - sigmoid(x W) a2 of its pair, W a projection of the input to a value a head
+    # and token. Its kv heads, KV cache and output projection are as without it.
+    differential: bool = False
+
+    @model_validator(mode="after")
+    def _differential(self) -> Self:
+        """Check that differential attention comes without the settings that see a
+        head of each output alone: an indexer and a relative bias."""
+        given = [
+            name
+            for name, on in (
+                ("indexer", self.indexer),
+                ("relative_bias", self.relative_bias),
+            )
+            if on is not None
+        ]
+        if self.differential and given:
+            raise ValueError(f"gqa: differential with {', '.join(given)} not yet")
+        return self
 
 
 class MLAConfig(QuadraticAttentionConfig):

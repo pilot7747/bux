@@ -503,6 +503,7 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
         ("mamba2(state_size=8, head_dim=8)", "num_heads", "none", "4"),
         ("gqa(num_heads=2, num_kv_heads=2)", "power_scale", "none", "0.1"),
         ("gqa(num_heads=2, num_kv_heads=2)", "exclusive", "false", "learned"),
+        ("gqa(num_heads=2, num_kv_heads=2)", "differential", "false", "true"),
         (
             "gqa(num_heads=2, num_kv_heads=2, gated=true)",
             "gate_head_bias",
@@ -578,6 +579,7 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         ("mamba2", "num_heads"): "ccdcaff2f8",
         ("gqa", "power_scale"): "4de8bfe6fd",
         ("gqa", "exclusive"): "4de8bfe6fd",
+        ("gqa", "differential"): "4de8bfe6fd",
         ("gqa", "gate_head_bias"): "370e873062",
         ("gqa", "gate_output_rank"): "370e873062",
         ("gqa", "gate_cross_head"): "370e873062",

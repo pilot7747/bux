@@ -336,6 +336,7 @@ _NEWER_LAYER_FIELDS = {
         "power_scale_length": 2048,
         "qk_norm_all_heads": False,
         "exclusive": False,
+        "differential": False,
         **_HYGA,
     },
     "mla": {"gate_head_bias": False, **_HYGA},

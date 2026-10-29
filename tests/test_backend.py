@@ -252,6 +252,37 @@ def test_hyga_s_gates_take_the_gate_and_are_new_parameters_alone():
         gqa(gated=True, gate_per_head=True, gate_output_rank=4)
 
 
+def test_differential_attention_subtracts_each_pairs_second_map():
+    """DIFF V2: 2h query heads, heads 2i and 2i + 1 a pair in one kv head's group,
+    and output head i a1 - sigmoid(x W)_i a2: as a 2h-head layer of the same
+    weights computes them, paired by its microsoft/unilm code's 0::2 and 1::2."""
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    diff = gqa(differential=True, head_dim=8, sinks=True)
+    assert diff.q is not None and diff.lambda_proj is not None
+    assert diff.q.kernel.shape == (D, 2 * H * 8) and diff.sinks is not None
+    assert diff.sinks.shape == (2 * H,)
+    diff.sinks[...] = jax.random.normal(jax.random.key(3), (2 * H,))
+    wide = Attention(
+        cfg.GQAConfig(num_heads=2 * H, num_kv_heads=2, head_dim=8, sinks=True),
+        D,
+        (),
+        nnx.Rngs(0),
+    )
+    for name in ("q", "k", "v"):
+        getattr(wide, name).kernel[...] = getattr(diff, name).kernel[...]
+    assert wide.sinks is not None
+    wide.sinks[...] = diff.sinks[...]
+    x_, projected = wide._projections(x)
+    q, k, v = wide._heads(projected, None, Taps())
+    maps = wide._attend(x_, q, k, v, None)
+    lam = jax.nn.sigmoid(diff.lambda_proj(x))[..., None]
+    heads = maps[:, :, 0::2] - lam * maps[:, :, 1::2]
+    expected = diff.o(heads.reshape(2, 8, -1))
+    assert jnp.allclose(diff(x, Taps()), expected, atol=1e-5)
+    with pytest.raises(ValueError, match="differential with relative_bias"):
+        gqa(differential=True, relative_bias=cfg.RelativeBiasConfig(rank=2, extent=4))
+
+
 def test_xsa_removes_each_heads_part_along_its_own_value():
     """y - (y . v) v / |v|^2, the paper's formula: nothing left along v, the rest
     of y kept; a query head takes its group's value. Learned, tanh(a) of it."""
