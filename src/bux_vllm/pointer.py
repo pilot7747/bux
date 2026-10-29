@@ -440,17 +440,31 @@ def mixture(
 ) -> torch.Tensor:
     """`bux_vllm.copying.mixed` in one Triton launch, a program a row, in the
     logits' dtype: the head's log-softmax over the rows but `copy` and the gate in
-    a first pass over the row, the mixture in a second. Its dozen PyTorch ops
-    cost vLLM's sampler about 7 times the head's log-softmax alone, each a launch
-    outside graphs."""
+    a first pass over the row, the mixture in a second, in float32. Its dozen
+    PyTorch ops cost vLLM's sampler about 7 times the head's log-softmax alone,
+    each a launch outside graphs; a program's blocks of `MIX_BLOCK` take a row of
+    50304 in 4 loads a pass."""
     logits = logits.contiguous()
     rows, vocab = logits.shape
     out = torch.empty_like(logits)
     if rows:
         _mixture_kernel[(rows,)](
-            logits, p_copy, a_sink, total, out, p_copy.stride(0), vocab, copy, BV=2048
+            logits,
+            p_copy,
+            a_sink,
+            total,
+            out,
+            p_copy.stride(0),
+            vocab,
+            copy,
+            BV=MIX_BLOCK,
+            num_warps=16,
         )
     return out
+
+
+#: The logits of a row the mixture's kernel reads at once.
+MIX_BLOCK = 16384
 
 
 @triton.jit
@@ -481,12 +495,13 @@ def _mixture_kernel(
     lse_lm = m + tl.log(total)
     gate = tl.load(row + copy).to(tl.float32)
     lse = _logaddexp(lse_lm, gate)
-    log_gate = gate - lse - tl.log(tl.load(TOTAL + r))
-    kept = _logaddexp(lse_lm - lse, log_gate + tl.log(tl.load(A_SINK + r)))
+    log_gate = gate - lse - tl.log(tl.load(TOTAL + r).to(tl.float32))
+    log_sink = tl.log(tl.load(A_SINK + r).to(tl.float32))
+    kept = _logaddexp(lse_lm - lse, log_gate + log_sink)
     for start in range(0, vocab, BV):
         v = start + tl.arange(0, BV)
         z = tl.load(row + v, mask=v < vocab, other=0.0).to(tl.float32)
-        p = tl.load(masses + v, mask=v < vocab, other=0.0)
+        p = tl.load(masses + v, mask=v < vocab, other=0.0).to(tl.float32)
         y = _logaddexp(z - lse_lm + kept, log_gate + tl.log(p))
         tl.store(out + v, tl.where(v == copy, -float("inf"), y), mask=v < vocab)
 

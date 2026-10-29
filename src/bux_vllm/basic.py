@@ -183,8 +183,10 @@ class Pointer(Layer):
         rows = site.vllm_config.scheduler_config.max_num_seqs
         copy = torch.zeros(rows, vocab, dtype=torch.float32)
         self.register_buffer("p_copy", copy, persistent=False)
-        self.register_buffer("a_sink", torch.ones(rows), persistent=False)
-        self.register_buffer("total", torch.ones(rows), persistent=False)
+        # float32, not the default dtype vLLM builds the model in
+        sums = torch.ones(rows, dtype=torch.float32)
+        self.register_buffer("a_sink", sums, persistent=False)
+        self.register_buffer("total", sums.clone(), persistent=False)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         return {
