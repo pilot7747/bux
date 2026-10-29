@@ -751,7 +751,8 @@ def picked_attention(
         rows = table[part.requests]
         if natively:
             _read_natively(cache, part, q[at], picked, rows, output[at])
-        elif _kernels(cache):
+            continue
+        if _kernels(cache):
             out = kernels.attend_picked(*args, cache.kv, rows, part.keys, cache.scales)
         else:
             out = picks.attend_picked(*args, cache.rows.kv, rows, part.keys)
