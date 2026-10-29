@@ -732,11 +732,23 @@ def export(name: str, out: Path, dtype: str, cases: dict[str, str] = CASES) -> N
     with placeholders(arch):
         save(arch, model, out, dtype=getattr(torch, dtype))
     _add_router_biases(model, arch, out)
-    rng = np.random.default_rng(0)
-    prompts = [rng.integers(0, arch.vocab_size, n).tolist() for n in LENGTHS]
-    meta = {"name": name, "dtype": dtype, "prompts": prompts, "steps": STEPS}
+    meta = {"name": name, "dtype": dtype, "prompts": prompts(arch), "steps": STEPS}
     (out / "parity.json").write_text(json.dumps(meta))
     print(f"exported {name} to {out}")
+
+
+def prompts(arch: Any) -> list[list[int]]:
+    """The case's prompts, of `LENGTHS` random tokens: none a copy pointer's
+    <copy> row, which is no token. Its mixture drops what the pointer puts on one,
+    and vLLM's log-softmax gives it back to the other tokens."""
+    rng = np.random.default_rng(0)
+    out = [rng.integers(0, arch.vocab_size, n) for n in LENGTHS]
+    heads = [x.config for x in arch.layers() if x.config.type == "head"]
+    pointer = heads[0].pointer if heads else None
+    if pointer is not None:
+        copy = arch.vocab_size - 1 if pointer.token is None else pointer.token
+        out = [np.where(p == copy, (copy + 1) % arch.vocab_size, p) for p in out]
+    return [p.tolist() for p in out]
 
 
 def reference_model(arch: Any, dtype: str) -> Any:
@@ -971,10 +983,10 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         tokens, starts = run[f"tokens{i}"], len(prompt) - 1
         sequence = [*prompt, *tokens.tolist()]
         want = _logprobs(model, sequence)[:-1]
-        vllm.add(run[f"logprobs{i}"], want, starts, tokens)
+        vllm.add(run[f"logprobs{i}"], want, starts, tokens, i)
         if low is not None:
             got = _logprobs(low, sequence)[:-1]
-            own.add(got, want, starts, got[starts:].argmax(-1))
+            own.add(got, want, starts, got[starts:].argmax(-1), i)
     error, gap = max(args.tolerance, 2 * own.error), max(args.margin, own.error)
     ok = vllm.error <= error and vllm.gap <= gap
     print(
@@ -983,6 +995,8 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         f"{'same' if vllm.same else 'differs'} (worst gap {vllm.gap:.2e}"
         f"{own.note(own.gap)})  {'ok' if ok else 'DIFFERS'}"
     )
+    if not ok:
+        print(f"{'':12s} its largest difference: {vllm.worst}")
     return ok
 
 
@@ -996,21 +1010,38 @@ class Agreement:
             of the token picked.
         same: Whether every pick is bux's.
         seen: Whether it measured anything.
+        worst: Where the largest difference is: its prompt, position and token.
     """
 
     error: float = 0.0
     gap: float = 0.0
     same: bool = True
     seen: bool = False
+    worst: str = ""
 
     def add(
-        self, got: np.ndarray, want: np.ndarray, starts: int, picks: np.ndarray
+        self,
+        got: np.ndarray,
+        want: np.ndarray,
+        starts: int,
+        picks: np.ndarray,
+        prompt: int,
     ) -> None:
-        """Measure a prompt's positions: the log-probabilities `got` against `want`,
-        and the `picks` of its steps, from position `starts` on."""
+        """Measure the positions of prompt number `prompt`: the log-probabilities
+        `got` against `want`, and the `picks` of its steps, from position `starts`
+        on."""
         steps = want[starts:]
         gap = steps.max(-1) - steps[np.arange(len(picks)), picks]
-        off = np.where(got == want, 0, np.abs(got - want))  # -inf at <copy>, both
+        with np.errstate(invalid="ignore"):  # -inf at <copy>, both
+            off = np.where(got == want, 0, np.abs(got - want))
+        if off.max() > self.error:
+            row, token = np.unravel_index(off.argmax(), off.shape)
+            kind = "a prompt's" if row < starts else "a decoded"
+            self.worst = (
+                f"prompt {prompt}, position {row} ({kind}), token {token}: "
+                f"{got[row, token]:.6f} against {want[row, token]:.6f}, the best "
+                f"{want[row].max():.4f}"
+            )
         self.error = max(self.error, float(off.max()))
         self.gap = max(self.gap, float(gap.max()))
         self.same &= bool((steps.argmax(-1) == picks).all())

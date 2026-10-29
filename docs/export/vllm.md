@@ -843,7 +843,10 @@ a prompt runs the ops between the graph's pieces.
 with perturbed weights. It decodes a batch of prompts of 3 to 64 tokens greedily in
 vLLM, and compares every position with bux: the token vLLM picks, and its
 log-probabilities over the whole vocabulary, for the prompts and for every decoding
-step. bux and vLLM live in separate environments, so the script runs in three steps:
+step. A copy pointer's prompts hold no `<copy>` token, which is no token: its
+mixture drops what the pointer puts on one, and vLLM's log-softmax would give that
+back to the other tokens. bux and vLLM live in separate environments, so the script
+runs in three steps:
 
 ```sh
 JAX_PLATFORMS=cpu python scripts/vllm_parity.py export runs/parity/float32   # bux's
