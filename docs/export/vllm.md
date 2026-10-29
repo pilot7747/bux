@@ -121,14 +121,16 @@ costs. On a B300, serve with `fp8` ([Schemes on a B300](#schemes-on-a-b300)).
 
 - **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
   routed and shared experts. That is attention's q, k, v, gate and output
-  projections (`gqa`, `mla`, `csa`), the MLPs and `linear`, LatentMoE's
+  projections (`gqa`, `mla`, `csa`), a `gqa` indexer's projections of its queries,
+  keys and head weights (one GEMM, one scale, where its head dim is a multiple of
+  16), the MLPs and `linear`, LatentMoE's
   projections, and the projections of `kda`, `gdn2`, `deltanet`, `gla`,
   `lightning`, `rwkv7` and `short_conv`, their low-rank ones included. vLLM's own
   `gdn` layer quantizes its projections too, and so does its Mamba-2, where tensor
   parallelism splits its groups.
 - **Kept in the model's dtype:** the embeddings (`value_embed`'s too) and the heads, the routers (which
   the plugin computes in float32), the shared experts' gate, the norms and convs,
-  the residual algebras, the indexers, `engram`, `mamba` (vLLM's Mamba layer takes
+  the residual algebras, the indexers of `mla` and `csa`, `engram`, `mamba` (vLLM's Mamba layer takes
   no quantization), and the KV cache (`--kv-cache-dtype` sets that). So are the
   weights the plugin reads itself: a sparse `mla`'s `kv_b`, which its sparse
   attention reads, `csa`'s grouped low-rank output, and HyGA's matrices of each
@@ -506,6 +508,9 @@ plugin's own kernels above. So does a sparse `mla` layer's indexer, unless
 `BUX_VLLM_SPARSE_KERNELS=native`: its FP8 keys would take a head slot as wide as a
 latent, which doubles the layer's cache.
 
+- **Projections.** A `gqa` layer's indexer projects its queries, keys and head
+  weights from the layer's input by one GEMM, which takes `--quantization` as the
+  layer's other projections do.
 - **Keys.** Each token's indexer key is cached in FP8 (e4m3) with a float32 scale,
   in head slots of the call's cache after its kv heads: each block's keys, then
   their scales, as DeepGEMM's paged kernel reads them. They page with the keys and
