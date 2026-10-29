@@ -1,7 +1,8 @@
 """What a ``gqa`` layer does to its queries, keys and values besides attending, in
-plain PyTorch: its ports, the value residual of its ``v`` port, the kv heads a rank
-keeps under tensor parallelism, its conv's taps (``kv_conv_size``) as vLLM's conv
-kernels take them, and the queries' scale by their position.
+plain PyTorch: its ports, the value embeddings of its ``ve`` port, the value residual
+of its ``v`` port, the kv heads a rank keeps under tensor parallelism, its conv's
+taps (``kv_conv_size``) as vLLM's conv kernels take them, and the queries' scale by
+their position.
 
 A port is ``[name, tap, mode]``, as ``bux.export.plan`` writes it: ``attn(v=@v1)``
 writes the layer's values to the tap ``v1`` (``write``), ``attn(v=$v1)`` reads them
@@ -16,9 +17,10 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 
 #: The ports a ``gqa`` layer runs in vLLM.
-PORTS = ("v", "kv", "index")
+PORTS = ("v", "kv", "index", "ve")
 
 
 def reads(ports: list, name: str) -> tuple[str, bool] | None:
@@ -52,7 +54,11 @@ def check_ports(c: dict, ports: list) -> None:
         raise NotImplementedError(f"gqa: the {', '.join(others)} port not in vLLM yet")
     if not reads(ports, "kv"):
         return
-    if any(n == "v" for n, _, _ in ports) or c["indexer"] or reads(ports, "index"):
+    if (
+        any(n in ("v", "ve") for n, _, _ in ports)
+        or c["indexer"]
+        or reads(ports, "index")
+    ):
         raise NotImplementedError("gqa: a v port or an indexer beside reading kv")
 
 
@@ -115,6 +121,37 @@ def mix_values(
         return 0.5 * v + 0.5 * v1
     a, b = (w[0], w[1]) if kind == "learned" else (w, 1 - w)
     return (a * v.float() + b * v1.float()).to(v.dtype)
+
+
+def add_value_embedding(
+    x: torch.Tensor,
+    v: torch.Tensor,
+    e: torch.Tensor,
+    w: torch.Tensor | None,
+    heads: tuple[int, int],
+) -> torch.Tensor:
+    """bux's value embeddings: the layer's values `v` plus the ``ve`` port's rows,
+    by a gate per kv head of the first channels of its input and of the rows,
+    ``v + 2 sigmoid(W [x[:n], e[:n]]) e``; ``v + e`` without one.
+
+    Args:
+        x: The layer's input, (T, d).
+        v: This rank's values, (T, g dv): its kv heads'.
+        e: The rows of every kv head, (T, kv dv), in the model's dtype.
+        w: The gate's weight of every kv head, (kv, 2n); None for no gate.
+        heads: This rank's first kv head and how many it keeps, g.
+
+    Returns:
+        The values, as v.
+    """
+    first, g = heads
+    dv = v.shape[-1] // g
+    rows = e[:, first * dv : (first + g) * dv]
+    if w is None:
+        return v + rows
+    n = w.shape[1] // 2
+    gate = F.linear(torch.cat([x[:, :n], e[:, :n]], -1), w[first : first + g])
+    return v + (2 * torch.sigmoid(gate)).repeat_interleave(dv, -1) * rows
 
 
 def keys_from_values(c: dict, ports: list) -> bool:
