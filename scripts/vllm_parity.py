@@ -121,6 +121,10 @@ SHARING = (
     "R = layer(local(kv=$kv!))\nG = layer(full(kv=@kv))\n"
 )
 
+#: The cases whose prompts' log-probabilities vLLM does not serve, which compare the
+#: rows vLLM samples alone: a head with a copy pointer points for those rows only.
+SAMPLED = ("cplm",)
+
 #: The cases, by name: a model each, as bux source.
 CASES = {
     "llama": LLAMA + "model = embed block^2 rmsnorm head",
@@ -894,10 +898,12 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         tokens, starts = run[f"tokens{i}"], len(prompt) - 1
         sequence = [*prompt, *tokens.tolist()]
         want = _logprobs(model, sequence)[:-1]
-        vllm.add(run[f"logprobs{i}"], want, starts, tokens)
+        skip = starts if name in SAMPLED else 0  # their prompts' rows unserved
+        got = run[f"logprobs{i}"]
+        vllm.add(got[skip:], want[skip:], starts - skip, tokens)
         if low is not None:
             got = _logprobs(low, sequence)[:-1]
-            own.add(got, want, starts, got[starts:].argmax(-1))
+            own.add(got[skip:], want[skip:], starts - skip, got[starts:].argmax(-1))
     error, gap = max(args.tolerance, 2 * own.error), max(args.margin, own.error)
     ok = vllm.error <= error and vllm.gap <= gap
     print(

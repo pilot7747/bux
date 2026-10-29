@@ -106,6 +106,21 @@ def pointed(
     return copy, every[:, -1]
 
 
+def rows_of(
+    p_copy: torch.Tensor, a_sink: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The first `n` rows of the pointer's buffers, (max_rows, vocab) and
+    (max_rows,): past the buffers' rows, as vLLM's dummy sampler run asks for more
+    rows than requests, rows of no pointer, p_copy 0 and a_sink 1, which leave the
+    head's softmax over the vocabulary but <copy>."""
+    have = p_copy.shape[0]
+    if n <= have:
+        return p_copy[:n], a_sink[:n]
+    more = n - have
+    p_copy = torch.cat([p_copy, p_copy.new_zeros(more, p_copy.shape[1])])
+    return p_copy, torch.cat([a_sink, a_sink.new_ones(more)])
+
+
 def mixed(
     logits: torch.Tensor, p_copy: torch.Tensor, a_sink: torch.Tensor, copy: int
 ) -> torch.Tensor:

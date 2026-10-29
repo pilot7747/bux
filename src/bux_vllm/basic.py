@@ -203,9 +203,8 @@ class Pointer(Layer):
 
     def mixed(self, logits: torch.Tensor) -> torch.Tensor:
         """The log of the mixture, of the head's `logits` of each request's row."""
-        n = logits.shape[0]
-        mix = copying.mixed(logits, self.p_copy[:n], self.a_sink[:n], self.copy)
-        return mix.to(logits.dtype)
+        p_copy, a_sink = copying.rows_of(self.p_copy, self.a_sink, logits.shape[0])
+        return copying.mixed(logits, p_copy, a_sink, self.copy).to(logits.dtype)
 
 
 def _rms_normed(x: torch.Tensor) -> torch.Tensor:

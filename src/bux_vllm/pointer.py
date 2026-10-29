@@ -175,7 +175,10 @@ def copy_pointer(
     n = steps.num_actual_tokens
     rows = copying.encode(k[:n], tokens[:n], cache.dtype, cache.fp8)
     picks.write(cache.rows, steps.slot_mapping[:n], rows)
-    last, requests = steps.last.long(), steps.last.shape[0]
+    # Every request's, but past the buffers' rows, which vLLM's runs within
+    # max_num_seqs never reach.
+    requests = min(steps.last.shape[0], p_copy.shape[0])
+    last = steps.last[:requests].long()
     table = steps.block_table_tensor[:requests]
     if q.dtype == torch.float32:
         copy, share = copying.pointed(
@@ -183,7 +186,7 @@ def copy_pointer(
             sink[last],
             cache.rows,
             table,
-            steps.position,
+            steps.position[:requests],
             p_copy.shape[1],
             cache.fp8,
         )
@@ -191,7 +194,8 @@ def copy_pointer(
         a_sink[:requests].copy_(share)
         return
     p_copy[:requests].zero_()
-    _pointed(q[last], sink[last], cache, table, steps.position, p_copy, a_sink)
+    position = steps.position[:requests]
+    _pointed(q[last], sink[last], cache, table, position, p_copy, a_sink)
 
 
 def _pointed(

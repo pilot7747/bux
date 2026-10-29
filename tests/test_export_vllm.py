@@ -2903,3 +2903,18 @@ def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture() -> None:
         finite = np.isfinite(want[i])
         assert (np.isfinite(got) == finite).all()
         np.testing.assert_allclose(got[finite], want[i][finite], rtol=1e-5, atol=1e-5)
+
+
+def test_rows_past_the_pointer_s_buffers_take_the_softmax_but_copy() -> None:
+    """vLLM's dummy sampler run asks compute_logits for more rows than max_num_seqs:
+    those rows mix no pointer, the head's softmax over every row but <copy>."""
+    p_copy, a_sink = torch.rand(4, 10), torch.rand(4)
+    rows, sinks = copying.rows_of(p_copy, a_sink, 3)
+    assert torch.equal(rows, p_copy[:3]) and torch.equal(sinks, a_sink[:3])
+    rows, sinks = copying.rows_of(p_copy, a_sink, 6)
+    assert rows.shape == (6, 10) and sinks.shape == (6,)
+    logits = torch.randn(6, 10)
+    got = copying.mixed(logits, rows, sinks, 9)
+    want = logits[:, :9].log_softmax(-1)
+    np.testing.assert_allclose(got[4:, :9].numpy(), want[4:].numpy(), rtol=1e-5)
+    assert torch.isneginf(got[:, 9]).all()
