@@ -66,6 +66,7 @@ LAYER_MODULES = (
     "rwkv7",
     "residual",
     "engram",
+    "doc_copy",
 )
 
 
@@ -349,6 +350,7 @@ def _repeat(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
         "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
+        "doc_copy": 0,
     }
 )
 class BuxModel(Scoped):
@@ -392,10 +394,11 @@ class BuxModel(Scoped):
         inputs_embeds: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
+        doc_copy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ctx = Ctx(positions, self.shared, inputs_embeds, self.plan)
         ctx.input_ids, ctx.query_start_loc = input_ids, query_start_loc
-        ctx.ngram_context = ngram_context
+        ctx.ngram_context, ctx.doc_copy = ngram_context, doc_copy
         run(self, self.plan.top.root, (), input_ids, ctx, 0)
         assert ctx.hidden is not None, "the model ran no head"
         return ctx.hidden
@@ -420,7 +423,8 @@ class BuxForCausalLM(nn.Module, IsHybrid):
 
     def get_model_state_cls(self) -> type:
         """vLLM's model runner state for the model (V2's): its own, which also gives
-        an engram the ids before each step (`bux_vllm.engram.model_state`)."""
+        an engram the ids before each step and ``doc_copy`` its candidates
+        (`bux_vllm.engram.model_state`)."""
         return engram.model_state(self.vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -441,6 +445,7 @@ class BuxForCausalLM(nn.Module, IsHybrid):
             inputs_embeds,
             kwargs.get("query_start_loc"),
             kwargs.get("ngram_context"),
+            kwargs.get("doc_copy"),
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

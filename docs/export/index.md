@@ -183,6 +183,7 @@ naming the layer or the setting.
 | `rwkv7` | every setting, and its `v` port (the value residual) |
 | `mamba`, `mamba2`, `short_conv` | every setting; `dt_min` and `dt_max` matter only at initialization |
 | `engram` | on a single or a widened stream; its last tokens and its conv's input tail stay in the cache while decoding. A token's class is its id mod `vocab_classes`, as in bux |
+| `doc_copy` | every setting and its `copy` port, on a single or a widened stream; the sequence's token ids stay in the cache while decoding, which each new token's contexts match against |
 | `nextn` | on a single or a widened stream; every head's logits on whole sequences (`all_heads=True`), skipped during generation |
 | `merge` | yes |
 | residual algebras | `hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`, with every setting, single-pass included; `msar`'s convs keep their last inputs in the cache while decoding |

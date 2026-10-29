@@ -103,6 +103,7 @@ from bux.architecture.common.segments import Segments
 from bux.architecture.experts.moe import MoE
 from bux.architecture.graph import build_node
 from bux.architecture.layers.conv import CausalConv
+from bux.architecture.layers.doc_copy import DocCopy
 from bux.architecture.layers.elementwise import Activation, Dropout, Linear, Scale
 from bux.architecture.layers.embedding import Embedding, Head, NextN, ValueEmbedding
 from bux.architecture.layers.engram import Engram
@@ -154,6 +155,7 @@ __all__ = [
     "CausalConv",
     "Context",
     "DeltaNet",
+    "DocCopy",
     "Dropout",
     "DyT",
     "Embedding",
