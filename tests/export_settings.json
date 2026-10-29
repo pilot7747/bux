@@ -72,11 +72,14 @@
   "kv_conv_size",
   "log_scale",
   "log_scale_floor",
+  "mimetic_noise",
+  "mimetic_vo",
   "num_heads",
   "num_kv_heads",
   "output_bias",
   "output_dropout",
   "output_norm",
+  "paired",
   "power_scale",
   "power_scale_length",
   "qk_norm",
@@ -388,6 +391,12 @@
  ],
  "AttentionResidualConfig": [
   "block_size",
+  "norm_eps",
+  "type"
+ ],
+ "MultiStreamAttentionResidualConfig": [
+  "block_size",
+  "kernel_sizes",
   "norm_eps",
   "type"
  ],

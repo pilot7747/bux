@@ -510,6 +510,8 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
         ("gqa(num_heads=2, num_kv_heads=2)", "value_embed_gate", "6", "3"),
         ("gqa(num_heads=2, num_kv_heads=2)", "k_eq_v", "false", "true"),
         ("gqa(num_heads=2, num_kv_heads=2)", "differential", "false", "true"),
+        ("gqa(num_heads=2, num_kv_heads=2)", "paired", "false", "true"),
+        ("gqa(num_heads=2, num_kv_heads=2)", "mimetic_vo", "none", "0.05"),
         (
             "gqa(num_heads=2, num_kv_heads=2, gated=true)",
             "gate_head_bias",
@@ -589,6 +591,8 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         ("gqa", "value_embed_gate"): "4de8bfe6fd",
         ("gqa", "k_eq_v"): "4de8bfe6fd",
         ("gqa", "differential"): "4de8bfe6fd",
+        ("gqa", "paired"): "4de8bfe6fd",
+        ("gqa", "mimetic_vo"): "4de8bfe6fd",
         ("gqa", "gate_head_bias"): "370e873062",
         ("gqa", "gate_output_rank"): "370e873062",
         ("gqa", "gate_cross_head"): "370e873062",

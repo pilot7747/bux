@@ -367,7 +367,8 @@ def computes_logits(c: dict) -> bool:
     """Whether the layer computes its softmax (`softmax_attention`): a setting needs
     the logits that transformers' attention implementations do not all take."""
     logit_features = (c["relative_bias"], c["log_scale"] is not None, c["indexer"])
-    return any((c["sinks"], c["softcap"] is not None, *logit_features))
+    paired = c.get("paired", False)  # paired heads, by a mask of their own
+    return any((c["sinks"], c["softcap"] is not None, paired, *logit_features))
 
 
 class SoftmaxAttention(nn.Module):
@@ -599,6 +600,30 @@ class SoftmaxAttention(nn.Module):
         return self.o(out.flatten(2))
 
 
+def paired(x: torch.Tensor) -> torch.Tensor:
+    """Queries, keys or values, b t n d, with head j and head j + n / 2 interleaved
+    along the sequence, b 2t n/2 d: position 2p holds token p's first half of the
+    heads and 2p + 1 its second (record 58's views)."""
+    b, t, n, d = x.shape
+    return x.reshape(b, 2 * t, n // 2, d)
+
+
+def paired_mask(mask: Dense, window: int | None) -> torch.Tensor:
+    """Which keys of `paired`'s sequence each of its queries sees, b 1 2t 2s, from
+    `mask` of the tokens without a window: the token's own and those before it, each
+    as two positions, and of its own token the first half's for the first, both for
+    the second; `window` of those positions at most if not None."""
+    t, s = mask.offsets.shape
+    half = torch.arange(2, device=mask.keep.device)
+    behind = 2 * mask.offsets[:, None, :, None] + half[:, None, None] - half
+    behind = behind.reshape(2 * t, 2 * s)
+    keep = behind >= 0
+    if window is not None:
+        keep &= behind < window
+    tokens = mask.keep.repeat_interleave(2, 2).repeat_interleave(2, 3)
+    return tokens & keep
+
+
 def differential(out: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
     """Each output head's ``a1 - sigmoid(lam) a2``, b t h dv, of its pair of query
     heads' outputs side by side in out, b t 2h dv (DIFF V2), lam b t h."""
@@ -657,8 +682,8 @@ class Attention(SoftmaxAttention):
     ``qk_norm_all_heads``) then RoPE, and its ports: ``ve`` (value embeddings, added
     to the values first), ``v`` (value residual), ``kv`` (cross-layer KV sharing) and
     ``index`` (an indexer's kept keys); differential attention, two query heads an
-    output head (`differential`); and XSA, each head's output less its part along
-    the query's own value (`exclusive`).
+    output head (`differential`); paired heads (`paired`); and XSA, each head's output
+    less its part along the query's own value (`exclusive`).
 
     A layer that reads ``kv`` attends to the writer's keys and values as the writer's
     cache layer keeps them, all of them while decoding, and keeps none of its own; it
@@ -700,6 +725,25 @@ class Attention(SoftmaxAttention):
         learned = self.exclusive == "learned"
         self.xsa_alpha = nn.Parameter(torch.zeros(h)) if learned else None
         self._differential(c, width, site)
+        self.paired = c["paired"]
+
+    def attend_paired(self, q: torch.Tensor, kv: KV, ctx: Ctx) -> torch.Tensor:
+        """Return paired-head attention's outputs, b t h dv, of the queries q, b t h
+        dk, over `kv`: head j's and head j + h/2's queries, and kv head m's and
+        m + g/2's keys and values, interleaved along the sequence (`paired`), over
+        the interleaved positions' mask (`paired_mask`)."""
+        b, t, h, _ = q.shape
+        mask = ctx.mask("dense", (kv.slot, None))
+        keys, values = (paired(y.transpose(1, 2)).transpose(1, 2) for y in (kv.k, kv.v))
+        out = softmax_attention(
+            paired(q).transpose(1, 2),
+            keys,
+            values,
+            paired_mask(mask, self.window),
+            self.scale,
+            self.softcap,
+        )
+        return out.reshape(b, t, h, -1)
 
     def _differential(self, c: dict, width: int, site: Site) -> None:
         """Make differential attention's projection to each output head's weight
@@ -753,7 +797,11 @@ class Attention(SoftmaxAttention):
             kv = self.cached(k, v, ctx, slot)
         self.write(ctx, "kv", kv)
         kept = self.kept(x, x, ctx, kv)
-        out = self.attend(x, q, kv, ctx, kept)
+        out = (
+            self.attend_paired(q, kv, ctx)
+            if self.paired
+            else self.attend(x, q, kv, ctx, kept)
+        )
         if self.lambda_proj is not None:
             out = differential(out, self.lambda_proj(x))
         if self.exclusive:
@@ -778,9 +826,7 @@ class Attention(SoftmaxAttention):
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """Split the projected queries into heads with QK-norm (`_split_normed`),
         then apply RoPE and the power scale."""
-        q = self._split_normed(q, self.hq, self.q_norm)
-        if self.rope is not None:
-            q = self.rope(q, ctx.positions)
+        q = self._rotated(self._split_normed(q, self.hq, self.q_norm), ctx)
         power, length = self.power_scale
         if power is None:
             return q
@@ -802,7 +848,20 @@ class Attention(SoftmaxAttention):
         if self.v_norm is not None:  # k_eq_v: each head's key, normalized
             v = self.v_norm(k.view(b, t, self.g, self.dk))
         k, v = self._split_normed(k, self.g, self.k_norm), v.view(b, t, self.g, self.dv)
-        return (k if self.rope is None else self.rope(k, ctx.positions)), v
+        return self._rotated(k, ctx), v
+
+    def _rotated(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        """Queries or keys, b t n dk, by RoPE at their positions; under ``paired``,
+        head i of the token at p at 2p + (i mod 2), as record 58's rotary."""
+        if self.rope is None:
+            return x
+        if not self.paired:
+            return self.rope(x, ctx.positions)
+        b, t, n, dk = x.shape
+        halves = x.view(b, t, n // 2, 2, dk)
+        p = ctx.positions
+        turned = [self.rope(halves[..., i, :], 2 * p + i) for i in (0, 1)]
+        return torch.stack(turned, 3).view(b, t, n, dk)
 
     def _split_normed(
         self, x: torch.Tensor, heads: int, norm: Norm | None

@@ -341,7 +341,7 @@ in every run.
 | `rmsnorm`, `layernorm`, `dyt`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `conv` | by vLLM's short-conv kernels, its last inputs in vLLM's Mamba cache, as the conv on keys and values; the whole stream on every rank |
 | `short_conv` | LFM2's, `C * conv(B u)`, by the same kernels and state, its channels split over ranks, with or without biases |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`, and HyGA's input, output and cross-head gates, the last's logits summed over the ranks by an all-reduce of their own), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), XSA (`exclusive`, fixed or learned), differential attention (`differential`: its query heads in one call of vLLM's attention over the same KV cache, each pair's subtraction fused by torch.compile, pairs kept on one rank), values from the keys (`k_eq_v`, [Values from the keys](#values-from-the-keys)), an indexer ([Sparse attention](#sparse-attention); DeepSeek-V3.2's on vLLM's DSA kernels, [DSA on vLLM's kernels](#dsa-on-vllms-kernels)), a relative bias (Inkling's, by the plugin's own op, as an indexer), the `ve` port: value embeddings, gated or not, added to the values before the value residual, the `v` port: the value residual, fixed, learned or convex, the `kv` port: cross-layer KV sharing, by vLLM's own, between layers of the same kv heads, the reader's window no longer than the writer's, and the `index` port: one layer's picks shared with others ([Sparse attention](#sparse-attention)). QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: the `kv` port of a sparse layer, a relative bias beside an indexer or ports, or `differential` reading the `index` port |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`, and HyGA's input, output and cross-head gates, the last's logits summed over the ranks by an all-reduce of their own), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), XSA (`exclusive`, fixed or learned), differential attention (`differential`: its query heads in one call of vLLM's attention over the same KV cache, each pair's subtraction fused by torch.compile, pairs kept on one rank), values from the keys (`k_eq_v`, [Values from the keys](#values-from-the-keys)), an indexer ([Sparse attention](#sparse-attention); DeepSeek-V3.2's on vLLM's DSA kernels, [DSA on vLLM's kernels](#dsa-on-vllms-kernels)), a relative bias (Inkling's, by the plugin's own op, as an indexer), the `ve` port: value embeddings, gated or not, added to the values before the value residual, the `v` port: the value residual, fixed, learned or convex, the `kv` port: cross-layer KV sharing, by vLLM's own, between layers of the same kv heads, the reader's window no longer than the writer's, and the `index` port: one layer's picks shared with others ([Sparse attention](#sparse-attention)). QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: the `kv` port of a sparse layer, a relative bias beside an indexer or ports, `differential` reading the `index` port, or paired heads (`paired`), which need an attention over two heads' keys in one softmax: vLLM's attention takes a query head's keys from one kv head, and returns no log-sum-exp to merge two of its calls |
 | `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. With an indexer (DeepSeek-V3.2's, its picks by vLLM's DSA kernels where they take it) or the `index` port's picks, sparse attention in the latent space by the plugin's ops ([Sparse attention](#sparse-attention)), with a window, soft-capping and sinks too, in any dtype. Not yet: QK-norm, a window, soft-capping or sinks without an indexer, a relative bias, `log_scale`, `gate_head_bias`, HyGA's gates, the `kv` port, an indexer that picks per group, `mla` that vLLM runs as MLA beside other attention, or such `mla` layers of different dims or heads |
 | `csa` | bux's arithmetic on vLLM's paged caches ([Compressed sparse attention](#compressed-sparse-attention)): a sliding window or every token, compressed latents of any `compress_ratio`, the indexer's top-k (ReLU'd or plain dots, weighted or summed, its norm), queries at full rank or from a latent, QK-norm, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), sinks, soft-capping, its scale, `gated` (a gate per channel or per head, `gate_head_bias`), `output_norm`, a dense or grouped low-rank output, and its `kv`, `index` and `candidates` ports; in float32 or bfloat16. Not yet: an indexer of blocks, a relative bias, `log_scale`, HyGA's gates, speculative decoding, decode context parallelism, or an FP8 KV cache |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), SiTU-GLU experts (`situ` with an `up_softcap`, Kimi K3's, by vLLM's own), LatentMoE with its norms (vLLM's fused experts at the latent's width), shared experts the router scores (`shared_expert_sink`), and each routed expert's output normalized before its weight (`expert_norm`; each of a token's picks a row of its own in vLLM's fused MoE, so that their outputs come back apart, summed over the ranks, for the norm), and zero experts (`num_zero_experts`, LongCat-Flash's, [Zero experts](#zero-experts)). Not yet: an `up_softcap` on experts other than `situ` ones, or zero experts under expert parallelism |
@@ -349,7 +349,7 @@ in every run.
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate; by bux's own rule ([DPLR delta rules](#dplr-delta-rules)) without a conv or an output gate, with a `v_head_dim` other than `head_dim`, or a lower bound under -5. Not yet: speculative decoding |
 | `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, with a conv or none, `lightning`'s decay by the layer's depth among the token mixers and its RMSNorm of all heads, its statistics summed over the ranks, and `rwkv7`'s `v` port (the value residual). Not yet: `gla` without a conv in a 16-bit model, or speculative decoding |
 | `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
-| residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
+| residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`, with every setting, single-pass included; `msar`'s convs keep each sequence's last values in vLLM's Mamba cache ([Multi-stream attention residuals](#multi-stream-attention-residuals)) |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet. Serve those models with transformers
@@ -530,8 +530,33 @@ how often it moves it.
   PyTorch against the export, and `scripts/vllm_residual.py` compares the kernels
   with the PyTorch path on a GPU and times a branch both ways.
 
-The kernels are custom ops that stay inside vLLM's CUDA graphs: the graphs split at
-attention and the recurrent and MoE layers' ops, not at these. On an NVIDIA B300
+### Multi-stream attention residuals
+
+`msar` keeps attnres's sources, each finished one as its streams: itself and its
+causal convs over the tokens. A branch expands the newest source, which its convs
+read the last values of from before the step: each sequence's last
+`max(kernel_sizes) - 1` values of the source, which vLLM keeps in its Mamba cache, as
+a conv's state.
+
+- **Packs.** vLLM gives every state of its Mamba cache a page as large as the
+  model's largest. So the plugin packs the branches' states, d channels each, into
+  as few states as fill that page: a recurrent layer's, such as KDA's in the
+  hybrid. They come after every other state in `layer_types`. In the hybrid at a
+  width of 3328, the 104 branches before the head pack 46 to a state, in 3 pages per
+  sequence (about 10 MB), where a state each would take 104.
+- **Kernels.** In a 16-bit model, two Triton kernels convolve a step's tokens and
+  keep each sequence's last values, by vLLM's slots: decoded tokens one a sequence,
+  a prompt's chunk after its kept values. The op runs between the CUDA graph's
+  pieces, as a short conv does, and a decoding step's graph captures it. A float32
+  model, and any under `BUX_VLLM_RESIDUAL_KERNELS=torch`, takes the PyTorch path.
+  The read's softmax over depth and its mixer run in PyTorch, which torch.compile
+  fuses.
+- **Checks.** CPU tests run the plugin's branches against the export's, and its
+  steps' convs (prompts in chunks, then decoded tokens) against each whole sequence;
+  `scripts/vllm_residual.py` compares the kernels with the PyTorch path on a GPU.
+
+The other algebras' kernels are custom ops that stay inside vLLM's CUDA graphs: the
+graphs split at attention and the recurrent and MoE layers' ops, not at these. On an NVIDIA B300
 (2026-10-28, vLLM 0.32.0, a step of 8 tokens in a CUDA graph), an `hc` branch's read
 and write take 0.013 ms fused against 0.094 ms in PyTorch.
 
@@ -805,12 +830,13 @@ JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare runs/parity/float32  # b
 Measured on 2026-10-28 on one and two (TP=2) NVIDIA B300 GPUs, with vLLM 0.32.0,
 PyTorch 2.13.0 (CUDA 13.0), flash-linear-attention 0.6.0 and Python 3.12; bux's
 reference ran on the CPU in float32. vLLM ran with CUDA graphs and `torch.compile` (its default), its own pick of attention backend, Triton's MoE kernels (`--moe-backend triton`), and, in float32, Triton's dots in IEEE float32 (`TRITON_F32_DEFAULT=ieee`).
-The rows of XSA, HyGA, value embeddings, values from the keys and differential
-attention (`xsa`, `hyga`, `diff`, their `-hybrid` cases, `value-embed`,
-`value-embed-shared`, `k-eq-v` and `k-eq-v-nope`) and of zero experts (`moe-zero`,
-`moe-zero-longcat`, `moe-zero-norm`) were measured the same way on 2026-10-29, and
-so were the sparse `gqa` and `mla` rows (all but `csa`'s), with each `gqa`
-indexer's projections in one GEMM.
+The rows of XSA, HyGA, value embeddings, values from the keys, differential
+attention and multi-stream attention residuals (`xsa`, `hyga`, `diff`, `msar`,
+their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
+`k-eq-v-nope`) and of zero experts (`moe-zero`, `moe-zero-longcat`,
+`moe-zero-norm`) were measured the same way on 2026-10-29, and so were the sparse
+`gqa` and `mla` rows (all but `csa`'s), with each `gqa` indexer's projections in
+one GEMM.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -898,6 +924,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `rwkv7-residual` | RWKV-7's value residual through its `v` port, low ranks | 1.3e-5 | 0.11 (0.25) | - |
 | `hc` | hyper-connections, 4 streams | 8.1e-6 | 0.079 (0.10) | 0.086 |
 | `attnres` | attention residuals in blocks of 3 | 8.6e-6 | 0.098 (0.17) | 0.14 |
+| `msar` | multi-stream attention residuals in blocks of 3, convs of 4, 8 and 12 taps over the tokens | 1.2e-5 | 0.12 (0.20) | 0.12 |
+| `msar-hybrid` | `msar` in blocks of 2 on the hybrid's shape: KDA, gated global layers without positions, the conv on keys and values, the `v` port | - | 0.35 (0.73) | 0.49 |
 | `mhc` | manifold-constrained hyper-connections | 8.1e-6 | 0.097 (0.11) | 0.11 |
 | `mhc-single` | mhc, single-pass | 6.7e-6 | 0.11 (0.10) | - |
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |

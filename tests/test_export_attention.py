@@ -99,6 +99,14 @@ GQA_SETTINGS = {
     "hyga, xsa, output norm": GQA + ", gated=true, gate_input_rank=4,"
     " gate_cross_head=true, exclusive=learned, output_norm=rmsnorm)",
     "differential": GQA + ", differential=true)",
+    "paired": GQA + ", paired=true)",
+    "paired, values from the keys": "gqa(num_heads=4, num_kv_heads=2,"
+    " paired=true, k_eq_v=true, qk_norm=rmsnorm)",
+    "paired, window, gated, qk norm, conv": GQA
+    + ", paired=true, sliding_window_size=5,"
+    " gated=true, qk_norm=rmsnorm, kv_conv_size=2)",
+    "paired, mha, no rope, hyga, softcap": "gqa(num_heads=4, num_kv_heads=4, paired=true,"
+    " gated=true, gate_cross_head=true, softcap=3.0)",
     "differential, sinks, window, fused, all heads": GQA + ", differential=true,"
     " sinks=true, sliding_window_size=3, fused_qkv=true, qk_norm=rmsnorm,"
     " qk_norm_all_heads=true)",
@@ -111,6 +119,8 @@ GQA_SETTINGS = {
     " extent=4))",
     "kv conv, window": GQA + ", kv_conv_size=3, sliding_window_size=4)",
     "dropouts": GQA + ", attention_dropout=0.1, output_dropout=0.1)",
+    "mimetic init": GQA + ", mimetic_vo=0.05, mimetic_noise=0.02, gated=true,"
+    " kv_conv_size=3)",
     "everything at once": "gqa(num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=12,"
     " bias=true, sinks=true, softcap=3.0, gated=true, output_norm=rmsnorm,"
     " qk_norm=rmsnorm, log_scale=0.3, log_scale_floor=3, relative_bias=relbias(rank=2,"
@@ -157,6 +167,15 @@ PORTS = {
         " differential=true, exclusive=true)",
         "attn(v=@v1)",
         "attn(v=$v1)",
+    ),
+    "value residual, paired": wired(
+        "gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
+        " paired=true)",
+        "attn(v=@v1)",
+        "attn(v=$v1)",
+    ),
+    "kv sharing, paired": wired(
+        GQA + ", paired=true)", "attn(kv=@kv)", "attn(kv=$kv!)"
     ),
     "kv sharing, differential": wired(
         GQA + ", differential=true)", "attn(kv=@kv)", "attn(kv=$kv!)"

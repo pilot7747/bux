@@ -775,6 +775,9 @@ RESIDUALS = {
     "gr eps": "gr(expansion=3, rank=4, norm_eps=1e-3)",
     "vpgate": "vpgate(temperature=0.5)",
     "vpgate clamped": "vpgate(eps=0.6)",
+    "msar": "msar(kernel_sizes=[2, 3])",
+    "msar blocks": "msar(block_size=2, norm_eps=1e-5)",
+    "msar block under way": "msar(block_size=4)",
 }
 
 
@@ -847,7 +850,9 @@ def compare_branches(setting: str) -> None:
     tokens, body = torch.randn(5, d), torch.randn(d, d) / d**0.5
     copies = hf_residual.widening(c)
     x = tokens[None] if copies is None else hf_residual.widen(tokens[None], copies)
-    ctx, ctx_mine = stand_in(pending_read=None), stand_in(pending_read=None)
+    # One sequence, whole: msar's convs read no cache.
+    ctx = stand_in(pending_read=None, cache=None, attention_mask=None, cache_slot=int)
+    ctx_mine = stand_in(pending_read=None)
     reads, x = through(theirs, x, ctx, body)
     got, y = through(mine, residual.widen(c, tokens), ctx_mine, body)
     for g, h in zip(got, reads, strict=True):
@@ -1238,6 +1243,67 @@ def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
     np.testing.assert_allclose(
         np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
     )
+
+
+def test_msar_packs_its_calls_states_to_a_recurrent_layers_page() -> None:
+    """The hybrid's 8 branches, packed 5 a pack (KDA's state of 4 value heads of 32
+    by 32 in float32, at 11 values of 128 a call in 16 bits), after every other
+    state in layer_types; d channels a call, 12 taps."""
+    c = bux_config(vllm_parity.CASES["msar-hybrid"])
+    assert c.bux is not None
+    p = plan.plan(c.bux, c.bux_reserved)
+    assert plan.msar_packs(c.bux, p) == [5, 3]
+    assert c.layer_types[-2:] == ["conv", "conv"]
+    assert c.layer_types[:-2].count("linear_attention") == 2
+    assert plan.msar_shapes(c.bux, p) == {(5 * 128, 12), (3 * 128, 12)}
+    plain = bux_config(vllm_parity.CASES["msar"])
+    assert plain.bux is not None
+    assert plan.msar_packs(plain.bux, plan.plan(plain.bux, plain.bux_reserved)) == [4]
+
+
+def test_msar_convs_over_steps_are_the_whole_sequences() -> None:
+    """Two sequences in a pack's channels: a prompt in two chunks (the second
+    after the first's kept values) beside one in a chunk, then two decoding steps,
+    convolve as each whole sequence does, the slots of other calls' channels
+    untouched; a padded decode row writes vLLM's null block alone."""
+    torch.manual_seed(0)
+    d, sizes = 6, (2, 4, 12)
+    taps = [torch.randn(k, d) for k in sizes]
+    weight = residual.stacked_taps(taps, 12)
+    lens = [9, 14]
+    seqs = [torch.randn(n + 2, d) for n in lens]  # each prompt, then 2 decoded
+    pack = torch.randn(4, 3 * d, 11)  # slots: null, a, b, spare; another call first
+    before = pack.clone()
+    states = pack[:, d : 2 * d]
+    want = [residual.causal_convs(s, taps) for s in seqs]
+    slots = torch.tensor([1, 2])
+
+    def prefill(chunks: list[torch.Tensor], initial: list[bool]) -> torch.Tensor:
+        starts = torch.tensor([0, *itertools.accumulate(len(c) for c in chunks)])
+        meta = stand_in(
+            query_start_loc_p=starts,
+            state_indices_tensor_p=slots,
+            has_initial_states_p=torch.tensor(initial),
+        )
+        v = torch.cat(chunks)
+        out = v.new_zeros(len(v), 3, d)
+        residual.prefill_convs(v, weight, states, meta, out)
+        return out
+
+    a, b = seqs
+    first = prefill([a[:5], b[:14]], [False, False])
+    second = prefill([a[5:9]], [True])[:4]  # a alone: slots[:1]
+    torch.testing.assert_close(torch.cat([first[:5], second]), want[0][:9])
+    torch.testing.assert_close(first[5:], want[1][:14])
+    for step in range(2):
+        v = torch.stack([a[9 + step], b[14 + step], torch.zeros(d)])
+        out = v.new_zeros(3, 3, d)
+        rows = torch.tensor([[1], [2], [-1]])  # a padded row last
+        residual.decode_convs(v, weight, states, rows, out)
+        torch.testing.assert_close(out[0], want[0][9 + step])
+        torch.testing.assert_close(out[1], want[1][14 + step])
+    torch.testing.assert_close(pack[1:, :d], before[1:, :d])  # the other call's
+    torch.testing.assert_close(pack[3], before[3])
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
@@ -2778,6 +2844,14 @@ def test_fp8_weights_quantize_every_layer_s_projections(
     quant = SimpleNamespace(name="fp8")
     model = built(vllm_parity.CASES[name], tmp_path, stood_in, quant)
     assert assert_quantized(model, quant)
+
+
+def test_paired_heads_say_vllm_has_no_attention_for_them(
+    stood_in: ModuleType, tmp_path: Path
+) -> None:
+    source = vllm_parity.LLAMA.replace("rope=rope()", "rope=rope(), paired=true")
+    with pytest.raises(NotImplementedError, match="paired .* two heads' keys"):
+        built(source + "model = embed block rmsnorm head", tmp_path, stood_in, None)
 
 
 #: The parity cases whose attention keeps a cache of the plugin's own

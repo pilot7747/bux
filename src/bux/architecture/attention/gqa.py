@@ -181,8 +181,19 @@ class SoftmaxAttention(nnx.Module):
         docs: Segments | None,
     ) -> Float[Array, "b t h dv"]:
         """Return every query's softmax-weighted values by the run's
+        `methods.attention` (`_attend_by_method`); `x` is for `FullLogits`."""
+        return self._attend_by_method(q, k, v, docs)
+
+    def _attend_by_method(
+        self,
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        v: Float[Array, "b s g dv"],
+        docs: Segments | None,
+    ) -> Float[Array, "b t h dv"]:
+        """Return every query's softmax-weighted values by the run's
         `methods.attention`, named `attention` with what its backward takes
-        (``remat.named``); `x` is for `FullLogits`."""
+        (``remat.named``)."""
         ids = None if docs is None else docs.ids
         args = AttentionArgs(ids, self.window, self.scale, self.softcap, self._sinks())
         method = parallel.method("attention")
@@ -298,12 +309,15 @@ class Attention(SoftmaxAttention):
     to k and v under ``kv_conv_size`` (Inkling), applies QK-norm (of each head, or of
     all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
-    run's ``methods.attention`` (`bux.parallel.context`). Under ``differential``
+    run's ``methods.attention`` (`bux.parallel.context`), its heads interleaved
+    in pairs under ``paired`` (`paired`). Under ``differential``
     (DIFF V2) it has two query heads for each output head, and takes the difference
     of their maps (`_difference`). Under ``exclusive`` (XSA) each head's output
     loses its part along the query's own value (`exclusive`).
     The heads' outputs then go through `SoftmaxAttention`'s norm, gate, output
     projection and dropout.
+    Under ``mimetic_vo`` its value and output kernels start near a value-output
+    map of ``-beta I`` (`~bux.initializers.mimetic_vo`).
     `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
     the config needs them.
 
@@ -408,6 +422,9 @@ class Attention(SoftmaxAttention):
         self.ve_gate = _value_embed_gate(config, ports, projects_kv, rngs)
         self._exclusion(config, projects_kv)
         self._init_differential(config, width, rngs)
+        self.paired = config.paired
+        if config.mimetic_vo is not None:
+            self._mimetic(config, width, rngs)
 
     def _init_differential(
         self, config: cfg.GQAConfig, width: int, rngs: nnx.Rngs
@@ -441,6 +458,21 @@ class Attention(SoftmaxAttention):
         zeros = jnp.zeros(self.heads)
         self.xsa_alpha = nnx.Param(zeros, names=("heads",)) if learned else None
 
+    def _mimetic(self, config: cfg.GQAConfig, width: int, rngs: nnx.Rngs) -> None:
+        """Start v's and o's kernels as `~bux.initializers.mimetic_vo` makes them, after
+        every other draw: v's columns of a fused qkv, and o's alone in a layer that
+        reads its kv port, whose values are its writer's."""
+        assert config.mimetic_vo is not None
+        h, g, dv = self.heads, self.kv_heads, self.v_head_dim
+        beta, noise = config.mimetic_vo, config.mimetic_noise
+        v, o = initializers.mimetic_vo(width, h, g, dv, beta, noise, rngs.params())
+        self.o.kernel[...] = o
+        if self.v is not None:
+            self.v.kernel[...] = v
+        elif self.qkv is not None:
+            start = (self.query_heads + g) * self.head_dim  # after q and k
+            self.qkv.kernel[...] = self.qkv.kernel[...].at[:, start:].set(v)
+
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         """Attend each position to those before it in its document, and to itself.
 
@@ -456,8 +488,25 @@ class Attention(SoftmaxAttention):
         x, projected = self._projections(x)
         q, k, v = self._heads(x, projected, docs, taps)
         self._observe(q, k, docs, taps)
-        out = self._difference(x, self._attend(x, q, k, v, docs))
+        out = self._difference(x, self._attend_heads(x, q, k, v, docs))
         return self._output(x, self._exclude(out, v))
+
+    def _attend_heads(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        v: Float[Array, "b s g dv"],
+        docs: Segments | None,
+    ) -> Float[Array, "b t h dv"]:
+        """Return `_attend`'s outputs; under ``paired``, of the heads paired
+        (`paired`)."""
+        if not self.paired:
+            return self._attend(x, q, k, v, docs)
+        b, t, h, _ = q.shape
+        q, k, v = (paired(a) for a in (q, k, v))
+        docs = None if docs is None else Segments.of(interleaved(docs, b, t))
+        return self._attend_by_method(q, k, v, docs).reshape(b, t, h, -1)
 
     def _difference(
         self, x: Float[Array, "b t d"], out: Float[Array, "b t hq dv"]
@@ -585,7 +634,28 @@ class Attention(SoftmaxAttention):
         if self.qk_norm_all_heads and norm is not None:
             x, norm = norm(x), None
         x = x.reshape(b, t, heads, self.head_dim)
+        if self.paired and self.rope is not None:
+            return self._rotate_paired(x, norm, pos, name)
         return norm_and_rotate(x, norm, self.rope, pos, name)
+
+    def _rotate_paired(
+        self,
+        x: Float[Array, "b t n dk"],
+        norm: Norm | None,
+        pos: Int[Array, "b t"] | None,
+        name: parallel.Name,
+    ) -> Float[Array, "b t n dk"]:
+        """Normalize and rotate the heads of paired-head attention: head i of the
+        token at position p turned at 2p + (i mod 2), as record 58's rotary turns
+        the halves of its views of two heads."""
+        b, t, n, dk = x.shape
+        p = jnp.broadcast_to(jnp.arange(t), (b, t)) if pos is None else pos
+        halves = x.reshape(b, t, n // 2, 2, dk)
+        turned = [
+            norm_and_rotate(halves[..., i, :], norm, self.rope, 2 * p + i, name)
+            for i in (0, 1)
+        ]
+        return jnp.stack(turned, 3).reshape(b, t, n, dk)
 
     def _add_value_embedding(
         self,
@@ -650,6 +720,21 @@ def exclusive(
     if strength is not None:
         along = along * strength.astype(jnp.float32)[:, None]
     return (y - along).astype(out.dtype)
+
+
+def paired(x: Float[Array, "b t n d"]) -> Float[Array, "b u m d"]:
+    """Return queries, keys or values with head j and head j + n / 2 interleaved
+    along the sequence, as record 58's views of them: position 2p of the u = 2t holds
+    the first half of the heads of token p, m = n / 2, and 2p + 1 its second half."""
+    b, t, n, d = x.shape
+    return x.reshape(b, 2 * t, n // 2, d)
+
+
+def interleaved(docs: Segments, b: int, t: int) -> Int[Array, "b u"]:
+    """Return the positions of `paired`'s sequence, each token's doubled and the
+    next, so that its documents are the tokens'."""
+    p = docs.positions
+    return jnp.stack([2 * p, 2 * p + 1], -1).reshape(b, 2 * t)
 
 
 def _by_head(x: Float[Array, "b t h i"], w: nnx.Param) -> Float[Array, "b t h o"]:

@@ -681,6 +681,61 @@ class GQAConfig(QuadraticAttentionConfig):
             raise ValueError(f"gqa: differential with {', '.join(given)} not yet")
         return self
 
+    # Paired-head attention (modded-nanogpt's record 58): query head j and head
+    # j + num_heads / 2, and kv head m and m + num_kv_heads / 2, interleaved along the
+    # sequence into one of twice its length, so that a query sees both heads' keys
+    # in one softmax: its own head's up to its own and the other's before it, or up
+    # to its own for the second. A window counts the interleaved positions, and RoPE
+    # turns head i of token n at 2n + (i mod 2). Not in vLLM yet.
+    paired: bool = False
+
+    @model_validator(mode="after")
+    def _paired(self) -> Self:
+        """Check that paired heads come in pairs of query and kv heads, without the
+        settings that see each query head alone."""
+        if not self.paired:
+            return self
+        if self.num_heads % 2 or self.num_kv_heads % 2:
+            raise ValueError(
+                f"gqa: paired takes an even number of heads and kv heads, not "
+                f"{self.num_heads} and {self.num_kv_heads}"
+            )
+        given = [
+            name
+            for name, on in (
+                ("indexer", self.indexer is not None),
+                ("relative_bias", self.relative_bias is not None),
+                ("log_scale", self.log_scale is not None),
+                ("attention_dropout", self.attention_dropout > 0),
+                ("sinks", self.sinks),
+                ("differential", self.differential),
+                ("exclusive", bool(self.exclusive)),
+            )
+            if on
+        ]
+        if given:
+            raise ValueError(f"gqa: paired with {', '.join(given)} not yet")
+        return self
+
+    # Mimetic init of the values and the output at this beta (modded-nanogpt's 0.05;
+    # Trockman & Kolter, 2023): v's and o's kernels start as blocks of +sqrt(beta)
+    # and -sqrt(beta) identities, so that the layer's value-output map starts at
+    # -beta I, plus noise; with kv heads, each of a group's query heads takes 1 / its
+    # group's size of it. None: as the init starts them.
+    mimetic_vo: Annotated[float, Field(gt=0)] | None = None
+    mimetic_noise: float = 0.01  # The std of the noise on v and o under mimetic_vo.
+
+    @model_validator(mode="after")
+    def _mimetic(self) -> Self:
+        """Check that the noise of the mimetic init comes with it."""
+        if self.mimetic_noise != 0.01 and self.mimetic_vo is None:
+            raise ValueError("mimetic_noise sets the init that mimetic_vo adds")
+        if self.mimetic_vo is not None and self.k_eq_v:
+            raise ValueError(
+                "gqa: mimetic_vo starts the v projection, which k_eq_v has not"
+            )
+        return self
+
 
 class MLAConfig(QuadraticAttentionConfig):
     """Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear).
@@ -1224,7 +1279,8 @@ for _init in (InitConfig, NormalInitConfig, FanInitConfig, ZerosInitConfig):
 # Residual algebras: what a residual branch `[f]` does instead of `x + f(x)`, set for
 # the whole model by the top-level setting `residual`, as `residual = mhc()`. Only
 # branches outside any other change; one inside another stays `x + f(x)`. `hc`,
-# `mhc`, `gr` and `attnres` widen the stream, and `merge` reads it back into one.
+# `mhc`, `gr`, `attnres` and `msar` widen the stream, and `merge` reads it back into
+# one.
 
 
 class HyperConnectionsConfig(Config):
@@ -1284,6 +1340,29 @@ class AttentionResidualConfig(Config):
     norm_eps: float = 1e-6  # Epsilon of the keys' RMS norm (Kimi K3: 1e-5).
 
 
+class MultiStreamAttentionResidualConfig(Config):
+    """Multi-stream attention residuals (Qin et al., 2026, MSAR): a residual algebra,
+    ``residual = msar(block_size=8)``.
+
+    attnres in several streams: each source (the embedding, a block's sum of branch
+    outputs, the block under way) becomes one stream as it is and one more for each
+    of `kernel_sizes`, its causal depthwise conv over the tokens, by a bank of convs
+    of the source's own. Each branch reads a softmax over depth in every stream, by
+    a query of its own per stream, and mixes the streams it read by sigmoid weights
+    of their RMS norm, ``sigmoid(a rmsnorm(Z) W + b)``. The head reads the last
+    branch's input plus its output. The stream holds the sources, so `engram` and
+    `nextn` need one stream under it, as under attnres.
+    """
+
+    type: Literal["msar"] = "msar"
+    # Branch outputs summed into one source; None -> each is its own source.
+    block_size: Positive | None = None
+    # The taps of each stream's conv after the first, the source as it is (MSAR's
+    # main setting: 4, 8 and 12, so 4 streams).
+    kernel_sizes: tuple[Positive, ...] = (4, 8, 12)
+    norm_eps: float = 1e-6  # Epsilon of the keys' and the mixer's RMS norms.
+
+
 class ResidualGateConfig(Config):
     """Variance-preserving residual gate (Muse Spark): a residual algebra,
     ``residual = vpgate()``.
@@ -1302,7 +1381,7 @@ class ResidualGateConfig(Config):
 
 
 class MergeConfig(Config):
-    """Reads a widened residual stream back into one (hc, mhc, gr, attnres).
+    """Reads a widened residual stream back into one (hc, mhc, gr, attnres, msar).
 
     The read the algebra does for a branch, without the write. The compiler puts one
     before the first layer outside a branch that needs one stream, such as the final
@@ -1312,12 +1391,13 @@ class MergeConfig(Config):
     type: Literal["merge"] = "merge"
 
 
-#: The residual algebras, `hc`, `mhc`, `gr`, `attnres` and `vpgate`, by their
+#: The residual algebras, `hc`, `mhc`, `gr`, `attnres`, `msar` and `vpgate`, by their
 #: ``type``, the values of the top-level ``residual`` setting.
 ResidualConfig = Annotated[
     HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
+    | MultiStreamAttentionResidualConfig
     | ResidualGateConfig,
     Field(discriminator="type"),
 ]
@@ -1369,6 +1449,7 @@ SubConfig = Annotated[
     | HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
+    | MultiStreamAttentionResidualConfig
     | ResidualGateConfig
     | NormalInitConfig
     | FanInitConfig

@@ -64,10 +64,14 @@ model = embed ve(ve=@e) [dyt attn(v=@v1, ve=$e!)] [norm mix(v=$v1) dropout(rate=
         norm head
 """,
     f"d_model = {D}\nvocab_size = {V}\nresidual = hc()\nmodel = embed [rmsnorm] head",
+    (
+        f"d_model = {D}\nvocab_size = {V}\nresidual = msar(block_size=1)\n"
+        "model = embed [rmsnorm] [rmsnorm] head"
+    ),
 ]
 
 
-@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc"])
+@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc", "msar"])
 def test_no_parameter_of_another_model_is_weakly_typed(source):
     arch = compile(source)
     assert not weak(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))

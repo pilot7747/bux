@@ -17,7 +17,8 @@ reference, relative to its largest value. In float32 the kernels must agree with
 which rounds every term of the export where the kernels round their results once:
 the rule `scripts/vllm_parity.py` holds vLLM to against bux in bfloat16. It prints
 each, with the time of a branch both ways at the width given, at 8 and 64 tokens,
-and exits nonzero if any differ.
+and exits nonzero if any differ. msar's convs over the tokens (`bux_vllm.msar`) are
+checked the same way in bfloat16, on a step of decoded tokens and prompt chunks.
 """
 
 from __future__ import annotations
@@ -187,6 +188,50 @@ def _milliseconds(fn: Any, repeats: int = 20, steps: int = 10) -> float:
     return start.elapsed_time(end) / (repeats * steps)
 
 
+def msar_step(d: int, lens: list[int], decodes: int) -> bool:
+    """msar's convs by the Triton kernels (`bux_vllm.msar`) against the PyTorch path,
+    in bfloat16: a step of `decodes` decoded tokens and prompt chunks of `lens`
+    (the first after kept values), on states of another call's channels too, its
+    outputs and the states it keeps."""
+    from bux_vllm import msar  # vLLM's, on a GPU alone
+
+    dev, bf16 = "cuda", torch.bfloat16
+    weight = torch.randn(3, 12, d, device=dev, dtype=bf16)
+    n = decodes + len(lens)
+    states = torch.randn(n + 2, 2 * d, 11, device=dev, dtype=bf16)
+    starts = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device=dev)
+    meta = SimpleNamespace(
+        num_decode_tokens=decodes,
+        num_prefill_tokens=sum(lens),
+        num_prefills=len(lens),
+        state_indices_tensor_d=torch.arange(1, decodes + 1, device=dev)[:, None],
+        state_indices_tensor_p=torch.arange(decodes + 1, n + 1, device=dev),
+        query_start_loc_p=starts,
+        has_initial_states_p=torch.arange(len(lens), device=dev) == 0,
+    )
+    v = torch.randn(decodes + sum(lens), d, device=dev, dtype=bf16)
+    got_states, want_states = states.clone(), states.clone()
+    got, want = (v.new_zeros(len(v), 3, d) for _ in range(2))
+    msar._convolve(v, weight, got_states[:, d:], meta, got)
+    p = meta.num_prefill_tokens
+    residual.decode_convs(
+        v[:decodes],
+        weight,
+        want_states[:, d:],
+        meta.state_indices_tensor_d,
+        want[:decodes],
+    )
+    residual.prefill_convs(
+        v[decodes:], weight, want_states[:, d:], meta, want[decodes : decodes + p]
+    )
+    error = max(_error(got, want), _error(got_states, want_states))
+    ok = error < 2e-2
+    print(
+        f"msar convs d={d} {decodes} decodes, chunks {lens}: {error:.1e}, {'ok' if ok else 'DIFFERS'}"
+    )
+    return ok
+
+
 def main() -> None:
     """Check every setting in both dtypes, and time it."""
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -201,6 +246,7 @@ def main() -> None:
         for d in (200, args.width)
         if not check(name, c, d, args.tokens, dtype)
     ]
+    bad += [f"msar d={d}" for d in (200, args.width) if not msar_step(d, [5, 37, 1], 6)]
     for name, c in SETTINGS.items():
         for tokens in TIMED:
             slow, fast = timed(c, args.width, tokens)

@@ -8,7 +8,7 @@ they are its first attention layer's (a ``csa`` layer's latents are one key-valu
 head, which its own caches keep, `bux_vllm.csa`). ``layer_types`` lists the kinds
 of state of each call that keeps any, in the order they run, which tells vLLM
 whether the model is a hybrid of attention and recurrent layers (or convs, which
-keep their last inputs).
+keep their last inputs), and after them msar's packs of its convs' states.
 
 A model whose attention is ``mla`` also carries the latent's dims, as DeepSeek's
 configs do (`LATENT`): vLLM reads them to size the latent KV cache, pick its MLA
@@ -26,7 +26,7 @@ from typing import Any
 from transformers.configuration_utils import PreTrainedConfig
 
 from .kv import reads
-from .plan import live, plan, ports
+from .plan import live, msar_packs, plan, ports
 
 #: The kind of state each stateful layer type keeps, as vLLM's ``layer_types``.
 STATES = {
@@ -120,10 +120,13 @@ class BuxConfig(PreTrainedConfig):
         self.bux, self.bux_sites = bux, bux_sites
         self.bux_reserved = bux_reserved or []
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
-        calls = live(plan(bux, self.bux_reserved).calls) if bux else []
+        p = plan(bux, self.bux_reserved) if bux else None
+        calls = live(p.calls) if p is not None else []
         self.layer_types = [
             k for c in calls for k in states(c.layer["config"], ports(c.layer))
         ]
+        packs = msar_packs(bux, p) if bux and p is not None else []
+        self.layer_types += ["conv"] * len(packs)  # msar's convs' states, last
         self.num_hidden_layers = len(self.layer_types)
         layers = [c.layer for c in calls]
         self._set_heads(layers)
