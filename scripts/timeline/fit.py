@@ -584,6 +584,12 @@ def cost_lines(targets: dict) -> list[str]:
     ]
 
 
+def converged(analyses: list, reps: int) -> str:
+    """How many of the bootstrap's refits converged, per metric, where any didn't."""
+    short = [f"{x.metric} {x.boot_refits}" for x in analyses if x.boot_refits < reps]
+    return "all converged" if not short else "converged: " + ", ".join(short)
+
+
 def noise_line(analyses: list, reps: int) -> str:
     """Each metric's noise, where it comes from, and the verdict's rule."""
     each = ", ".join(
@@ -592,7 +598,7 @@ def noise_line(analyses: list, reps: int) -> str:
     )
     return (
         f"Noise of a run, seeds as blocks (a seed shifts every family's run alike): {each}. "
-        f"The bootstrap refits {reps} times with each point off by its runs' own noise over the root "
+        f"The bootstrap refits {reps} times ({converged(analyses, reps)}) with each point off by its runs' own noise over the root "
         f"of their number and by its seeds' shifts, drawn once a refit for every family. "
         f"'No measurable difference' means |delta| < {fit_analysis.VERDICT} sigmas of the delta at every "
         f"rung: own sigma x sqrt(1/n + 1/n_parent) for points on the same seeds, the seeds' spread added otherwise."

@@ -376,7 +376,8 @@ def bootstrap(
 ) -> list[tuple[dict[str, Family], dict[str, Law]]]:
     """`reps` refits of every family, each from the full fit, with each point off
     by its runs' noise (`sigma`) and by its seeds' shifts, drawn once per refit
-    for every family (`seed_sigma`): seeds act alike across families."""
+    for every family (`seed_sigma`): seeds act alike across families. A refit
+    whose solver fails to converge is left out, so fewer than `reps` can return."""
     rng = np.random.default_rng(seed)
     seeds = sorted(
         {s for fam in fams.values() for ss in (fam.seeds or [(0,)]) for s in ss}
@@ -385,5 +386,8 @@ def bootstrap(
     for _ in range(reps):
         shifts = {s: seed_sigma * rng.standard_normal() for s in seeds}
         noisy = {f: fam.noisy(rng, sigma, shifts) for f, fam in fams.items()}
-        out.append((noisy, fit_metric(noisy, root, joint, laws, e, e_range)))
+        try:
+            out.append((noisy, fit_metric(noisy, root, joint, laws, e, e_range)))
+        except np.linalg.LinAlgError:
+            continue
     return out

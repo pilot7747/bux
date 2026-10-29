@@ -61,6 +61,7 @@ class Analysis:
     seed_sigma: float = 0.0  # the spread of the seeds' shifts
     loro: dict[str, dict] = field(default_factory=dict)
     boot: dict[str, dict] = field(default_factory=dict)
+    boot_refits: int = 0  # the bootstrap's refits that converged
 
 
 def families(
@@ -126,6 +127,7 @@ def analyze(
             o.seed_sigma,
             o.e_range,
         )
+        a.boot_refits = len(reps)
         qs = [quantities(fb, lb, targets, o.root) for fb, lb in reps]
         a.boot = {f: spread([q[f] for q in qs if f in q], 5, 95) for f in fams}
     return a
