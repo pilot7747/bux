@@ -20,9 +20,9 @@ use rungs
 g_k    = fr_global(kv_conv_size=4)
 dsa_ix = indexer(num_heads=4, head_dim=64, top_k=2048)  # sparse_native.bux's dsa_ix
 
-# A global layer that runs the indexer and exports its picks, one that reuses them, and
-# one that reuses them last, popping them.
-F = fr_layer(g_k(indexer=dsa_ix, index=@topk, v=$v1))
+# A global layer that runs the indexer ix and exports its picks, one that reuses them,
+# and one that reuses them last, popping them.
+F(ix) = fr_layer(g_k(indexer=ix, index=@topk, v=$v1))
 S = fr_layer(g_k(index=$topk, v=$v1))
 E = fr_layer(g_k(index=$topk!, v=$v1))
 kda3 = fr_layer(hy_delta)^3
@@ -32,11 +32,11 @@ kda3 = fr_layer(hy_delta)^3
 # group popping them. Of n global layers, the n - 1 after the first make whole
 # groups of `every` (`every - 1` that reuse picks, then one that indexes again),
 # then those left over reuse the last group's.
-sharing(every, n=layers // 4) =
+sharing(every, ix=dsa_ix, n=layers // 4) =
     embed
     fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2
-    fr_layer(g_k(indexer=dsa_ix, index=@topk, v=@v1))
-    ((kda3 S)^(every - 2) kda3 E kda3 F)^((n - 1) // every)
+    fr_layer(g_k(indexer=ix, index=@topk, v=@v1))
+    ((kda3 S)^(every - 2) kda3 E kda3 F(ix))^((n - 1) // every)
     (kda3 S)^(n - 1 - (n - 1) // every * every)
     fr_norm @h fr_out hy_mtp
 
@@ -46,6 +46,11 @@ model = # 2026 GLM-5.2, GLM-5.3 (IndexShare; IndexCache, Bai et al.): one global
       # 2026 IndexCache (Bai et al.), 1/2 retention: every other global layer runs
       # the indexer; long-context cost
       | is2_c: sharing(2)
+      # 2026 IndexCache (Bai et al.), training-aware: is4_c, and each layer that
+      # reads the picks also distills the indexer towards its own attention over
+      # them (loss_over=served; their 1/2 retention: 51.6 long-context average
+      # against 49.8 without it); long-context quality
+      | is4x_c: sharing(4, dsa_ix(loss_over=served))
 
 residual = hc(expansion=4)
 
