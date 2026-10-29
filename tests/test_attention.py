@@ -101,6 +101,14 @@ BODIES = {
         " [norm single(kv=$kv, index=@topk, candidates=$pool)]"
         " [norm single(kv=$kv, index=$topk)] norm head"
     ),
+    # IndexCache's multi-layer distillation: readers distill the writer's indexer,
+    # in repeats too, a later writer's picks popped by its last reader
+    "gqa_served": (
+        "a = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
+        " indexer=small(loss_over=served))\n"
+        "model = embed [norm a(index=@k)] [norm ffn] ([norm a(index=$k)] [norm ffn])^2"
+        " ([norm a(index=@k)] [norm ffn] [norm a(index=$k!)] [norm ffn])^2 norm head"
+    ),
     # GLM-5's IndexCache, with a reader that has no indexer of its own at all
     "mla_index_ports": (
         "model = embed [norm latent(indexer=small, index=@k)]"
@@ -581,6 +589,79 @@ def test_a_layer_reading_index_attends_to_the_writers_selection():
     assert not jnp.allclose(reader(h, taps), dense, atol=1e-3)
 
 
+def test_a_reader_of_served_picks_adds_its_kl_to_the_writers_indexer():
+    """IndexCache's multi-layer distillation (``loss_over=served``): a layer that
+    reads the picks adds KL(p || q) to the loss, p its own attention over them summed
+    over heads, q the writer's indexer over them; its gradient reaches that indexer
+    alone, scaled by its loss_weight, as the writer's own term is."""
+    c = cfg.SparseIndexerConfig(
+        num_heads=2, head_dim=8, top_k=4, loss_weight=0.5, loss_over="served"
+    )
+    writer, reader = gqa(index_port("write"), indexer=c), gqa(index_port("read"))
+    assert writer.indexer is not None
+    x, h = inputs(), inputs(2)
+
+    def losses(writer, reader):
+        taps = Taps(training=True)
+        writer(x, taps)
+        reader(h, taps)
+        return taps, [(r.name, r.weight, r.value) for r in taps.losses]
+
+    taps, [own, read] = losses(writer, reader)
+    assert own[:2] == ("indexer_loss", 0.5) and read[:2] == ("indexer_loss", 1.0)
+    [kept] = taps["topk"]
+    selected = keeps(kept, causal(12))
+    q, k, _ = gqa_heads(reader, h)
+    p_read = attention_probs(q, k, reader.scale, selected).sum(1)
+    q, k, _ = gqa_heads(writer, x)
+    p_own = attention_probs(q, k, writer.scale, selected).sum(1)
+
+    def reference(writer, p):  # KL(p || q) of the writer's indexer
+        scores = writer.indexer.scores(x, x, None, writer.indexer.keys(x, None))
+        return kl(p, scores, selected).mean()
+
+    assert jnp.allclose(read[2], reference(writer, p_read), atol=1e-6)
+    assert jnp.allclose(own[2], reference(writer, p_own), atol=1e-6)
+
+    def total(writer, reader):
+        return sum(w * v for _, w, v in losses(writer, reader)[1])
+
+    gw, gr = nnx.grad(total, argnums=(0, 1))(writer, reader)
+    assert not any(bool(g.any()) for g in jax.tree.leaves(gr))
+    for path, g in jax.tree_util.tree_leaves_with_path(gw):
+        name = jax.tree_util.keystr(path)
+        assert bool(g.any()) == ("indexer" in name), name
+    # both terms at the writer's weight: 0.5 (KL_own + KL_read)
+    want = nnx.grad(lambda w: 0.5 * (reference(w, p_own) + reference(w, p_read)))
+    close = jax.tree.map(
+        lambda a, b: jnp.allclose(a, b, atol=1e-7), gw.indexer, want(writer).indexer
+    )
+    assert jax.tree.all(close)
+
+
+def test_a_served_indexer_picks_and_attends_as_its_own_does():
+    """``loss_over=served`` changes the loss alone: the picks, the outputs and the
+    writer's own term are the same as with ``own``, and outside training no layer
+    adds a loss or carries the indexer's distribution on."""
+    own = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=4)
+    served = own.model_copy(update={"loss_over": "served"})
+    x, h = inputs(), inputs(2)
+    runs = []
+    for c in (own, served):
+        writer, reader = gqa(index_port("write"), indexer=c), gqa(index_port("read"))
+        taps = Taps(training=True)
+        outs = writer(x, taps), reader(h, taps)
+        runs.append((outs, taps["topk"][0].index, [r.value for r in taps.losses]))
+        plain = Taps()
+        writer(x, plain), reader(h, plain)
+        assert plain.losses == [] and plain["topk"][0].predicted is None
+    (outs_a, kept_a, loss_a), (outs_b, kept_b, loss_b) = runs
+    assert all(jnp.array_equal(a, b) for a, b in zip(outs_a, outs_b))
+    assert jnp.array_equal(kept_a, kept_b)
+    assert len(loss_a) == 1 and len(loss_b) == 2
+    assert jnp.allclose(loss_a[0], loss_b[0], atol=1e-6)
+
+
 def test_ports_that_need_an_indexer_say_so():
     with pytest.raises(ValueError, match="'index' port needs an indexer"):
         gqa(index_port("write"))
@@ -592,6 +673,10 @@ def test_ports_that_need_an_indexer_say_so():
         gqa(pool, indexer=c.model_copy(update={"block_size": 4}))
     with pytest.raises(ValueError, match="set compress_ratio"):
         CSA(cfg.CSAConfig(num_heads=2, head_dim=8), D, index_port("read"), nnx.Rngs(0))
+    with pytest.raises(ValueError, match="loss_over=served"):
+        c.model_copy(update={"block_size": 4, "loss_over": "served"}).model_validate(
+            c.model_copy(update={"block_size": 4, "loss_over": "served"}).model_dump()
+        )
 
 
 def csa(ports=(), **kw):
@@ -878,9 +963,28 @@ def indexer_loss(m, t, positions=None):
     return sum(r.value for r in reported if r.name == "indexer_loss")
 
 
+def test_every_reader_of_served_picks_reports_a_term_of_the_indexer_loss():
+    """With ``loss_over=served``, the 3 writers and the 4 layers that read their
+    picks each report a term, in a scanned repeat too; outside training, none."""
+    m, t = model(BODIES["gqa_served"]), tokens()
+    heads, reported = m.training_heads(t)
+    assert [r.name for r in reported] == ["indexer_loss"] * 7
+    assert sorted(r.weight for r in reported) == [1.0] * 7
+    assert jnp.array_equal(heads[0].logits(), m(t))
+    own = model(BODIES["gqa_served"].replace("loss_over=served", "loss_over=own"))
+    assert jnp.array_equal(own(t), m(t))
+
+
 @pytest.mark.parametrize(
     "body",
-    ["mla_indexer", "gqa_block_indexer", "gqa_msa", "csa_ports", "mla_index_ports"],
+    [
+        "mla_indexer",
+        "gqa_block_indexer",
+        "gqa_msa",
+        "csa_ports",
+        "mla_index_ports",
+        "gqa_served",
+    ],
 )
 def test_the_indexer_loss_trains_the_indexers_and_nothing_else(body):
     """Their inputs are detached, and so is the attention they learn from: none of its

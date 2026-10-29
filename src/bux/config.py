@@ -449,6 +449,10 @@ class SparseIndexerConfig(Config):
     # attention over the kept keys to the softmax of its scores (DSA). 0 leaves it
     # untrained.
     loss_weight: Annotated[float, Field(ge=0)] = 1.0
+    # Whose attention the loss distills the indexer towards: "own", its layer's (DSA);
+    # "served", also that of every layer that reads its picks through the `index`
+    # port, each a term of loss_weight (IndexCache's multi-layer distillation).
+    loss_over: Literal["own", "served"] = "own"
 
     @model_validator(mode="after")
     def _selection(self) -> Self:
@@ -463,6 +467,11 @@ class SparseIndexerConfig(Config):
             raise ValueError(
                 "indexer(per_group=true) with blocks takes pool=max: QSA's mean-pooled "
                 "blocks are one pick for all heads"
+            )
+        if self.loss_over == "served" and (self.per_group or blocks):
+            raise ValueError(
+                "indexer(loss_over=served) distills one pick of single keys for all "
+                "heads: set block_size=1 and per_group=false"
             )
         if blocks and self.top_k < self.block_size:
             raise ValueError(

@@ -121,10 +121,6 @@ SHARING = (
     "R = layer(local(kv=$kv!))\nG = layer(full(kv=@kv))\n"
 )
 
-#: The cases whose prompts' log-probabilities vLLM does not serve, which compare the
-#: rows vLLM samples alone: a head with a copy pointer points for those rows only.
-SAMPLED = ("cplm", "cplm-128")
-
 #: The cases, by name: a model each, as bux source.
 CASES = {
     "llama": LLAMA + "model = embed block^2 rmsnorm head",
@@ -187,6 +183,9 @@ CASES = {
     # samples, the pointer's keys and tokens in a paged cache of the head's own.
     "cplm": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer(dim=64))",
     "cplm-128": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer())",
+    # A window shorter than all prompts but the first.
+    "cplm-window": LLAMA
+    + "model = embed block^2 rmsnorm head(pointer=copy_pointer(window=12))",
     "moe": HEAD
     + ATTN
     + EXPERT
@@ -551,6 +550,26 @@ CASES = {
     + NATIVE.replace("rope=rope()", "kv_conv_size=4, qk_norm=rmsnorm, gated=true")
     + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
     + LINEAR_HYBRID,
+    # GLM-5.2's IndexShare on the hybrid's global layer: one layer's indexer picks
+    # the keys the next two global layers attend over, on vLLM's own sparse GQA
+    # attention, as it does the first's: groups of 4 query heads, at TP2 too.
+    "dsa-share-native": HEAD
+    + FFN
+    + "attn = gqa(num_heads=8, num_kv_heads=2, kv_conv_size=4, qk_norm=rmsnorm,"
+    f" gated=true, {NATIVE_INDEXER})\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(index=@topk, v=@v1)]"
+    " [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(index=$topk, v=$v1)]"
+    " [rmsnorm ffn] [rmsnorm attn(index=$topk!, v=$v1!)] [rmsnorm ffn] rmsnorm head",
+    # The same without KDA, whose kernels are not float32-exact: one indexer's picks
+    # read by two later layers, the conv on keys and values, the v port.
+    "dsa-share-native-plain": HEAD
+    + FFN
+    + "attn = gqa(num_heads=8, num_kv_heads=2, kv_conv_size=4, qk_norm=rmsnorm,"
+    f" gated=true, {NATIVE_INDEXER})\n"
+    + "model = embed [rmsnorm attn(index=@topk, v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk, v=$v1)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk!, v=$v1!)] [rmsnorm ffn] rmsnorm head",
     # MSA's picks, of blocks and per kv head's group, shared likewise.
     "msa-share": HEAD
     + FFN
@@ -733,11 +752,23 @@ def export(name: str, out: Path, dtype: str, cases: dict[str, str] = CASES) -> N
     with placeholders(arch):
         save(arch, model, out, dtype=getattr(torch, dtype))
     _add_router_biases(model, arch, out)
-    rng = np.random.default_rng(0)
-    prompts = [rng.integers(0, arch.vocab_size, n).tolist() for n in LENGTHS]
-    meta = {"name": name, "dtype": dtype, "prompts": prompts, "steps": STEPS}
+    meta = {"name": name, "dtype": dtype, "prompts": prompts(arch), "steps": STEPS}
     (out / "parity.json").write_text(json.dumps(meta))
     print(f"exported {name} to {out}")
+
+
+def prompts(arch: Any) -> list[list[int]]:
+    """The case's prompts, of `LENGTHS` random tokens: none a copy pointer's
+    <copy> row, which is no token. Its mixture drops what the pointer puts on one,
+    and vLLM's log-softmax gives it back to the other tokens."""
+    rng = np.random.default_rng(0)
+    out = [rng.integers(0, arch.vocab_size, n) for n in LENGTHS]
+    heads = [x.config for x in arch.layers() if x.config.type == "head"]
+    pointer = heads[0].pointer if heads else None
+    if pointer is not None:
+        copy = arch.vocab_size - 1 if pointer.token is None else pointer.token
+        out = [np.where(p == copy, (copy + 1) % arch.vocab_size, p) for p in out]
+    return [p.tolist() for p in out]
 
 
 def reference_model(arch: Any, dtype: str) -> Any:
@@ -972,12 +1003,10 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         tokens, starts = run[f"tokens{i}"], len(prompt) - 1
         sequence = [*prompt, *tokens.tolist()]
         want = _logprobs(model, sequence)[:-1]
-        skip = starts if name in SAMPLED else 0  # their prompts' rows unserved
-        got = run[f"logprobs{i}"]
-        vllm.add(got[skip:], want[skip:], starts - skip, tokens)
+        vllm.add(run[f"logprobs{i}"], want, starts, tokens, i)
         if low is not None:
             got = _logprobs(low, sequence)[:-1]
-            own.add(got[skip:], want[skip:], starts - skip, got[starts:].argmax(-1))
+            own.add(got, want, starts, got[starts:].argmax(-1), i)
     error, gap = max(args.tolerance, 2 * own.error), max(args.margin, own.error)
     ok = vllm.error <= error and vllm.gap <= gap
     print(
@@ -986,6 +1015,8 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         f"{'same' if vllm.same else 'differs'} (worst gap {vllm.gap:.2e}"
         f"{own.note(own.gap)})  {'ok' if ok else 'DIFFERS'}"
     )
+    if not ok:
+        print(f"{'':12s} its largest difference: {vllm.worst}")
     return ok
 
 
@@ -999,21 +1030,38 @@ class Agreement:
             of the token picked.
         same: Whether every pick is bux's.
         seen: Whether it measured anything.
+        worst: Where the largest difference is: its prompt, position and token.
     """
 
     error: float = 0.0
     gap: float = 0.0
     same: bool = True
     seen: bool = False
+    worst: str = ""
 
     def add(
-        self, got: np.ndarray, want: np.ndarray, starts: int, picks: np.ndarray
+        self,
+        got: np.ndarray,
+        want: np.ndarray,
+        starts: int,
+        picks: np.ndarray,
+        prompt: int,
     ) -> None:
-        """Measure a prompt's positions: the log-probabilities `got` against `want`,
-        and the `picks` of its steps, from position `starts` on."""
+        """Measure the positions of prompt number `prompt`: the log-probabilities
+        `got` against `want`, and the `picks` of its steps, from position `starts`
+        on."""
         steps = want[starts:]
         gap = steps.max(-1) - steps[np.arange(len(picks)), picks]
-        off = np.where(got == want, 0, np.abs(got - want))  # -inf at <copy>, both
+        with np.errstate(invalid="ignore"):  # -inf at <copy>, both
+            off = np.where(got == want, 0, np.abs(got - want))
+        if off.max() > self.error:
+            row, token = np.unravel_index(off.argmax(), off.shape)
+            kind = "a prompt's" if row < starts else "a decoded"
+            self.worst = (
+                f"prompt {prompt}, position {row} ({kind}), token {token}: "
+                f"{got[row, token]:.6f} against {want[row, token]:.6f}, the best "
+                f"{want[row].max():.4f}"
+            )
         self.error = max(self.error, float(off.max()))
         self.gap = max(self.gap, float(gap.max()))
         self.same &= bool((steps.argmax(-1) == picks).all())

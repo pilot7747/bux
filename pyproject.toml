@@ -127,6 +127,7 @@ mypy-init-return = true
 "src/bux_vllm/msar.py" = ["ANN001", "ANN202"]
 "src/bux_vllm/streams.py" = ["ANN001", "ANN202"]
 "src/bux_vllm/pointer.py" = ["ANN001", "ANN202"]
+"scripts/vllm_pointer_bench.py" = ["ANN001", "ANN202"]
 
 [tool.ty.terminal]
 error-on-warning = true

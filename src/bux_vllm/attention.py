@@ -24,7 +24,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from . import keyed, kv, outputs, picks, sparse
+from . import dsa, keyed, kv, outputs, picks, sparse
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -57,7 +57,8 @@ class Attention(Layer):
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
     op over vLLM's paged caches (`bux_vllm.sparse`). The ``index`` port passes the
     picks on: a layer that reads it attends to the keys another's indexer picked,
-    of those its own window sees, and runs no indexer. With a relative bias, each
+    of those its own window sees, and runs no indexer, on vLLM's own sparse GQA
+    attention where it takes the layer, as the layer that picked them does. With a relative bias, each
     query attends to every key it sees, the bias and the length scale on its
     logits, by the plugin's op over a paged cache of its own.
 
@@ -226,6 +227,7 @@ class Attention(Layer):
         dtype = site.vllm_config.model_config.dtype
         dims, heads = (self.dk, self.dv), c["num_kv_heads"]
         native, blocked, fp8 = sparse.paths(spec, ix, dims, dtype, heads)
+        theirs = self._natively_read(c, spec, width, site)
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -237,7 +239,34 @@ class Attention(Layer):
             native,
             fp8,
             blocked,
+            theirs,
         )
+
+    def _natively_read(
+        self, c: dict, spec: picks.Sparse, width: int, site: Site
+    ) -> int:
+        """The indexer key dims of the layer whose picks this one reads through its
+        ``index`` port, where vLLM's own sparse GQA attention attends over them, as
+        it does in that layer (`bux_vllm.dsa.reads`): a ``gqa`` writer of the same
+        heads whose single keys vLLM's DSA kernels pick; else 0, for the plugin's
+        kernels."""
+        w, dtype = site.index_writer, site.vllm_config.model_config.dtype
+        if w is None or not self.reads_index or w["type"] != "gqa":
+            return 0
+        ix = w["indexer"]
+        if not ix or ix["block_size"] != 1:
+            return 0
+        same = (w["num_kv_heads"], *kv.head_dims(w, width)) == (
+            c["num_kv_heads"],
+            self.dk,
+            self.dv,
+        )
+        if not (same and dsa.reads(spec, (self.dk, self.dv), self.hq // self.g, dtype)):
+            return 0
+        settings = (w["sliding_window_size"], 1.0, None, None)
+        picker = picks.layer_spec(ix, None, settings, self.dk, (0, 1))
+        native = dsa.takes(picker, ix["head_dim"], ix["num_heads"], dtype)
+        return ix["head_dim"] if native else 0
 
     def _biased_caches(
         self, c: dict, width: int, site: Site, names: dict[str, list[str]]

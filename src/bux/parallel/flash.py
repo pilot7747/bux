@@ -8,7 +8,8 @@ recomputes ``P = exp(s - lse)``. So blocks merge by their logsumexps (`merge`), 
 sink folds into one (`attend`).
 
 `TOKAMAX` is tokamax's Mosaic kernels, on GPUs; `JNP` the same in jnp, all t by s
-logits at once, which a CPU runs and the tests check the rest by. `CUDNN` is cuDNN's
+logits at once, which a CPU runs and the tests check the rest by. `CHUNKS` is XLA's,
+a chunk of queries at a time, for heads no flash kernel takes. `CUDNN` is cuDNN's
 causal kernels, for whole rows of one document. `cudnn` is cuDNN's fused attention
 through jax in its packed layout, for rows of documents: no softcap, no sinks, no
 logsumexp.
@@ -21,7 +22,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import jax_internals, kernels
 
@@ -150,6 +151,170 @@ def finite(lse: Float[Array, "*s"]) -> Float[Array, "*s"]:
 #: The kernel in jnp, all t by s logits at once, which a CPU runs and the tests check
 #: the others by.
 JNP = Kernel(_jnp_forward, _jnp_backward)
+
+
+# --- XLA, a chunk of queries at a time ----------------------------------------------
+
+#: The most logits a chunk of `CHUNKS`' queries makes: 2^27 numbers, 512 MiB of float32.
+CHUNK_LOGITS = 1 << 27
+
+
+def query_chunks(b: int, t: int, h: int, s: int) -> int:
+    """Return how many chunks `CHUNKS` splits t queries into: the fewest that divide t
+    and make at most `CHUNK_LOGITS` logits each, for b rows of h heads and s keys."""
+    fits = (
+        n for n in range(1, t) if t % n == 0 and b * h * (t // n) * s <= CHUNK_LOGITS
+    )
+    return next(fits, t)
+
+
+def _parts(x: Shaped[Array, "b t *r"], n: int) -> Shaped[Array, "n b c *r"]:
+    """Split x into n chunks of its positions, in order."""
+    b, t = x.shape[:2]
+    return jnp.moveaxis(x.reshape(b, n, t // n, *x.shape[2:]), 1, 0)
+
+
+def _whole(x: Shaped[Array, "n b c *r"]) -> Shaped[Array, "b t *r"]:
+    """Join the chunks `_parts` made."""
+    n, b, c = x.shape[:3]
+    return jnp.moveaxis(x, 0, 1).reshape(b, n * c, *x.shape[3:])
+
+
+def _chunk_lse(lse: Float[Array, "b h t"], n: int) -> Float[Array, "n b h c"]:
+    b, h, t = lse.shape
+    return jnp.moveaxis(lse.reshape(b, h, n, t // n), 2, 0)
+
+
+def _grouped(x: Shaped[Array, "b c h e"], g: int) -> Shaped[Array, "b g r c e"]:
+    """Group the query heads of `x` by the kv head they share, g groups."""
+    b, c, h, e = x.shape
+    return x.reshape(b, c, g, h // g, e).transpose(0, 2, 3, 1, 4)
+
+
+def _ungrouped(x: Shaped[Array, "b g r c e"]) -> Shaped[Array, "b c h e"]:
+    b, g, r, c, e = x.shape
+    return x.transpose(0, 3, 1, 2, 4).reshape(b, c, g * r, e)
+
+
+class _Chunk(NamedTuple):
+    """A chunk of queries: their positions in the row, and the keys they see."""
+
+    rows: Int[Array, " c"]  #: Each query's position.
+    start: Int[Array, "b c"] | None  #: Each query's first key, or None.
+    end: Int[Array, "b c"] | None  #: Each query's key past its last, or None.
+
+
+def _chunk_seen(keys: Keys, chunk: _Chunk, s: int) -> Bool[Array, "#b 1 1 c s"]:
+    """Return which of s keys each query of `chunk` sees, by `keys`."""
+    index = jnp.arange(s)
+    seen = jnp.ones((1, 1, 1, chunk.rows.shape[0], s), bool)
+    if keys.causal:
+        seen &= index <= chunk.rows[:, None]
+    if chunk.start is not None:
+        seen = seen & (index >= chunk.start[..., None])[:, None, None]
+    if chunk.end is not None:
+        seen = seen & (index < chunk.end[..., None])[:, None, None]
+    return seen
+
+
+def _chunks_of(keys: Keys, t: int, n: int) -> _Chunk:
+    """Return the chunks of t queries, n of them, as `_Chunk`s along a first axis."""
+    rows = jnp.arange(t).reshape(n, t // n)
+    start, end = (None if x is None else _parts(x, n) for x in (keys.start, keys.end))
+    return _Chunk(rows, start, end)
+
+
+def _chunk_logits(
+    q: Float[Array, "b c h dk"],
+    k: Float[Array, "b s g dk"],
+    scale: float,
+    cap: float | None,
+) -> tuple[Float[Array, "b g r c s"], Float[Array, "b g r c s"]]:
+    """Return a chunk's logits in float32, from q and k as they come, before the soft
+    cap and after it."""
+    grouped = _grouped(q, k.shape[2])
+    raw = jnp.einsum("bgrcd,bsgd->bgrcs", grouped, k, preferred_element_type=F32)
+    raw = raw * scale
+    return raw, raw if cap is None else cap * jnp.tanh(raw / cap)
+
+
+def _chunked_forward(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+    keys: Keys,
+    scale: float,
+    cap: float | None,
+) -> Output:
+    b, t, h, _ = q.shape
+    n = query_chunks(b, t, h, k.shape[1])
+
+    def chunk(xs: tuple) -> tuple[Float[Array, "b c h dv"], Float[Array, "b h c"]]:
+        q, at = xs
+        _, logits = _chunk_logits(q, k, scale, cap)
+        logits = jnp.where(_chunk_seen(keys, at, k.shape[1]), logits, -jnp.inf)
+        lse = jax.nn.logsumexp(logits, -1)
+        p = jnp.exp(logits - finite(lse)[..., None]).astype(v.dtype)
+        out = jnp.einsum("bgrcs,bsgv->bgrcv", p, v, preferred_element_type=F32)
+        return _ungrouped(out).astype(q.dtype), lse.reshape(b, h, -1)
+
+    out, lse = jax.lax.map(chunk, (_parts(q, n), _chunks_of(keys, t, n)))
+    return _whole(out), jnp.moveaxis(lse, 0, 2).reshape(b, h, t)
+
+
+def _chunked_backward(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+    out: Float[Array, "b t h dv"],
+    dout: Float[Array, "b t h dv"],
+    lse: Float[Array, "b h t"],
+    keys: Keys,
+    scale: float,
+    cap: float | None,
+) -> Grads:
+    """FlashAttention-2's backward pass a chunk of queries at a time, P computed again
+    from `lse`; dK and dV summed over the chunks in float32."""
+    b, t, h, _ = q.shape
+    g = k.shape[2]
+    n = query_chunks(b, t, h, k.shape[1])
+
+    def chunk(sums: tuple, xs: tuple) -> tuple[tuple, Float[Array, "b c h dk"]]:
+        q, out, dout, lse, at = xs
+        raw, logits = _chunk_logits(q, k, scale, cap)
+        lse = finite(lse).reshape(b, g, h // g, -1, 1)
+        seen = _chunk_seen(keys, at, k.shape[1])
+        p = jnp.where(seen, jnp.exp(logits - lse), 0)
+        do = _grouped(dout, g)
+        dp = jnp.einsum("bgrcv,bsgv->bgrcs", do, v, preferred_element_type=F32)
+        delta = (do.astype(F32) * _grouped(out, g).astype(F32)).sum(-1, keepdims=True)
+        ds = p * (dp - delta)
+        if cap is not None:
+            ds = ds * (1 - jnp.tanh(raw / cap) ** 2)
+        ds = (ds * scale).astype(q.dtype)
+        dq = jnp.einsum("bgrcs,bsgd->bgrcd", ds, k, preferred_element_type=F32)
+        dk = jnp.einsum(
+            "bgrcs,bgrcd->bsgd", ds, _grouped(q, g), preferred_element_type=F32
+        )
+        dv = jnp.einsum(
+            "bgrcs,bgrcv->bsgv", p.astype(v.dtype), do, preferred_element_type=F32
+        )
+        return (sums[0] + dk, sums[1] + dv), _ungrouped(dq).astype(q.dtype)
+
+    zeros = jnp.zeros(k.shape, F32), jnp.zeros(v.shape, F32)
+    xs = (
+        *(_parts(x, n) for x in (q, out, dout)),
+        _chunk_lse(lse, n),
+        _chunks_of(keys, t, n),
+    )
+    (dk, dv), dq = jax.lax.scan(chunk, zeros, xs)
+    return _whole(dq), dk.astype(k.dtype), dv.astype(v.dtype)
+
+
+#: The kernel by XLA, a chunk of queries at a time, at most `CHUNK_LOGITS` logits each
+#: (`query_chunks`): what a GPU attends by where no flash kernel takes the heads, such
+#: as Qwen3-Next's of 256 in rows of more documents than cuDNN has room for.
+CHUNKS = Kernel(_chunked_forward, _chunked_backward)
 
 
 # --- tokamax ------------------------------------------------------------------------

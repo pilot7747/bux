@@ -28,7 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from . import copying
-from .common import ACTIVATIONS, Ctx, Layer, Norm, Site, unsupported
+from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
 
 
 class Embedding(Layer):
@@ -142,32 +142,34 @@ class Head(Layer):
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor | None:
         """The logits of `hidden`, the head's input, gathered over the ranks: with a
-        copy pointer, the log of its mixture, of the requests' rows the forward
-        pointed for, in order, as vLLM samples one a request."""
+        copy pointer, the log of its mixture (`Pointer.mixed`), of the rows vLLM
+        samples, one a request, or of a prompt's rows, for prompt logprobs."""
         logits = self.processor(self.lm_head, hidden, self.lm_head.bias)
         if self.pointer is None or logits is None:
             return logits
-        return self.pointer.mixed(logits)
+        return self.pointer.mixed(logits, hidden)
 
 
 class Pointer(Layer):
     """A head's copy pointer: its query and key projections, the query's gain, the
     sink's key, its paged cache (`bux_vllm.pointer.PointerCache`), and the buffers
     of each request's p_copy and a_sink, which its forward fills and `mixed` reads.
+    With a ``window`` each query looks that many positions back at most, as bux's.
 
     Raises:
-        NotImplementedError: A ``window``, which the cache's op does not cap yet, or
-            speculative decoding, which samples more than one row a request.
+        NotImplementedError: Speculative decoding, which samples more than one row a
+            request.
     """
 
     p_copy: torch.Tensor
     a_sink: torch.Tensor
+    total: torch.Tensor
 
     def __init__(self, c: dict, width: int, vocab: int, site: Site):
         super().__init__()
-        from .pointer import PointerCache
+        from .pointer import PointerCache, mixture
 
-        unsupported(c, "window")
+        self.mixture = mixture  # the mixture's kernel
         if site.vllm_config.num_speculative_tokens:
             raise NotImplementedError("head: a copy pointer with speculative decoding")
         dim, self.dim = c["dim"], c["dim"]
@@ -176,11 +178,15 @@ class Pointer(Layer):
         self.k = ReplicatedLinear(width, dim, bias=False, return_bias=False)
         self.gain = nn.Parameter(torch.ones(()), requires_grad=False)
         self.sink = nn.Parameter(torch.zeros(dim), requires_grad=False)
-        self.cache = PointerCache(dim, site.vllm_config, site.caches[0])
+        window = copying.WHOLE if c["window"] is None else c["window"]
+        self.cache = PointerCache(dim, site.vllm_config, site.caches[0], window)
         rows = site.vllm_config.scheduler_config.max_num_seqs
         copy = torch.zeros(rows, vocab, dtype=torch.float32)
         self.register_buffer("p_copy", copy, persistent=False)
-        self.register_buffer("a_sink", torch.ones(rows), persistent=False)
+        # float32, not the default dtype vLLM builds the model in
+        sums = torch.ones(rows, dtype=torch.float32)
+        self.register_buffer("a_sink", sums, persistent=False)
+        self.register_buffer("total", sums.clone(), persistent=False)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         return {
@@ -198,13 +204,50 @@ class Pointer(Layer):
         k = _rms_normed(self.k(x))
         sink = (q.float() @ self.sink.float()) * self.dim**-0.5
         torch.ops.vllm.bux_copy_pointer(
-            q, k, ctx.input_ids, sink, self.p_copy, self.a_sink, self.cache.prefix
+            x,
+            q,
+            k,
+            ctx.input_ids,
+            sink,
+            self.p_copy,
+            self.a_sink,
+            self.total,
+            self.cache.prefix,
         )
 
-    def mixed(self, logits: torch.Tensor) -> torch.Tensor:
-        """The log of the mixture, of the head's `logits` of each request's row."""
-        p_copy, a_sink = copying.rows_of(self.p_copy, self.a_sink, logits.shape[0])
-        return copying.mixed(logits, p_copy, a_sink, self.copy).to(logits.dtype)
+    def mixed(self, logits: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        """The log of the mixture, of the head's `logits` of its input `hidden`:
+        each request's sampled row, which the forward pointed for; or, for prompt
+        logprobs, rows of the step's head input, which it points for now
+        (`bux_vllm.copying.prompted`), or of a full graph's step, whose every token
+        is its request's last (`bux_vllm.copying.Prompts`); mixed in one launch
+        (`bux_vllm.pointer.mixture`)."""
+        stash, n = self.cache.stash, logits.shape[0]
+        fresh = stash is not None and stash.sampled == 1
+        if fresh and (first := stash.rows.at(hidden)) is not None:
+            q = _rms_normed(self.q(hidden)) * self.gain.to(hidden.dtype)
+            sink = (q.float() @ self.sink.float()) * self.dim**-0.5
+            rows, fp8 = self.cache.rows, self.cache.fp8
+            vocab, window = logits.shape[1], self.cache.window
+            p_copy, a_sink = copying.prompted(
+                q, sink, rows, stash.steps, first, vocab, fp8, window
+            )
+            return self.mixture(
+                logits, p_copy, a_sink, torch.ones_like(a_sink), self.copy
+            )
+        at = _row_in(self.cache.graphed, hidden)
+        if at is None and stash is not None:  # the rows vLLM samples, gathered
+            stash.sampled += 1
+        at = at or 0
+        p_copy, a_sink, total = copying.rows_of(
+            self.p_copy[at:], self.a_sink[at:], self.total[at:], n
+        )
+        return self.mixture(logits, p_copy, a_sink, total, self.copy)
+
+
+def _row_in(graphs: list[copying.Rows], hidden: torch.Tensor) -> int | None:
+    """The row of a full graph's head input at which `hidden` starts, if any."""
+    return next((at for g in graphs if (at := g.at(hidden)) is not None), None)
 
 
 def _rms_normed(x: torch.Tensor) -> torch.Tensor:

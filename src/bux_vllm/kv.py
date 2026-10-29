@@ -62,20 +62,20 @@ def check_ports(c: dict, ports: list) -> None:
         raise NotImplementedError("gqa: a v port or an indexer beside reading kv")
 
 
-def sources(ports: list[list]) -> list[int | None]:
-    """The call each call attends to the keys and values of through its ``kv``
-    port, by its index, from each call's ports in the order the calls run: the one
-    whose push the tap it reads holds, as bux's taps run (``$kv`` the last push,
-    ``$kv!`` taken off); None for a call that reads none. A reader that writes the
-    port too pushes its writer's keys and values on."""
+def sources(ports: list[list], name: str = "kv") -> list[int | None]:
+    """The call each call reads through its port `name` (its ``kv`` port's keys and
+    values, its ``index`` port's picks), by its index, from each call's ports in the
+    order the calls run: the one whose push the tap it reads holds, as bux's taps
+    run (``$kv`` the last push, ``$kv!`` taken off); None for a call that reads
+    none. A reader that writes the port too pushes its writer's on."""
     stacks: dict[str, list[int]] = {}
     out: list[int | None] = []
     for i, call in enumerate(ports):
-        source, read = None, reads(call, "kv")
+        source, read = None, reads(call, name)
         if read is not None:
             stack = stacks[read[0]]
             source = stack.pop() if read[1] else stack[-1]
-        for tap in writes(call, "kv"):
+        for tap in writes(call, name):
             stacks.setdefault(tap, []).append(i if source is None else source)
         out.append(source)
     return out

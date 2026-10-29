@@ -10,10 +10,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import PartitionSpec as P
 
+from bux import parallel
 from bux.architecture import Segments
 from bux.architecture.recurrent import fused_delta
 from bux.architecture.recurrent.linear_attention import _chunked
+from bux.train import config as tcfg
 
 B, T, H, K = 2, 64, 2, 8
 # What the kernels fall back on: the chunks, recomputed, as linear_attention passes.
@@ -128,3 +131,91 @@ def test_a_kernel_runs_one_decay_a_head_or_one_a_channel_bounded_at_minus_5(
     monkeypatch.setattr(fused_delta, "_sm", lambda: True)
     monkeypatch.setattr(fused_delta, "frost", object())
     assert fused_delta.runs(128, 128, dtype, decays, floor) is runs
+
+
+# --- Every device runs each graph once before a step on several does ----------------
+
+
+class _Graph:
+    """A stand-in for cuDNN's graph of `op`, built for `device`: it zeroes its outputs,
+    and records each execute, with whether a warm-up ran it (`fused_delta.warm`)."""
+
+    def __init__(self, op, device, record):
+        inputs, outputs = fused_delta.NODES[op]
+        self.op, self.device, self.record = op, device, record
+        self.ports = [*inputs, *outputs]
+        self.outputs = list(outputs)
+
+    def get_workspace_size(self):
+        return 16
+
+    def execute(self, pack, workspace, handle):
+        self.record.append((self.op, self.device, fused_delta._WARMING.locked()))
+        for port in self.outputs:
+            np.asarray(pack[port])[...] = 0
+
+
+@pytest.fixture
+def graphs(monkeypatch):
+    """What the stand-in graphs executed, where the kernels would: on this host's
+    CPUs, each graph's callback by its own device's thread."""
+    record = []
+    monkeypatch.setattr(fused_delta, "_graph", lambda op, s, d: _Graph(op, d, record))
+    monkeypatch.setattr(fused_delta, "_handle", lambda device, ctx: None)
+    monkeypatch.setattr(fused_delta, "_WARM", set())
+    return record
+
+
+def _step(xs, docs):
+    """A training step's GDN layer on its device's rows, its loss summed over them,
+    once it has run."""
+
+    def loss(*xs):
+        out = fused_delta.delta_rule(*xs, docs, _recomputed)
+        return out.astype(jnp.float32).sum()
+
+    return jax.block_until_ready(
+        jax.jit(jax.value_and_grad(loss, argnums=range(5)))(*xs)
+    )
+
+
+def _on_rows(xs):
+    """xs, their rows split over the run's devices."""
+    on = parallel.active()
+    assert on is not None
+    rows = jax.sharding.NamedSharding(on.mesh, P("data"))
+    return [jax.device_put(x.astype(jnp.bfloat16), rows) for x in xs]
+
+
+@pytest.mark.parametrize("devices", [1, 2])
+def test_each_device_runs_a_graph_before_a_step_of_several_runs_it(graphs, devices):
+    """A graph's first execute compiles and loads its kernels, which on a GPU waits
+    for its peers; inside a step on several, a peer may be waiting at a collective
+    this device joins only after the callback returns, and the step hangs. So every
+    device's first execute of each graph is a warm-up's, and a step's never; on one
+    device, which has no peers, a step's own first execute is no warm-up's."""
+    with parallel.use(tcfg.MeshConfig(data=devices)):
+        _step(_on_rows(_inputs(1)), _documents(T))
+    ops = {"gdn", "gdn_bwd"}
+    firsts = {}
+    for op, device, warming in graphs:
+        firsts.setdefault((op, device), warming)
+    assert {op for op, _ in firsts} == ops
+    assert len(firsts) == len(ops) * devices
+    assert all(firsts.values()) == (devices > 1)
+    in_step = {(op, d) for op, d, warming in graphs if not warming}
+    assert in_step == set(firsts)  # the step runs every graph on every device
+
+
+def test_a_graph_warms_up_once_a_process(graphs):
+    """And again for inputs of new shapes: a step of another phase, or an eval's."""
+    with parallel.use(tcfg.MeshConfig(data=2)):
+        xs = _on_rows(_inputs(1))
+        for _ in range(2):
+            _step(xs, _documents(T))
+        _step(
+            [x[:, : T // 2] for x in xs],
+            Segments.of(_documents(T).positions[:, : T // 2]),
+        )
+    warm_ups = [(op, d) for op, d, warming in graphs if warming]
+    assert sorted(warm_ups) == sorted([*set(warm_ups)] * 2)  # each graph, each shape

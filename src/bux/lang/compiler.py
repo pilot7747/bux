@@ -325,6 +325,13 @@ def _activation(name: str) -> cfg.ActivationConfig:
     return cfg.ActivationConfig(fn=typing.cast(cfg.Activation, name))
 
 
+def _nothing(value: object) -> bool:
+    """Return whether `value` is ``f^0``: no layers, which a sequence leaves out."""
+    if not isinstance(value, ir.Seq) or value.items:
+        return False
+    return value.label is None and value.share is None
+
+
 def _flatten(nodes: list[ir.Node], cls: type, children: str) -> tuple[ir.Node, ...]:
     out: list[ir.Node] = []
     for node in nodes:
@@ -624,9 +631,12 @@ class _Evaluator:
                     expr.span,
                 )
             case ast.Seq(items=items):
-                nodes = [
-                    self.graph(self.eval(item, scope), item.span) for item in items
-                ]
+                values = [(self.eval(item, scope), item.span) for item in items]
+                nodes = [self.graph(v, at) for v, at in values if not _nothing(v)]
+                if not nodes:  # every item repeated 0 times
+                    return self.node(ir.Identity(), expr.span)
+                if len(nodes) == 1:  # the others repeated 0 times
+                    return nodes[0]
                 return self.node(
                     ir.Seq(items=_flatten(nodes, ir.Seq, "items")), expr.span
                 )
@@ -756,9 +766,13 @@ class _Evaluator:
 
     def repeat(self, expr: ast.BinOp, left: object, right: object) -> ir.Node:
         times = _unwrap(right)
-        if isinstance(times, bool) or not isinstance(times, int) or times < 1:
-            raise BuxError("a repeat count must be a positive integer", expr.right.span)
+        if isinstance(times, bool) or not isinstance(times, int) or times < 0:
+            raise BuxError(
+                "a repeat count must be a whole number, 0 or more", expr.right.span
+            )
         body = self.graph(left, expr.left.span)
+        if times == 0:  # nothing, which a sequence drops (`_nothing`)
+            return self.node(ir.Seq(items=()), expr.span)
         if times == 1:
             return body
         return self.node(ir.Repeat(body=body, times=times), expr.span)
@@ -834,7 +848,9 @@ class _Evaluator:
     # --- Coercions ------------------------------------------------------------------
 
     def graph(self, value: object, span: Span) -> ir.Node:
-        """Return `value` as a layer or block."""
+        """Return `value` as a layer or block: ``f^0`` outside a sequence as `_`."""
+        if _nothing(value):
+            return self.node(ir.Identity(), span)
         match value:
             case _Named(label=label, value=inner, share=share):
                 node = self.graph(inner, span)

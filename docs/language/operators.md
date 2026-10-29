@@ -140,8 +140,10 @@ A `-` between two items is a subtraction, even without a space after it: `f -g` 
 ## Repetition: `f^n`
 
 `f^n` is `n` copies of `f` in a row, each with its own parameters (unless `f` is
-[`shared`](definitions.md#sharing-shared)). `block^32` is 32 blocks. The count must be
-a positive integer, and `f^1` is `f`.
+[`shared`](definitions.md#sharing-shared)). `block^32` is 32 blocks. The count is a
+whole number: `f^1` is `f`, and `f^0` is nothing, left out of the sequence it is in
+(alone, it is `_`). So a count computed from the width may come out 0, as the readers
+left over after whole groups do: `(F S^3)^(n // 4) S^(n - n // 4 * 4)`.
 
 ```bux
 M = [norm ssm]
