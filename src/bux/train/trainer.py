@@ -59,6 +59,7 @@ from bux.lang.printer import config_to_source, run_to_source
 from bux.parallel.gather import Axes
 from bux.train import (
     curriculum,
+    ema,
     fitting,
     flops,
     interleave,
@@ -1300,6 +1301,7 @@ def train(
         tx = optimizer(
             config.optimizer, multiplier, model, config.clip, precision.moments
         )
+        tx = ema.beside(tx, config)
         trainer = Trainer(
             model,
             tx,
@@ -1521,10 +1523,13 @@ def _hooks(
     make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """Return the run's own hooks: its `log`, evals, checkpoint, which resumes `trainer`
-    from the latest checkpoint in `folder` if there is one, and profile."""
+    """Return the run's own hooks: its `log`, the weights its ``ema`` ends on, evals,
+    checkpoint, which resumes `trainer` from the latest checkpoint in `folder` if
+    there is one, and profile."""
     config = run.train
     hooks: list[Hook] = [log]
+    if config.ema is not None:  # before the last step's eval and checkpoint
+        hooks.append(ema.Ship(config.ema, config.steps))
     sets = evals(config)
     token_bytes = _token_bytes(config, run.arch.vocab_size) if sets else None
     for e in sets:

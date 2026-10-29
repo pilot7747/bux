@@ -31,6 +31,7 @@
   "center_bias",
   "expert",
   "expert_norm",
+  "ffn_experts_per_token",
   "latent_input_norm",
   "latent_output_norm",
   "latent_size",
@@ -39,6 +40,7 @@
   "num_experts",
   "num_groups",
   "num_shared_experts",
+  "num_zero_experts",
   "random_logits",
   "routed_scaling_factor",
   "router",
@@ -54,6 +56,7 @@
  "GQAConfig": [
   "attention_dropout",
   "bias",
+  "differential",
   "exclusive",
   "fused_qkv",
   "gate_activation",
@@ -69,11 +72,14 @@
   "kv_conv_size",
   "log_scale",
   "log_scale_floor",
+  "mimetic_noise",
+  "mimetic_vo",
   "num_heads",
   "num_kv_heads",
   "output_bias",
   "output_dropout",
   "output_norm",
+  "paired",
   "power_scale",
   "power_scale_length",
   "qk_norm",
@@ -378,6 +384,12 @@
  ],
  "AttentionResidualConfig": [
   "block_size",
+  "norm_eps",
+  "type"
+ ],
+ "MultiStreamAttentionResidualConfig": [
+  "block_size",
+  "kernel_sizes",
   "norm_eps",
   "type"
  ],

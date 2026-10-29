@@ -42,6 +42,11 @@ ALGEBRAS = {
     "attnres block under way": under(
         "attnres(block_size=4, norm_eps=1e-5)", "model = embed block^3 rmsnorm head"
     ),
+    "msar": under("msar(kernel_sizes=[2, 3])"),
+    "msar blocks": under("msar(block_size=2)", "model = embed block^3 head"),
+    "msar block under way": under(
+        "msar(block_size=3, norm_eps=1e-5)", "model = embed block^3 rmsnorm head"
+    ),
     "vpgate": under("vpgate(temperature=0.5)"),
     "vpgate clamped": under("vpgate(eps=0.6)"),
     "taps of the streams": under(
@@ -84,6 +89,10 @@ NEXTN = {
     "widening one stream": under(
         "mhc(expansion=2)",
         MTP + "model = embed block merge rmsnorm @h out $h nextn block rmsnorm out",
+    ),
+    "under msar": under(
+        "msar(block_size=2)",
+        MTP + "mtp = $h nextn block out\nmodel = embed block^2 @h out mtp",
     ),
     "single pass": under(
         "mhc(expansion=2, single_pass=true)",

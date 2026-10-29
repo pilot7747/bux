@@ -229,6 +229,29 @@ CASES = {
     " activation=situ, up_softcap=0.5))\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Zero experts: on the timeline's experts (a shared one, sigmoid, aux-free),
+    # LongCat-Flash's (softmax, unnormalized, scaled, no bias), and beside an expert
+    # norm, which routes apart.
+    "moe-zero": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, num_shared_experts=1,"
+    " router=sigmoid, routed_scaling_factor=2.5, load_balancing=aux_free,"
+    " expert=dense)\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-zero-longcat": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-zero-norm": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " load_balancing=aux_free, expert_norm=rmsnorm, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
     "moe-norm": HEAD
     + ATTN
@@ -324,6 +347,17 @@ CASES = {
     "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "attnres": LLAMA
     + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    # MSAR's 4 streams, its convs of 4, 8 and 12 taps reading each sequence's last
+    # values; then on the hybrid's shape (KDA, gated global layers without positions
+    # with QK-norm, the conv on keys and values and the v port), in blocks of 2.
+    "msar": LLAMA + "residual = msar(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    "msar-hybrid": HEAD
+    + FFN
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "glob = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\nresidual = msar(block_size=2)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm glob(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm glob(v=$v1!)] [rmsnorm ffn] rmsnorm head",
     "mhc": LLAMA + "residual = mhc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "mhc-single": LLAMA + "residual = mhc(expansion=4, single_pass=true)\n"
     "model = embed block^2 rmsnorm head",
@@ -453,6 +487,26 @@ CASES = {
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
     " gate_output_rank=32, gate_cross_head=true, kv_conv_size=4, exclusive=learned)\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
+    # DIFF V2: two query heads to an output head, a pair in one kv head's group, with
+    # sinks for each query head and a window; and with a gate, QK-norm of all heads
+    # and fused projections.
+    "diff": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, differential=true, rope=rope())\n"
+    + "local = attn(sliding_window_size=8, sinks=true)\n"
+    + "fused = attn(gated=true, qk_norm=rmsnorm, qk_norm_all_heads=true,"
+    " fused_qkv=true)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " [rmsnorm fused] [rmsnorm ffn] rmsnorm head",
+    # xsa-hybrid's global layers differential, without XSA.
+    "diff-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4, differential=true)\n"
     + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
     + "residual = hc(expansion=4)\n"
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
