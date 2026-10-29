@@ -1,0 +1,58 @@
+# Index sharing (GLM-5.2's IndexShare, after IndexCache) on sparse_native.bux's dsa_c:
+# the factorial's candidate (r1v1k1f0p0s0) with DSA on its global layers, where only
+# some global layers run the indexer. Each exports its picks through the `index` port,
+# and the global layers up to the next one attend to the same keys with no indexer of
+# their own: no scoring, no indexer keys cached, no indexer loss. Everything else is
+# dsa_c's, so each arm pairs with it and with the candidate by seed.
+#
+# GLM-5.2 runs the indexer in one sparse layer of four. Only one layer in four of the
+# candidate is global, so the sharing counts global layers: with every=4, global
+# layers 0, 4, 8, ... run the indexer and the next three reuse its picks, each three
+# KDA layers further on (GLM's readers are 1 to 3 layers on). At the serving widths
+# (13 global layers at d3328, 14 at d3584) is4_c runs 4 indexers and is2_c 7. The
+# training rungs have 2 or 3 global layers, a sketch of that pattern: at d512 both
+# arms are F S (one run), at d768 is4_c is F S S and is2_c F S F.
+# Arms: era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k    = fr_global(kv_conv_size=4)
+dsa_ix = indexer(num_heads=4, head_dim=64, top_k=2048)  # sparse_native.bux's dsa_ix
+
+# A global layer that runs the indexer ix and exports its picks, one that reuses them,
+# and one that reuses them last, popping them.
+F(ix) = fr_layer(g_k(indexer=ix, index=@topk, v=$v1))
+S = fr_layer(g_k(index=$topk, v=$v1))
+E = fr_layer(g_k(index=$topk!, v=$v1))
+kda3 = fr_layer(hy_delta)^3
+
+# The candidate with dsa_c's indexer on its first global layer and on every
+# `every`-th after it; the global layers between reuse its picks, the last of a
+# group popping them. Of n global layers, the n - 1 after the first make whole
+# groups of `every` (`every - 1` that reuse picks, then one that indexes again),
+# then those left over reuse the last group's.
+sharing(every, ix=dsa_ix, n=layers // 4) =
+    embed
+    fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2
+    fr_layer(g_k(indexer=ix, index=@topk, v=@v1))
+    ((kda3 S)^(every - 2) kda3 E kda3 F(ix))^((n - 1) // every)
+    (kda3 S)^(n - 1 - (n - 1) // every * every)
+    fr_norm @h fr_out hy_mtp
+
+model = # 2026 GLM-5.2, GLM-5.3 (IndexShare; IndexCache, Bai et al.): one global layer
+        # in four runs the indexer, the next three reuse its picks; long-context cost
+        is4_c: sharing(4)
+      # 2026 IndexCache (Bai et al.), 1/2 retention: every other global layer runs
+      # the indexer; long-context cost
+      | is2_c: sharing(2)
+      # 2026 IndexCache (Bai et al.), training-aware: is4_c, and each layer that
+      # reads the picks also distills the indexer towards its own attention over
+      # them (loss_over=served; their 1/2 retention: 51.6 long-context average
+      # against 49.8 without it); long-context quality
+      | is4x_c: sharing(4, dsa_ix(loss_over=served))
+
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), as the candidate's.
+optimizer.lr = 2e-3
