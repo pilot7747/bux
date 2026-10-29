@@ -1029,6 +1029,40 @@ class EngramConfig(Config):
     boundary_token: int | None = None
 
 
+class DocCopyConfig(Config):
+    """The document-local copy feature (modded-nanogpt PR 378): each position's
+    candidate next token, the one that followed the latest earlier occurrence in its
+    document of the longest of its contexts that occurred, fed to the stream.
+
+    For each of `lengths`, the context of that many tokens ending at a position
+    matches where the same tokens ended earlier in the same document. The longest
+    length that matches picks the latest such occurrence; the candidate is the token
+    after it, and its bucket is the length and how often the context occurred before
+    (1 to `counts`, the last counting more). The layer adds
+    ``gain (E[c] s[b] + e[b])`` to the stream: the candidate's row of the model's
+    first embedding, times a scale of its bucket, plus an embedding of the bucket,
+    both from 0, so that it starts as nothing.
+
+    PR 378 adds the same vector at two sites, after the embedding and before the
+    final norm, with gains of 0.5 and 1: write it bare at the first, which pushes the
+    vector to its ``copy`` port (``doc_copy(copy=@c)``), and at the second read it,
+    with a gain of its own (``doc_copy(gain=1, copy=$c!)``). It reads the model's
+    input tokens itself, as engram does, and adds to every copy of a widened stream.
+
+    Ports: ``copy`` exports the copy vector, or imports it instead of computing one.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"copy"})
+
+    type: Literal["doc_copy"] = "doc_copy"
+    gain: float = 0.5  # The vector's weight at this site, learned from here.
+    # The context lengths that match, shortest first (PR 378's ten).
+    lengths: tuple[Positive, ...] = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+    # How often a matched context occurred before that its bucket tells apart: 1, 2
+    # and 3 or more by default.
+    counts: Positive = 3
+
+
 # --- Initialization -------------------------------------------------------------
 # How the weight matrices start, set for the whole model by the top-level setting
 # `init`. Without it, every one starts from `normal(std=0.02)`, but those a layer
@@ -1252,6 +1286,7 @@ LayerConfig = Annotated[
     | LMHeadConfig
     | NextNConfig
     | EngramConfig
+    | DocCopyConfig
     | MergeConfig,
     Field(discriminator="type"),
 ]

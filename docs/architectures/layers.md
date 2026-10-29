@@ -307,6 +307,38 @@ classes; a checkpoint of the real model replaces it with the tokenizer's map. Th
 tables' rows split over devices as the vocabulary does, and weight decay skips them.
 :::
 
+## `doc_copy`: the document-local copy feature
+
+The copy feature (modded-nanogpt PR 378) gives each position a candidate next
+token from its own document ({bux}`doc_copy`). Of the contexts of 1, 2, 3, 4, 6, 8,
+12, 16, 24 and 32 tokens ending at a position, the longest one that occurred
+earlier in its document picks its latest occurrence, and the candidate is the token
+that followed it. Its bucket is the context's length and how often it occurred
+before: once, twice, or more. PR 378 adds the same vector at two sites, after the
+embedding and before the final norm:
+
+```bux
+model = embed doc_copy(copy=@c) block^12 merge doc_copy(gain=1, copy=$c!) norm head
+```
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `gain` | `0.5` | the vector's weight at this site, learned |
+| `lengths` | `[1, 2, 3, 4, 6, 8, 12, 16, 24, 32]` | the context lengths that match |
+| `counts` | `3` | how many earlier occurrences the buckets tell apart |
+
+The layer adds $g\,(E_c\, s_b + e_b)$ to the stream: $E_c$ is the candidate's row of
+the model's first embedding, $s_b$ a scale of its bucket and $e_b$ an embedding of
+it. Both start at 0, so the feature starts as nothing, and a position with no match
+gets nothing. The layer at the first site pushes the vector to its `copy` port; the
+one that reads it has a gain of its own and no tables.
+
+Write `doc_copy` bare. It reads the model's input tokens itself, as `engram` does,
+and never looks past its own document or its own position. On a widened stream it
+adds to every copy; before the final norm, `merge` first, so that it adds once. PR
+378 matches on its tokenizer's normalized classes of tokens (case and spacing);
+bux's matches on the tokens.
+
 ## Elementwise layers
 
 | Layer | What it does | Settings |

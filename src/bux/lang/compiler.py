@@ -1345,7 +1345,7 @@ class _Entry:
 
 
 # Layers that act on every copy of a widened residual stream instead of reading it.
-_ON_COPIES = (cfg.EngramConfig, cfg.NextNConfig)
+_ON_COPIES = (cfg.EngramConfig, cfg.NextNConfig, cfg.DocCopyConfig)
 
 
 class _Lowering:
