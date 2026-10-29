@@ -1,0 +1,97 @@
+# New layers on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the late-2026
+# hybrid with hyper-connections, the value residual and the key-value conv on its
+# global layers), each one change, from the papers and the speedrun of 2026. The
+# residual is hc in every arm but nl_msar, every branch's, the MTP module's too; the MTP
+# module keeps the hybrid's layer. Arms: era, source, what it was claimed for.
+# newlayers_opt.bux has the training options.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# factorial.bux's vres(g, e): the first global layer's values mixed into every later
+# one's; plain(g, e) without.
+best(g, e)  = embed
+              fr_layer(hy_delta, fr_dense) fr_layer(hy_delta, e)^2 fr_layer(g(v=@v1), e)
+              (fr_layer(hy_delta, e)^3 fr_layer(g(v=$v1), e))^(layers // 4 - 1)
+              fr_norm @h fr_out hy_mtp
+plain(g, e) = embed
+              fr_layer(hy_delta, fr_dense) fr_layer(hy_delta, e)^2 fr_layer(g, e)
+              (fr_layer(hy_delta, e)^3 fr_layer(g, e))^(layers // 4 - 1)
+              fr_norm @h fr_out hy_mtp
+
+g_k = fr_global(kv_conv_size=4)
+
+# A table of value embeddings before every global layer, its own, as wide as the
+# layer's kv heads' values; the MTP module's layer has none.
+ve_g    = value_embed(features=d_model // 4)
+ve_best = embed
+          fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2
+          ve_g(ve=@e) fr_layer(g_k(v=@v1, ve=$e!))
+          (fr_layer(hy_delta)^3 ve_g(ve=@e) fr_layer(g_k(v=$v1, ve=$e!)))^(layers // 4 - 1)
+          fr_norm @h fr_out hy_mtp
+
+# Zero experts beside the 256 FFN experts, half as many as LongCat's ratio, the
+# aux-free bias steering a token to 7 FFN experts (the candidate's compute) of its 10
+# picks; lean: 5 of 8, fewer expert FLOPs to serve.
+zero_e = fr_experts(top_k=10, num_zero_experts=128, ffn_experts_per_token=7,
+                    bias_update_rate=1e-2)
+lean_e = fr_experts(top_k=8, num_zero_experts=128, ffn_experts_per_token=5,
+                    bias_update_rate=1e-2)
+
+model = # 2026 Apple's exclusive self-attention (XSA, arXiv 2603.09078), modded-nanogpt
+        # record 82: each global head's output less its part along the token's own
+        # value; gains at 0.7-2.7B that grow with length, -2% steps in the speedrun
+        nl_xsa:         best(fr_global(kv_conv_size=4, exclusive=true), fr_experts)
+        # the same, its share tanh(a) learned per head from 0 (modded-nanogpt's)
+      | nl_xsa_learned: best(fr_global(kv_conv_size=4, exclusive=learned), fr_experts)
+        # 2026 HyGA (Zhou et al., arXiv 2608.11805): the sigmoid gate also reads each
+        # head's own output (rank 64, the H-gate), times a gate a head from all heads'
+        # outputs (the C-gate), with learned sinks, as the paper's main runs; -0.008
+        # loss at 0.6B, -0.012 at MoE-5B, MBPP+ 35.2 -> 40.2
+      | nl_hyga:        best(fr_global(kv_conv_size=4, gate_output_rank=64,
+                                       gate_cross_head=true, sinks=true), fr_experts)
+        # 2024 modded-nanogpt record 14, nanochat ("models love VEs"): a token table
+        # added to each global layer's values by a gate 2 sigmoid(W [x[:6], e[:6]]);
+        # -5% time in the speedrun
+      | nl_ve:          ve_best
+        # 2026 Gemma 4: the global layers' values made from their keys (no v
+        # projection), RMS-normed without a gain; +3.1% ppl for half the KV cache at
+        # 300M-1.2B, Su's 0.9B K=V MQA beat GQA
+      | nl_kveq:        best(fr_global(kv_conv_size=4, k_eq_v=true), fr_experts)
+        # the same without the value residual, so that every global layer caches one
+        # vector a token in vLLM: K=V in place of V, the serving bet
+      | nl_kveq_plain:  plain(fr_global(kv_conv_size=4, k_eq_v=true), fr_experts)
+        # 2026 Microsoft's Differential Transformer V2: twice the global query heads,
+        # each output head a1 - sigmoid(x W) a2 of a pair in one kv head's group;
+        # -0.02 to -0.03 loss at 1T tokens, the same KV cache
+      | nl_diff:        best(fr_global(kv_conv_size=4, differential=true), fr_experts)
+        # 2025 LongCat-Flash (arXiv 2509.01322): zero-computation experts the router
+        # picks for easy tokens, at the candidate's expert compute
+      | nl_null:        best(g_k, zero_e)
+        # the same at 5 FFN experts a token of 8 picks, fewer expert FLOPs to serve
+      | nl_null_lean:   best(g_k, lean_e)
+        # 2026 MSAR (Qin et al., arXiv 2610.13630): AttnRes's softmax over depth in 4
+        # streams a source, the source and causal convs of 4, 8 and 12 tokens, mixed
+        # by a sigmoid gate, in place of hc; 1.58x compute-equivalent against
+        # AttnRes's 1.35x at 10B-A1.1B
+      | nl_msar:        best(g_k, fr_experts)
+        # 2024 modded-nanogpt record 64 (Trockman & Kolter's mimetic init): each
+        # global layer's values and output start as +-sqrt(0.05) identities, a
+        # value-output map of -0.05 I, a group's heads sharing it; -1.3% steps, free
+      | nl_mimetic:     best(fr_global(kv_conv_size=4, mimetic_vo=0.05), fr_experts)
+        # 2025 modded-nanogpt record 58: the global heads attend in pairs, heads j and
+        # j + h/2 interleaved along the sequence, so that a query sees both heads'
+        # keys in one softmax; -3% steps, twice the attention FLOPs (not in vLLM yet).
+        # Pairs take an even number of kv heads: 2 for every 512 of the stream, as
+        # the candidate's at d512 and d1024, one fewer at d768 and d1280
+      | nl_paired:      best(fr_global(kv_conv_size=4, paired=true,
+                                       num_kv_heads=d_model // 512 * 2), fr_experts)
+
+hc_r     = hc(expansion=4)
+residual = nl_xsa: hc_r | nl_xsa_learned: hc_r | nl_hyga: hc_r | nl_ve: hc_r
+         | nl_kveq: hc_r | nl_kveq_plain: hc_r | nl_diff: hc_r | nl_null: hc_r
+         | nl_null_lean: hc_r | nl_msar: msar(block_size=layers // 4) | nl_mimetic: hc_r
+         | nl_paired: hc_r
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

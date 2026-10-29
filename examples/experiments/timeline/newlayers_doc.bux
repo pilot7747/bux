@@ -1,0 +1,28 @@
+# The document-local copy feature on the factorial's candidate (factorial.bux's
+# r1v1k1f0p0s0: the late-2026 hybrid with hyper-connections, the value residual and
+# the key-value conv on its global layers), one change. The residual is hc, every
+# branch's, the MTP module's too; the MTP module keeps the hybrid's layer and its own
+# final norm, without the feature: era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k = fr_global(kv_conv_size=4)
+
+model = # 2026 modded-nanogpt PR 378 (after PR 376's copy mixture): each position's
+        # candidate next token, the one after the latest earlier occurrence in its
+        # document of its longest matching context of 1 to 32 tokens, its embedding
+        # scaled by its bucket (the length and 1, 2 or 3+ occurrences) plus the
+        # bucket's embedding, added after the embedding (gain 0.5) and before the
+        # final norm (gain 1); -2.9% time on 8xH100, aimed at repo_bpb
+        embed doc_copy(copy=@c)
+        fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+        (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        merge doc_copy(gain=1, copy=$c!) fr_norm @h fr_out hy_mtp
+
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan); seeds 0, 1 and 2, paired with
+# factorial[r1v1k1f0p0s0, d512]'s.
+seed         = 0 | 1 | 2
+optimizer.lr = 2e-3

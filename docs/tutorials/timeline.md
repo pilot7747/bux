@@ -217,6 +217,10 @@ curriculum = base: yarn_phase | rope: yarn_phase | rope_500k: yarn_phase | ...
 | `zoo.bux` | the 2021 reference | the 2025-26 zoo's open choices: window sizes and ratios, sinks, gate forms, DyT, KDA ratios |
 | `milestones.bux`, `zoo_moe.bux`, `swa.bux` | the 2020 baseline; the 2026 frontier | a family for each year; the frontier's routing; the frontier with the hybrid's winners and a leaner window |
 | `stacks.bux`, `stacks2.bux`, `factorial.bux`, `audit.bux` | the 2026 hybrid | its add-ons, one at a time and in a fractional factorial (step 8), and the candidate's cheaper variants |
+| `ideas.bux`, `ideas2.bux`, `canon.bux`, `stack3.bux` | the candidate (step 8) | settings of bux the study had not used: GatedNorm, the embedding's scale, Canon convs, shared keys and values, Engram; their winners stacked |
+| `newlayers.bux`, `newlayers_cplm.bux`, `newlayers_doc.bux`, `newlayers_aux.bux` | the candidate (step 8) | the new layers of 2026: XSA, value embeddings, HyGA, K=V, differential attention, MSAR, null experts, paired heads, mimetic init; the copy pointer; the document-local copy; the prefix-token loss |
+| `stack4.bux`, `stack5.bux`, `stack6.bux` | the candidate (step 8) | the new layers' winners stacked: value embeddings, learned XSA and differential attention in a factorial with GatedNorm; the copy pointer with GatedNorm; every change that held at d768 |
+| `ideas_opt.bux`, `newlayers_opt.bux`, `muon_2020.bux`, `muon_2021.bux` | the candidate; the 2020 baseline; the 2021 reference | training options beside the AdamW recipe, not architecture: inits, Muon, NorMuon, the tail EMA, cautious weight decay |
 | `sparse_native.bux` | the candidate (step 8) | DSA, QSA and MSA on its global layers, in the shapes vLLM serves on its own kernels (DeepSeek-V3.2's, Qwen3.8's, MiniMax-M3's) |
 | `dense0.bux` | the candidate (step 8) | its first layer's FFN routed like every other's: no dense layer before the experts |
 

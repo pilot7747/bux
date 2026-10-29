@@ -1,0 +1,36 @@
+# Every change that gained at d768 on the factorial's candidate (factorial.bux's
+# r1v1k1f0p0s0: the late-2026 hybrid with hyper-connections, the value residual and the
+# key-value conv), together: the CPLM copy pointer (newlayers_cplm.bux's nl_cplm,
+# -2.45% at d768), GatedNorm (ideas.bux's gnorm, -0.49%), and stack4.bux's value
+# embeddings, learned exclusive self-attention and differential attention V2 on the
+# global layers (s4_v1x1d1, -0.53% as three; with GatedNorm, s4_gvxd, -0.84%). It is
+# stack5.bux (CPLM + GatedNorm) with stack4.bux's three. The MTP module's call of the
+# shared head keeps its plain softmax, and its layer keeps the hybrid's, as each
+# change's own arm did.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# 2026 modded-nanogpt PR 379 (CPLM): a <copy> row of the head, whose mass goes to a
+# pointer over the document's earlier final hidden states.
+shared fr_out = head(pointer=copy_pointer())
+
+# 2026 Qwen (GatedNorm, arXiv 2601.22966): every branch's norm times a gate of rank 16
+# on its own output.
+gated_norm = fr_norm (_ * (linear(features=16) swish linear(features=d_model) sigmoid))
+gn_layer(mixer, ffn=fr_experts) = [gated_norm mixer] [gated_norm ffn]
+
+# stack4.bux's global layers with exclusive self-attention and differential
+# attention, and a table of value embeddings before each, its own.
+g_xd = fr_global(kv_conv_size=4, exclusive=learned, differential=true)
+ve_g = value_embed(features=d_model // 4)
+
+model = embed
+        gn_layer(hy_delta, fr_dense) gn_layer(hy_delta)^2
+        ve_g(ve=@vt) gn_layer(g_xd(v=@v1, ve=$vt!))
+        (gn_layer(hy_delta)^3 ve_g(ve=@vt) gn_layer(g_xd(v=$v1, ve=$vt!)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan).
+optimizer.lr = 2e-3
