@@ -244,9 +244,8 @@ def check_decode(
     for r, (k, s) in enumerate(keys):
         want = reference(q[r].float(), w[r : r + 1], k.float() * s[:, None])[0]
         n = lengths[r]
-        error = max(
-            error, (logits[r, :n] - want).abs().max().item() / want.abs().max().item()
-        )
+        most = max(want.abs().max().item(), 1e-30)  # a ReLU'd lone key may score 0
+        error = max(error, (logits[r, :n] - want).abs().max().item() / most)
         torch_top = want.topk(min(top_k, n)).indices.int()[None]
         ok = (
             ok

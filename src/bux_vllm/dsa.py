@@ -101,8 +101,10 @@ def slots(dims: int, channels: int, itemsize: int) -> int:
 
 def quantized(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """x, (..., D), in FP8 e4m3 and a float32 scale a row, as vLLM caches DeepSeek's
-    indexer keys: the row's largest magnitude, 1e-4 at least, over 448."""
-    scale = x.float().abs().amax(-1, keepdim=True).clamp(min=1e-4) / FP8_MAX
+    indexer keys: the row's largest magnitude, 1e-4 at least, over 448 (times its
+    float32 reciprocal, as PyTorch divides by a number on a GPU, so that every
+    device and `bux_vllm.caching` round alike)."""
+    scale = x.float().abs().amax(-1, keepdim=True).clamp(min=1e-4) * (1 / FP8_MAX)
     return (x.float() / scale).to(FP8), scale.squeeze(-1)
 
 

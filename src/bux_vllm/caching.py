@@ -7,9 +7,10 @@ token's indexer key in FP8 and its float32 scale in DeepGEMM's paged layout
 attention reads them (`packed`).
 
 They compute what `bux_vllm.dsa` and `bux_vllm.sparse.PagedCache` do in PyTorch,
-bit for bit: the scales by IEEE division, the FP8 values rounded to nearest even
-(e4m3 saturating at 448, as the PyTorch path clamps them). A padding token (slot
--1) writes nothing.
+bit for bit: a scale as a row's largest magnitude times the float32 reciprocal of
+448, the values divided by it as IEEE does, rounded to nearest even (e4m3
+saturating at 448, as the PyTorch path clamps them). A padding token (slot -1)
+writes nothing.
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ import triton.language as tl
 
 FP8 = torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8).max
-FLOOR = 1e-4  # the least scale of a key or query head, times FP8_MAX
+INVERSE = 1 / FP8_MAX  # rounded to float32 as Triton takes it, as PyTorch's GPU does
+FLOOR = 1e-4  # the least of a row's largest magnitudes that a scale takes
 SCALE_BYTES = 4  # a key's float32 scale, after a block's keys
 
 
@@ -53,18 +55,18 @@ def _part(
     x = tl.load(src_ptr + g * stride_sh + d, mask=on, other=0.0)
     if fp8:
         y = x.to(tl.float32)
-        y = tl.div_rn(y, tl.zeros_like(y) + scale)
+        if scale != 1.0:  # a scale of 1 divides exactly
+            y = tl.div_rn(y, tl.zeros_like(y) + scale)
         x = tl.minimum(tl.maximum(y, -most), most)
     dst = row_ptr + g * stride_cg + first + d
     tl.store(dst, x.to(row_ptr.dtype.element_ty), mask=on)
 
 
 @triton.jit
-def _scaled(x, fp8_max, floor):
+def _scaled(x, inverse, floor):
     """The FP8 scale of each row of x, (rows, dims): its largest magnitude, `floor`
-    at least, over `fp8_max`, by IEEE division."""
-    most = tl.maximum(tl.max(tl.abs(x), 1), floor)
-    return tl.div_rn(most, tl.zeros_like(most) + fp8_max)
+    at least, times `inverse`, the reciprocal of FP8's largest value."""
+    return tl.maximum(tl.max(tl.abs(x), 1), floor) * inverse
 
 
 @triton.jit
@@ -73,7 +75,7 @@ def _index_key(
     key_ptr,
     offset,
     block_size,
-    fp8_max,
+    inverse,
     floor,
     dims: tl.constexpr,
     block_i: tl.constexpr,
@@ -84,7 +86,7 @@ def _index_key(
     i = tl.arange(0, block_i)[None, :]
     on = i < dims
     x = tl.load(key_ptr + i, mask=on, other=0.0).to(tl.float32)
-    scale = _scaled(x, fp8_max, floor)
+    scale = _scaled(x, inverse, floor)
     values = tl.div_rn(x, tl.zeros_like(x) + scale[:, None])
     keys = (base_ptr + offset * dims + i).to(tl.pointer_type(tl.float8e4nv))
     tl.store(keys, values.to(tl.float8e4nv), mask=on)
@@ -114,7 +116,7 @@ def _write_kernel(
     k_scale,
     v_scale,
     most,
-    fp8_max,
+    inverse,
     floor,
     heads: tl.constexpr,
     dk: tl.constexpr,
@@ -126,49 +128,52 @@ def _write_kernel(
     block_v: tl.constexpr,
     block_i: tl.constexpr,
 ):
-    """A token's keys and values at its slot of the cache, and its indexer key
-    (with `index_dims`) at the slot's place in the region of each block that
-    starts `region` bytes in; nothing for a padding token's slot of -1."""
-    t = tl.program_id(0)
+    """A token's keys (part 0), values (1) or indexer key (2, with `index_dims`)
+    at its slot of the cache, the key at the slot's place in the region of each
+    block that starts `region` bytes in; nothing for a padding token's slot of
+    -1. Parts apart, as programs of their own, so that their loads overlap."""
+    t, part = tl.program_id(0), tl.program_id(1)
     slot = tl.load(slot_ptr + t)
     if slot >= 0:
         block, offset = slot // block_size, slot % block_size
         row = cache_ptr + block * stride_cb + offset * stride_cs
-        k_row = k_ptr + t * stride_kt
-        _part(
-            row,
-            k_row,
-            stride_kh,
-            stride_cg,
-            0,
-            k_scale,
-            most,
-            heads,
-            dk,
-            fp8,
-            block_g,
-            block_k,
-        )
-        v_row = v_ptr + t * stride_vt
-        _part(
-            row,
-            v_row,
-            stride_vh,
-            stride_cg,
-            dk,
-            v_scale,
-            most,
-            heads,
-            dv,
-            fp8,
-            block_g,
-            block_v,
-        )
-        if index_dims > 0:
+        if part == 0:
+            k_row = k_ptr + t * stride_kt
+            _part(
+                row,
+                k_row,
+                stride_kh,
+                stride_cg,
+                0,
+                k_scale,
+                most,
+                heads,
+                dk,
+                fp8,
+                block_g,
+                block_k,
+            )
+        elif part == 1:
+            v_row = v_ptr + t * stride_vt
+            _part(
+                row,
+                v_row,
+                stride_vh,
+                stride_cg,
+                dk,
+                v_scale,
+                most,
+                heads,
+                dv,
+                fp8,
+                block_g,
+                block_v,
+            )
+        elif index_dims > 0:
             base = raw_ptr + block * stride_rb + region
             key = key_ptr + t * stride_it
             _index_key(
-                base, key, offset, block_size, fp8_max, floor, index_dims, block_i
+                base, key, offset, block_size, inverse, floor, index_dims, block_i
             )
 
 
@@ -206,7 +211,7 @@ def write(
     slot_bytes = cache.stride(1) * cache.element_size()
     if not n:
         return
-    _write_kernel[(n,)](
+    _write_kernel[(n, 3 if dims else 2)](
         k,
         v,
         keys,
@@ -227,7 +232,7 @@ def write(
         scales[0],
         scales[1],
         most,
-        FP8_MAX,
+        INVERSE,
         FLOOR,
         heads=g,
         dk=dk,
@@ -238,7 +243,7 @@ def write(
         block_k=_block(dk),
         block_v=_block(v.shape[2]),
         block_i=_block(dims),
-        num_warps=1,
+        num_warps=2,
     )
 
 
@@ -254,7 +259,7 @@ def _queries_kernel(
     stride_8t,
     stride_8h,
     stride_ot,
-    fp8_max,
+    inverse,
     floor,
     heads: tl.constexpr,
     padded: tl.constexpr,
@@ -273,7 +278,7 @@ def _queries_kernel(
         mask=on,
         other=0.0,
     ).to(tl.float32)
-    scale = _scaled(q, fp8_max, floor)
+    scale = _scaled(q, inverse, floor)
     q8 = tl.div_rn(q, tl.zeros_like(q) + scale[:, None])
     kept = (h[:, None] < padded) & (d[None, :] < dims)
     dst = q8_ptr + t * stride_8t + h[:, None] * stride_8h + d[None, :]
@@ -310,7 +315,7 @@ def queries(
         q8.stride(0),
         q8.stride(1),
         weights.stride(0),
-        FP8_MAX,
+        INVERSE,
         FLOOR,
         heads=h,
         padded=heads,

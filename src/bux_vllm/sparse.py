@@ -673,7 +673,7 @@ def _native(
         assert kept is not None
         kv = cache.rows.kv
         out = picks.attend_picked(spec, q, kept, positions, kv, rows, part.keys)
-        return out, kept
+        return out, kept if wanted else None
     if attends:
         if spec.mean and kept is not None:  # QSA's picks, read whole
             chosen = torch.where(kept[1], kept[0], -1)
