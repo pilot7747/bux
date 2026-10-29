@@ -1,0 +1,50 @@
+# Sparse attention on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv),
+# in its global layers alone, each in the shape vLLM serves on kernels of its own: DSA
+# as DeepSeek-V3.2's, QSA as Qwen3.8's, MSA as MiniMax-M3's. The global layers keep
+# the candidate's gated GQA of heads of 64, a kv head for every 4 query heads, without
+# positions; everything else is the candidate's, so each arm pairs with it by seed.
+# An indexer, trained by a loss of its own towards the attention, picks the keys each
+# query attends to; every arm keeps 2048 keys a query, which is all of a 2k row and
+# an eighth of a 16k one. The MTP module's layer stays dense.
+# Arms: era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k = fr_global(kv_conv_size=4)
+
+# DSA: 4 heads of 64 score every key a query sees and keep its best 2048
+# (factorial.bux's dsa_g).
+dsa_ix = indexer(num_heads=4, head_dim=64, top_k=2048)
+
+# QSA: 4 heads score the keys' means over blocks of 4 and keep the best 512 complete
+# blocks, beside the query's own unfinished block.
+qsa_ix = indexer(num_heads=4, head_dim=64, top_k=2048, block_size=4, weighted=false,
+                 norm=fr_norm)
+
+# MSA: an index head for each kv head scores every key by a plain dot product, and
+# each kv head's group of query heads attends to its best 16 blocks of 128 keys, its
+# own block among them.
+msa_ix = indexer(num_heads=d_model // 256, head_dim=64, top_k=2048, block_size=128,
+                 pool=max, per_group=true, relu=false, weighted=false, norm=fr_norm)
+
+# factorial.bux's vres(g_k, fr_experts) with the indexer ix on its global layers.
+sparse(ix) = embed
+             fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(indexer=ix, v=@v1))
+             (fr_layer(hy_delta)^3 fr_layer(g_k(indexer=ix, v=$v1)))^(layers // 4 - 1)
+             fr_norm @h fr_out hy_mtp
+
+model = # 2025 DeepSeek-V3.2 (DSA), 2026 GLM-5.3: the candidate with the factorial's
+        # indexer; long-context cost
+        dsa_c: sparse(dsa_ix)
+      # 2026 Qwen3.8-Flash-Next (QSA): an indexer over blocks of 4; long-context cost
+      | qsa_c: sparse(qsa_ix)
+      # 2026 MiniMax-M3, M3.1-Flash (MSA): a pick of blocks for each kv head's group;
+      # long-context cost
+      | msa_c: sparse(msa_ix)
+
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), as the candidate's.
+optimizer.lr = 2e-3
