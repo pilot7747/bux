@@ -1355,7 +1355,7 @@ class _Lowering:
         self.ev = ev
         self.d_model = d_model
         # Whether the residual algebra widens the stream between branches, and whether
-        # into copies of it (attnres keeps the branch outputs so far instead).
+        # into copies of it (attnres and msar keep the branch outputs so far instead).
         self.widened = residual is not None and residual.type != "vpgate"
         self.copies = residual is not None and residual.type in ("hc", "mhc", "gr")
         self.depth = 0  # residual branches the node being lowered is inside
@@ -1640,7 +1640,7 @@ class _Lowering:
                 raise self.error(
                     "merge reads a widened residual stream back into one, but there "
                     "is none here",
-                    "widen it with residual = hc(...), mhc(...), gr(...) or attnres(...)"
+                    "widen it with residual = hc(...), mhc(...), gr(...), attnres(...) or msar(...)"
                     if not self.widened
                     else None,
                 )
