@@ -341,7 +341,8 @@ def cache_layer(c: dict, ports: list) -> tuple[str, dict] | None:
     """
     if reads(ports, "kv"):
         return None
-    conv = {"number_of_conv_states": 2} if c.get("kv_conv_size") else {}
+    states = 1 if c.get("k_eq_v") else 2  # the keys', and the values' unless shared
+    conv = {"number_of_conv_states": states} if c.get("kv_conv_size") else {}
     window = c["sliding_window_size"]
     if sparse(c, ports):
         if reads(ports, "index"):
@@ -618,6 +619,15 @@ def exclusive(
     return (y - along).to(out.dtype)
 
 
+def value_norm(c: dict) -> Norm:
+    """The norm of values made from the keys (``k_eq_v``, Gemma 4's): an RMSNorm
+    without a gain, at the eps of the layer's QK-norm, or 1e-6 without one."""
+    qk = c["qk_norm"]
+    eps = 1e-6 if qk is None else qk["eps"]
+    plain = {"type": "rmsnorm", "eps": eps, "affine": False, "bias": False}
+    return Norm(plain | {"zero_centered": False, "scale_input": False}, 1)
+
+
 def check_reader(c: dict, ports: list) -> None:
     """Raise for what a layer that reads kv does not export: a v port (its values are
     the writer's, all of them while decoding) or an indexer of its own (whose keys it
@@ -661,6 +671,7 @@ class Attention(SoftmaxAttention):
         self.q_norm = Norm(qk, q_width) if qk else None
         self.k_norm = Norm(qk, k_width) if qk and not self.reads_kv else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self.v_norm = value_norm(c) if c["k_eq_v"] and not self.reads_kv else None
         self.power_scale = c["power_scale"], c["power_scale_length"]
         self.value_residual = c["value_residual"]
         trained = reads(site.ports, "v") and self.value_residual != "fixed"
@@ -686,16 +697,17 @@ class Attention(SoftmaxAttention):
         out_bias = bias if c["output_bias"] is None else c["output_bias"]
         fused = c["fused_qkv"] and not self.reads_kv
         split = not (fused or self.reads_kv)
+        own_v = 0 if c["k_eq_v"] else g * dv  # k_eq_v: values from the keys
         self.qkv = (
-            nn.Linear(width, h * dk + g * (dk + dv), bias=bias) if fused else None
+            nn.Linear(width, h * dk + g * dk + own_v, bias=bias) if fused else None
         )
         self.q = None if fused else nn.Linear(width, h * dk, bias=bias)
         self.k = nn.Linear(width, g * dk, bias=bias) if split else None
-        self.v = nn.Linear(width, g * dv, bias=bias) if split else None
+        self.v = nn.Linear(width, own_v, bias=bias) if split and own_v else None
         self.o = nn.Linear(h * dv, width, bias=out_bias)
         size = None if self.reads_kv else c["kv_conv_size"]
         self.k_conv = CausalConv(g * dk, size, False) if size else None
-        self.v_conv = CausalConv(g * dv, size, False) if size else None
+        self.v_conv = CausalConv(own_v, size, False) if size and own_v else None
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         q, k, v = self._project(x)
@@ -723,12 +735,15 @@ class Attention(SoftmaxAttention):
         """Project x to q, k and v, b t _; k and v are None if the layer reads kv."""
         if self.qkv is not None:
             q, k = self.h * self.dk, self.g * self.dk
+            if self.v_norm is not None:
+                q, k = self.qkv(x).split([q, k], -1)
+                return [q, k, k]
             return list(self.qkv(x).split([q, k, self.g * self.dv], -1))
         assert self.q is not None
-        kv = (
-            [None, None] if self.k is None or self.v is None else [self.k(x), self.v(x)]
-        )
-        return [self.q(x), *kv]
+        if self.k is None:
+            return [self.q(x), None, None]
+        k = self.k(x)
+        return [self.q(x), k, k if self.v is None else self.v(x)]
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """Split the projected queries into heads with QK-norm (`_split_normed`),
@@ -750,8 +765,12 @@ class Attention(SoftmaxAttention):
         the cache layer `slot`), split them into heads, the keys with QK-norm
         (`_split_normed`), then apply RoPE to the keys."""
         b, t, _ = k.shape
-        if self.k_conv is not None and self.v_conv is not None:
-            k, v = k + self.k_conv(k, ctx, slot, 0), v + self.v_conv(v, ctx, slot, 1)
+        if self.k_conv is not None:
+            k = k + self.k_conv(k, ctx, slot, 0)
+        if self.v_conv is not None:
+            v = v + self.v_conv(v, ctx, slot, 1)
+        if self.v_norm is not None:  # k_eq_v: each head's key, normalized
+            v = self.v_norm(k.view(b, t, self.g, self.dk))
         k, v = self._split_normed(k, self.g, self.k_norm), v.view(b, t, self.g, self.dv)
         return (k if self.rope is None else self.rope(k, ctx.positions)), v
 

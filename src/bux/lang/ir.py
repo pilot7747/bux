@@ -338,6 +338,7 @@ _NEWER_LAYER_FIELDS = {
         "exclusive": False,
         **_HYGA,
         "value_embed_gate": 6,
+        "k_eq_v": False,
     },
     "mla": {"gate_head_bias": False, **_HYGA},
     "csa": {"gate_head_bias": False, **_HYGA},

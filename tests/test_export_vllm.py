@@ -33,6 +33,7 @@ from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
+from bux.architecture.registry import Taps
 from bux.export import check
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
@@ -1088,6 +1089,60 @@ def test_value_embeddings_add_to_each_ranks_values_as_bux(
         np.testing.assert_allclose(
             got.numpy(), want[:, first : first + g].reshape(8, -1), rtol=1e-5, atol=1e-6
         )
+
+
+def test_values_from_the_keys_are_normalized_as_bux_and_convolved_alone() -> None:
+    qk = cfg.NormalizationConfig(type="rmsnorm", eps=1e-5)
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, qk_norm=qk, k_eq_v=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    k = jax.random.normal(jax.random.key(1), (1, 8, 32))
+    _, want = attn._keys_as_values(k, None, Taps())
+    norm = common.Norm(kv.value_norm(c.model_dump(mode="json")["qk_norm"]), 16)
+    assert not list(norm.parameters())
+    got = norm(torch.from_numpy(np.array(k)[0]).view(8, 2, 16))
+    np.testing.assert_allclose(got.numpy(), np.asarray(want[0]), rtol=1e-5, atol=1e-6)
+    conv = c.model_copy(update={"kv_conv_size": 4}).model_dump(mode="json")
+    assert kv.conv_channels(conv, 64, 1) == 2 * 16
+    assert kv.conv_channels(conv | {"k_eq_v": False}, 64, 2) == 16 + 16
+
+
+KEYED = {
+    "nope": ({}, (), True),
+    "zero-centered gain": ({"qk_norm": {"zero_centered": True}}, (), True),
+    "writes v": ({}, (["v", "v1", "write"],), True),
+    "rope": ({"rope": cfg.RoPEConfig()}, (), False),
+    "reads v": ({}, (["v", "v1", "read"],), False),
+    "writes kv": ({}, (["kv", "kv", "write"],), False),
+    "layernorm": ({"qk_norm": {"type": "layernorm"}}, (), False),
+}
+
+
+@pytest.mark.parametrize(("change", "ports", "keyed"), KEYED.values(), ids=KEYED)
+def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
+    change: dict, ports: tuple, keyed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bux's keys are its values times the key norm's gain wherever the plugin
+    caches the values alone, asked to, and puts the gain on the queries instead."""
+    qk = {"type": "rmsnorm", "eps": 1e-5} | change.pop("qk_norm", {})
+    c = cfg.GQAConfig.model_validate(
+        {"num_heads": 4, "num_kv_heads": 2, "k_eq_v": True, "qk_norm": qk} | change
+    )
+    dumped = c.model_dump(mode="json")
+    assert not kv.keys_from_values(dumped, list(ports))  # keys and values, unasked
+    monkeypatch.setenv("BUX_VLLM_K_EQ_V_CACHE", "keys")
+    assert kv.keys_from_values(dumped, list(ports)) == keyed
+    if not keyed:
+        return
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.k_norm is not None and attn.k_norm.scale is not None
+    attn.k_norm.scale[...] = jax.random.normal(jax.random.key(2), (16,))
+    k, v = attn._keys_as_values(
+        jax.random.normal(jax.random.key(1), (1, 8, 32)), None, Taps()
+    )
+    gain = attn.k_norm.scale[...] + (1 if attn.k_norm.zero_centered else 0)
+    np.testing.assert_allclose(
+        np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
+    )
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
