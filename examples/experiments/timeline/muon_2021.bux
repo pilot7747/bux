@@ -1,0 +1,9 @@
+# Muon on the 2021 reference (gpt3_rope.bux, positions.bux's rope), its model
+# unchanged, as muon_2020.bux does on the 2020 baseline: Muon for the matrices in the
+# blocks at Moonlight's update RMS of 0.2, AdamW at the reference's 2e-3 for the rest.
+# A training option, not architecture.
+use gpt3_rope
+use timeline_code
+use rungs
+
+optimizer = muon(lr=2e-3, weight_decay=0.1, adam=adamw(lr=2e-3, weight_decay=0.1))
