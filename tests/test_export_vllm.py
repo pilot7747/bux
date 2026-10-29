@@ -3038,16 +3038,18 @@ def test_a_pointer_s_rows_keep_its_keys_and_tokens(fp8: torch.dtype | None) -> N
     np.testing.assert_array_equal(got_keys.numpy(), want.numpy())
 
 
-def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture() -> None:
+@pytest.mark.parametrize("dim", [16, 24], ids=["dim 16", "dim 24"])
+def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
     """Each position as a request's last token: the pointer over the request's
     earlier tokens in the paged cache, mixed with the head's softmax, is bux's
-    mixture (`bux.architecture.copy.log_probs`) at that position."""
+    mixture (`bux.architecture.copy.log_probs`) at that position, at a key width
+    of a power of two and of none."""
     from bux.architecture import copy as bux_copy
 
     source = (
         "d_model = 32\nvocab_size = 64\n"
         "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
-        "model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim=16))"
+        f"model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim={dim}))"
     )
     model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
     tokens = jax.random.randint(jax.random.key(0), (1, 12), 0, 6)
@@ -3061,7 +3063,7 @@ def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture() -> None:
     )
     logits = torch.from_numpy(np.array(head.projection(head.hidden)[0], np.float32))
     size, blocks = 4, 3
-    cache = torch.zeros(8, 1, size, copying.row_width(16))
+    cache = torch.zeros(8, 1, size, copying.row_width(dim))
     table = torch.tensor([[5, 2, 7]])  # the request's blocks, out of order
     slots = table[0, torch.arange(12) // size] * size + torch.arange(12) % size
     rows = copying.encode(k, torch.from_numpy(np.array(tokens[0])), torch.float32, None)
@@ -3119,3 +3121,25 @@ def test_the_pointer_s_pytorch_path_reads_nothing_on_the_host(
     monkeypatch.undo()
     assert torch.allclose(p_copy.sum(-1) + a_sink, torch.ones(3))
     assert a_sink[2] == 1  # nothing before position 0
+
+
+def test_rows_no_step_wrote_point_inside_the_cache_and_the_vocabulary() -> None:
+    """vLLM's dummy and capture runs point padded requests at the null block, whose
+    rows hold anything, and at block-table entries of -1: the pointer reads inside
+    the cache and gives every token an index of the vocabulary."""
+    cache = torch.full((3, 1, 4, copying.row_width(8)), torch.nan)
+    cache[1, 0, :, 8:] = torch.tensor([-5.0, 1e30, 300.0, 0.0])
+    _, tokens = copying.decode(cache, 8, None)
+    assert ((tokens >= 0) & (tokens < 2**24)).all()
+    table = torch.tensor([[-1, 7], [1, 1]])
+    p_copy, a_sink = copying.pointed(
+        torch.randn(2, 8),
+        torch.randn(2),
+        cache,
+        table,
+        torch.tensor([8, 8]),
+        10,
+        None,
+        8,
+    )
+    assert p_copy.shape == (2, 10) and a_sink.shape == (2,)

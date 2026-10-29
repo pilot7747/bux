@@ -55,7 +55,10 @@ def decode(
     (..., `row_width`), as `encode` wrote them."""
     keys = rows[..., :dim]
     keys = keys.view(fp8).float() if fp8 is not None else keys.float()
-    digits = rows[..., dim : dim + DIGITS].long()
+    # A row no step wrote, as the null block's that padded requests point at,
+    # gives bytes: its token is then some token, never an index out of range.
+    digits = rows[..., dim : dim + DIGITS].float()
+    digits = torch.where((digits >= 0) & (digits <= 255), digits, 0).long()
     tokens = sum(digits[..., i] << (8 * i) for i in range(DIGITS))
     return keys, torch.as_tensor(tokens)
 
@@ -65,7 +68,8 @@ def gathered(cache: torch.Tensor, table: torch.Tensor, length: int) -> torch.Ten
     the paged `cache`, ``[blocks, 1, block_size, row]``, by its block `table`."""
     size = cache.shape[2]
     at = torch.arange(length, device=cache.device)
-    blocks = table[:, at // size].long()
+    columns = (at // size).clamp(max=table.shape[1] - 1)
+    blocks = table[:, columns].long().clamp(0, cache.shape[0] - 1)
     return cache[blocks, 0, at % size]
 
 

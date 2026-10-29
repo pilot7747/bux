@@ -123,7 +123,7 @@ SHARING = (
 
 #: The cases whose prompts' log-probabilities vLLM does not serve, which compare the
 #: rows vLLM samples alone: a head with a copy pointer points for those rows only.
-SAMPLED = ("cplm",)
+SAMPLED = ("cplm", "cplm-128")
 
 #: The cases, by name: a model each, as bux source.
 CASES = {
@@ -186,6 +186,7 @@ CASES = {
     # CPLM's copy pointer on the head: its mixture with the softmax is what vLLM
     # samples, the pointer's keys and tokens in a paged cache of the head's own.
     "cplm": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer(dim=64))",
+    "cplm-128": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer())",
     "moe": HEAD
     + ATTN
     + EXPERT

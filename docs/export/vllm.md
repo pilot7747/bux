@@ -893,6 +893,7 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
 | `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
 | `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own; the sampled rows alone | - | - | - |
+| `cplm-128` | the same pointer at its default width of 128 | - | - | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |

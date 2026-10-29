@@ -210,7 +210,12 @@ def _pointed(
     a_sink: torch.Tensor,
 ) -> None:
     """`bux_vllm.copying.pointed` by the Triton kernel, into the zeroed rows of
-    `p_copy` and into `a_sink`."""
+    `p_copy` and into `a_sink`, for keys of any width: the kernel masks the
+    power of two of channels it loads to the keys'. Every address it takes is in
+    bounds whatever the cache holds: vLLM's dummy and capture runs point padded
+    requests at the null block, whose rows no step wrote, so it clamps each block
+    to the cache's, each digit to a byte and each token to the vocabulary, and
+    reads no position past the block table's."""
     rows = cache.rows
     requests, dim = q.shape
     if requests == 0:
@@ -230,8 +235,11 @@ def _pointed(
         table.stride(0),
         p_copy.stride(0),
         p_copy.shape[1],
+        rows.shape[0],
+        table.shape[1] * rows.shape[2],
         dim**-0.5,
         D=dim,
+        DP=triton.next_power_of_2(dim),
         B=rows.shape[2],
         BN=64,
         DIGITS=copying.DIGITS,
@@ -253,8 +261,11 @@ def _pointer_kernel(
     stride_table,
     stride_copy,
     vocab,
+    blocks,
+    longest,
     scale,
     D: tl.constexpr,
+    DP: tl.constexpr,
     B: tl.constexpr,
     BN: tl.constexpr,
     DIGITS: tl.constexpr,
@@ -262,17 +273,23 @@ def _pointer_kernel(
     """One request's query over its positions before it: the softmax's max and sum
     in a first pass, then each position's share added into its token's entry."""
     r = tl.program_id(0)
-    end = tl.load(POSITION + r)
-    d = tl.arange(0, D)
-    q = tl.load(Q + r * D + d).to(tl.float32)
+    end = tl.minimum(tl.load(POSITION + r), longest)  # the block table's positions
+    d = tl.arange(0, DP)  # a power of two of channels, D of them the key's
+    on = d < D
+    q = tl.load(Q + r * D + d, mask=on, other=0.0).to(tl.float32)
     s0 = tl.load(SINK + r)
     m, total = s0, s0 * 0.0 + 1.0
     for start in range(0, end, BN):
         at = start + tl.arange(0, BN)
         seen = at < end
         block = tl.load(TABLE + r * stride_table + at // B, mask=seen, other=0)
-        base = block.to(tl.int64) * stride_block + (at % B) * stride_slot
-        k = tl.load(KEYS + base[:, None] + d[None, :], mask=seen[:, None], other=0.0)
+        block = tl.minimum(tl.maximum(block, 0), blocks - 1).to(tl.int64)
+        base = block * stride_block + (at % B) * stride_slot
+        k = tl.load(
+            KEYS + base[:, None] + d[None, :],
+            mask=seen[:, None] & on[None, :],
+            other=0.0,
+        )
         s = tl.sum(k.to(tl.float32) * q[None, :], 1) * scale
         s = tl.where(seen, s, -float("inf"))
         top = tl.maximum(m, tl.max(s, 0))
@@ -282,15 +299,22 @@ def _pointer_kernel(
         at = start + tl.arange(0, BN)
         seen = at < end
         block = tl.load(TABLE + r * stride_table + at // B, mask=seen, other=0)
-        base = block.to(tl.int64) * stride_block + (at % B) * stride_slot
-        k = tl.load(KEYS + base[:, None] + d[None, :], mask=seen[:, None], other=0.0)
+        block = tl.minimum(tl.maximum(block, 0), blocks - 1).to(tl.int64)
+        base = block * stride_block + (at % B) * stride_slot
+        k = tl.load(
+            KEYS + base[:, None] + d[None, :],
+            mask=seen[:, None] & on[None, :],
+            other=0.0,
+        )
         s = tl.sum(k.to(tl.float32) * q[None, :], 1) * scale
         share = tl.where(seen, tl.exp(s - m) / total, 0.0)
         token = tl.zeros([BN], tl.int64)
         for i in tl.static_range(DIGITS):
             digit = tl.load(ROWS + base + D + i, mask=seen, other=0).to(tl.float32)
+            # A byte, or 0 for anything else (NaN too), of a row no step wrote
+            digit = tl.where((digit >= 0.0) & (digit <= 255.0), digit, 0.0)
             token += digit.to(tl.int64) << (8 * i)
-        token = tl.minimum(token, vocab - 1)
+        token = tl.minimum(tl.maximum(token, 0), vocab - 1)
         tl.atomic_add(P_COPY + r * stride_copy + token, share, mask=seen)
     tl.store(A_SINK + r, tl.exp(s0 - m) / total)
 

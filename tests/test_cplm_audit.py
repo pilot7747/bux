@@ -44,7 +44,7 @@ buckets: Any = getattr(tcfg, "buckets", None)
 
 
 def the_head(model: Model) -> Head:
-    return next(m for _, m in model.iter_modules() if isinstance(m, Head))
+    return next(m for _, m in nnx.iter_modules(model) if isinstance(m, Head))
 
 
 def gated_model(seed: int = 0) -> Model:
