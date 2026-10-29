@@ -723,9 +723,10 @@ In a bfloat16 model, MSA's indexer and attention run on the Triton kernels vLLM
 runs MiniMax-M3's sparse layers on, where they take its settings: blocks of 128
 keys (`block_size=128`, `pool=max`, `per_group=true`), plain dots, unweighted
 heads, an index head for each kv head, index and attention heads of a power of two
-of dims (keys and values alike), a power of two of kv heads on a GPU, fewer than 64
-blocks a query, and no window, sinks or softcap. MiniMax-M3's own settings are
-these.
+of dims (keys and values alike), fewer than 64 blocks a query, and no window, sinks
+or softcap. MiniMax-M3's own settings are these. The index kernels take a power of
+two of index heads on a GPU: other counts run padded with heads of no query, whose
+picks are dropped.
 
 - **Keys.** Each token's index key, normalized and rotated, is cached in bfloat16
   in head slots after the call's kv heads. The cache takes blocks of 128 tokens, a
@@ -978,7 +979,8 @@ float32, with the kernels forced (`BUX_VLLM_SPARSE_KERNELS=native`), they differ
 from that reference by up to 3.4: FP8 scores often tie exactly, and vLLM's top-k
 breaks a tie its own way, where bux keeps the first key.
 `msa-native`'s prompts fit in one block of 128, so it checks the kernels' attention
-and plumbing; `scripts/vllm_native.py` checks their picks, which agree with bux's.
+and plumbing; `scripts/vllm_native.py` checks their picks, which agree with bux's,
+and their attention over an FP8 cache in a CUDA graph's decoding step.
 `gdn`, `kda`, `kda-odd`, `kda-kimi` and the `mla` cases run in bfloat16 only, and
 `gla` without a conv in float32 alone. A `-` marks a case not measured that way.
 

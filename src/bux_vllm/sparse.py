@@ -298,6 +298,9 @@ class PagedCache(nn.Module, AttentionLayerBase):
         keys = dsa.slots(index_dims, channels, size) if native else 0
         self.slots = self.raw_slots + keys
         self.scales = (1.0, 1.0)  # an FP8 cache's keys' and values' scales
+        # as the MSA kernels read them: made with the model, before any CUDA graph
+        held = torch.tensor(self.scales, dtype=torch.float32)
+        self.register_buffer("held_scales", held, persistent=False)
         self.longest = vllm_config.model_config.max_model_len
         kernel = getattr(vllm_config, "kernel_config", None)
         self.topk_backend = getattr(kernel, "sparse_indexer_topk_backend", "auto")
@@ -594,7 +597,7 @@ def _blocked(
     spec = cache.sparse
     first, count = spec.groups
     iq = iq[:, first : first + count].contiguous()
-    attending = (spec.top_k // msa.BLOCK, spec.scale, cache.scales)
+    attending = (spec.top_k // msa.BLOCK, spec.scale, cache.held_scales)
     keys, kv = cache.raw.keys, cache.kv
     if part.decoding:
         assert meta.seq_lens is not None, "decoded tokens have their keys' lengths"
