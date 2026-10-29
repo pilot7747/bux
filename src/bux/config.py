@@ -1092,6 +1092,30 @@ class ValueEmbeddingConfig(Config):
     std: float = 0.01
 
 
+class CopyPointerConfig(Config):
+    """The copy pointer of a CPLM head (modded-nanogpt's CPLM): the next token's
+    probability is a mixture of the head's softmax and a pointer over the earlier
+    tokens of the document, ``p = p_lm (1 - a (1 - a_sink)) + a p_copy``.
+
+    The gate a is the softmax's mass on the `token` row, ``<copy>``, a row of the
+    vocabulary that no token is, and p_lm is the softmax over the other rows. The
+    pointer is one head of `dim` on the head's input: each position attends to the
+    positions before it in its document, and to a learned sink, by RMS-normed queries
+    (times a learned gain) and keys; ``p_copy(y)`` is its attention on the positions
+    whose token is y, and the sink's share, a_sink, goes back to p_lm. A setting of
+    the model's first head: ``head(pointer=copy_pointer())``.
+    """
+
+    type: Literal["copy_pointer"] = "copy_pointer"
+    dim: Positive = 128  # Width of the pointer's queries and keys.
+    # The row of <copy> in the vocabulary, one no token is, as a padding row; None ->
+    # the last row.
+    token: Annotated[int, Field(ge=0)] | None = None
+    # How far back the pointer looks, in tokens; None: the whole document
+    # (modded-nanogpt: 2048 to 4096 in training, 8192 in its evals).
+    window: Positive | None = None
+
+
 class LMHeadConfig(Config):
     """The language-model head: the stream to logits over the vocabulary,
     ``softcap(x W + b)``. Every head is an output of the model; nothing follows one
@@ -1103,6 +1127,9 @@ class LMHeadConfig(Config):
     # Soft-capping of the logits, softcap * tanh(logits / softcap) (Gemma 2); None:
     # none.
     softcap: float | None = None
+    # A copy pointer (CPLM) on the pass's first head, whose loss and evals are then
+    # those of its mixture; later heads, as an MTP module's, keep their softmax.
+    pointer: CopyPointerConfig | None = None
 
 
 class NextNConfig(Config):
@@ -1463,6 +1490,7 @@ SubConfig = Annotated[
     | YaRNConfig
     | Llama3RoPEScalingConfig
     | RelativeBiasConfig
+    | CopyPointerConfig
     | SparseIndexerConfig
     | HyperConnectionsConfig
     | GatedResidualConfig

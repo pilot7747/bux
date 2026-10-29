@@ -121,6 +121,10 @@ SHARING = (
     "R = layer(local(kv=$kv!))\nG = layer(full(kv=@kv))\n"
 )
 
+#: The cases whose prompts' log-probabilities vLLM does not serve, which compare the
+#: rows vLLM samples alone: a head with a copy pointer points for those rows only.
+SAMPLED = ("cplm", "cplm-128")
+
 #: The cases, by name: a model each, as bux source.
 CASES = {
     "llama": LLAMA + "model = embed block^2 rmsnorm head",
@@ -179,6 +183,10 @@ CASES = {
     + "capped = mlp(intermediate_size=256, activation=relu2, up_softcap=2)\n"
     + "model = embed(norm=rmsnorm) [rmsnorm attn] [rmsnorm ffn] [rmsnorm laguna]"
     " [rmsnorm capped] rmsnorm head",
+    # CPLM's copy pointer on the head: its mixture with the softmax is what vLLM
+    # samples, the pointer's keys and tokens in a paged cache of the head's own.
+    "cplm": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer(dim=64))",
+    "cplm-128": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer())",
     "moe": HEAD
     + ATTN
     + EXPERT
@@ -964,10 +972,12 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         tokens, starts = run[f"tokens{i}"], len(prompt) - 1
         sequence = [*prompt, *tokens.tolist()]
         want = _logprobs(model, sequence)[:-1]
-        vllm.add(run[f"logprobs{i}"], want, starts, tokens)
+        skip = starts if name in SAMPLED else 0  # their prompts' rows unserved
+        got = run[f"logprobs{i}"]
+        vllm.add(got[skip:], want[skip:], starts - skip, tokens)
         if low is not None:
             got = _logprobs(low, sequence)[:-1]
-            own.add(got, want, starts, got[starts:].argmax(-1))
+            own.add(got[skip:], want[skip:], starts - skip, got[starts:].argmax(-1))
     error, gap = max(args.tolerance, 2 * own.error), max(args.margin, own.error)
     ok = vllm.error <= error and vllm.gap <= gap
     print(
@@ -1003,7 +1013,8 @@ class Agreement:
         and the `picks` of its steps, from position `starts` on."""
         steps = want[starts:]
         gap = steps.max(-1) - steps[np.arange(len(picks)), picks]
-        self.error = max(self.error, float(np.abs(got - want).max()))
+        off = np.where(got == want, 0, np.abs(got - want))  # -inf at <copy>, both
+        self.error = max(self.error, float(off.max()))
         self.gap = max(self.gap, float(gap.max()))
         self.same &= bool((steps.argmax(-1) == picks).all())
         self.seen = True
@@ -1014,10 +1025,16 @@ class Agreement:
 
 
 def _logprobs(model: Any, tokens: list[int]) -> np.ndarray:
-    """bux's log-probabilities of every position of `tokens`, in float32."""
+    """bux's log-probabilities of every position of `tokens`, in float32: of its copy
+    pointer's mixture, for a first head with one (`bux.architecture.copy`)."""
     import jax
     import jax.numpy as jnp
 
+    from bux.architecture import copy
+
+    [first, *_] = model.heads(jnp.asarray([tokens]))
+    if first.pointer is not None:
+        return np.asarray(copy.log_probs(first)[0])
     logits = model(jnp.asarray([tokens]))[0].astype(jnp.float32)
     return np.asarray(jax.nn.log_softmax(logits, -1))
 

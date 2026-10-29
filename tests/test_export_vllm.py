@@ -49,6 +49,7 @@ from bux_vllm import (
     common,
     compressed,
     config,
+    copying,
     delta,
     docmatch,
     dplr,
@@ -2832,6 +2833,7 @@ def engine_config(where: Path, quant: Any, cache_dtype: str = "auto") -> Any:
         compilation_config=SimpleNamespace(static_forward_context={}, splitting_ops=[]),
         quant_config=quant,
         num_speculative_tokens=0,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
 
 
@@ -2858,7 +2860,9 @@ def kept(model: Any, path: str) -> bool:
     HyGA's cross-head gate and differential attention's weights, of an output a
     head, and a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name in ("shared_gate", "cross_gate", "lambda_proj"):
+    if name in ("shared_gate", "cross_gate", "lambda_proj") or owner.endswith(
+        ".pointer"
+    ):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 
@@ -3109,6 +3113,201 @@ def test_the_fp8_emulation_rounds_what_vllm_quantizes(tmp_path: Path) -> None:
         ]
         assert all(torch.equal(a, x) for a, x in zip(again, w if w.dim() == 3 else [w]))
         assert not torch.equal(p, before[name]), name
+
+
+@pytest.mark.parametrize("fp8", [None, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+def test_a_pointer_s_rows_keep_its_keys_and_tokens(fp8: torch.dtype | None) -> None:
+    keys = torch.randn(5, 128)
+    tokens = torch.tensor([0, 255, 256, 50303, 2**24 - 1])
+    dtype = torch.uint8 if fp8 is not None else torch.bfloat16
+    rows = copying.encode(keys, tokens, dtype, fp8)
+    assert rows.shape == (5, 1, copying.row_width(128)) and rows.dtype == dtype
+    got_keys, got_tokens = copying.decode(rows[:, 0], 128, fp8)
+    assert got_tokens.tolist() == tokens.tolist()
+    want = keys.to(fp8 or torch.bfloat16).float()
+    np.testing.assert_array_equal(got_keys.numpy(), want.numpy())
+
+
+@pytest.mark.parametrize("dim", [16, 24], ids=["dim 16", "dim 24"])
+def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
+    """Each position as a request's last token: the pointer over the request's
+    earlier tokens in the paged cache, mixed with the head's softmax, is bux's
+    mixture (`bux.architecture.copy.log_probs`) at that position, at a key width
+    of a power of two and of none."""
+    from bux.architecture import copy as bux_copy
+
+    source = (
+        "d_model = 32\nvocab_size = 64\n"
+        "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
+        f"model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim={dim}))"
+    )
+    model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
+    tokens = jax.random.randint(jax.random.key(0), (1, 12), 0, 6)
+    [head] = model.heads(tokens)
+    pointer = head.pointer
+    assert pointer is not None
+    want = np.asarray(bux_copy.log_probs(head)[0])
+    q, k, sink = (
+        torch.from_numpy(np.array(a[0], np.float32))
+        for a in (pointer.query, pointer.key, pointer.sink)
+    )
+    logits = torch.from_numpy(np.array(head.projection(head.hidden)[0], np.float32))
+    size, blocks = 4, 3
+    cache = torch.zeros(8, 1, size, copying.row_width(dim))
+    table = torch.tensor([[5, 2, 7]])  # the request's blocks, out of order
+    slots = table[0, torch.arange(12) // size] * size + torch.arange(12) % size
+    rows = copying.encode(k, torch.from_numpy(np.array(tokens[0])), torch.float32, None)
+    cache.view(-1, rows.shape[-1])[slots] = rows[:, 0]
+    assert blocks * size == 12
+    for i in range(12):
+        p_copy, a_sink = copying.pointed(
+            q[i : i + 1], sink[i : i + 1], cache, table, torch.tensor([i]), 64, None, 12
+        )
+        got = copying.mixed(logits[i : i + 1], p_copy, a_sink, 63)[0].numpy()
+        finite = np.isfinite(want[i])
+        assert (np.isfinite(got) == finite).all()
+        np.testing.assert_allclose(got[finite], want[i][finite], rtol=1e-5, atol=1e-5)
+
+
+def test_the_pointer_s_steps_replayed_as_a_graph_sample_bux_s_mixture() -> None:
+    """vLLM's steps as the op takes them: two prompts in a step, then steps of their
+    decoded tokens and a padded request, as one CUDA graph replays them, its
+    metadata the capture's and vLLM's buffers refilled in place. Each request's
+    row, written then pointed, mixes to bux's mixture at its last token."""
+    from bux.architecture import copy as bux_copy
+
+    source = (
+        "d_model = 32\nvocab_size = 64\n"
+        "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
+        "model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim=16))"
+    )
+    model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
+    tokens = jax.random.randint(jax.random.key(1), (2, 10), 0, 6)
+    [head] = model.heads(tokens)
+    pointer = head.pointer
+    assert pointer is not None
+    want = np.asarray(bux_copy.log_probs(head))
+    q, k, sink = (
+        torch.from_numpy(np.array(a, np.float32))
+        for a in (pointer.query, pointer.key, pointer.sink)
+    )
+    logits = torch.from_numpy(np.array(head.projection(head.hidden), np.float32))
+    ids = torch.from_numpy(np.array(tokens))
+    size, length = 4, 12
+    cache = torch.zeros(8, 1, size, copying.row_width(16))
+    table = torch.tensor([[5, 2, 7], [1, 6, 3], [0, 0, 0]], dtype=torch.int32)
+    starts = torch.zeros(4, dtype=torch.int32)  # vLLM's buffers, refilled in place
+    lens = torch.zeros(3, dtype=torch.int32)
+    slots = torch.full((16,), -1)
+
+    def slot(r: int, at: int) -> int:
+        return int(table[r, at // size]) * size + at % size
+
+    def point(steps: copying.Steps, at: list[tuple[int, int]]) -> torch.Tensor:
+        """Run the op's float32 path on the step of the (request, position) `at`,
+        padding past them; return the mixture of each request's last."""
+        pad = steps.num_actual_tokens - len(at)
+        rows = [r * 10 + p for r, p in at] + [0] * pad
+        flat = (x.reshape(20, *x.shape[2:])[rows] for x in (q, k, ids, sink))
+        q_, k_, ids_, sink_ = flat
+        q_, sink_, table_, position = copying.stepped(
+            cache, steps, q_, k_, ids_, sink_, steps.requests, None
+        )
+        p_copy, a_sink = copying.pointed(
+            q_, sink_, cache, table_, position, 64, None, length
+        )
+        p_copy, a_sink = copying.rows_of(p_copy, a_sink, 2)
+        last = torch.stack([logits[r, max(p for s, p in at if s == r)] for r in (0, 1)])
+        return copying.mixed(last, p_copy, a_sink, 63)
+
+    def check_rows(got: torch.Tensor, positions: tuple[int, int]) -> None:
+        for r, p in enumerate(positions):
+            finite = np.isfinite(want[r, p])
+            assert (np.isfinite(got[r].numpy()) == finite).all()
+            np.testing.assert_allclose(
+                got[r].numpy()[finite], want[r, p][finite], rtol=1e-5, atol=1e-5
+            )
+
+    graph = copying.Steps(slots[:3], table, 3, starts, lens)
+    point(graph, [(0, 0), (1, 0)])  # the capture's run, of no request
+    prompts = [(0, p) for p in range(4)] + [(1, p) for p in range(6)]
+    starts[:3] = torch.tensor([0, 4, 10])
+    lens[:2] = torch.tensor([4, 6])
+    slots[:10] = torch.tensor([slot(r, p) for r, p in prompts])
+    eager = copying.Steps(slots[:10], table[:2], 10, starts[:3], lens[:2])
+    check_rows(point(eager, prompts), (3, 5))
+    for step in range(4):
+        a, b = 4 + step, 6 + step
+        starts.copy_(torch.tensor([0, 1, 2, 2]))
+        lens.copy_(torch.tensor([a + 1, b + 1, 0]))
+        slots[:3] = torch.tensor([slot(0, a), slot(1, b), -1])
+        check_rows(point(graph, [(0, a), (1, b)]), (a, b))
+
+
+def test_rows_past_the_pointer_s_buffers_take_the_softmax_but_copy() -> None:
+    """vLLM's dummy sampler run asks compute_logits for more rows than max_num_seqs:
+    those rows mix no pointer, the head's softmax over every row but <copy>."""
+    p_copy, a_sink = torch.rand(4, 10), torch.rand(4)
+    rows, sinks = copying.rows_of(p_copy, a_sink, 3)
+    assert torch.equal(rows, p_copy[:3]) and torch.equal(sinks, a_sink[:3])
+    rows, sinks = copying.rows_of(p_copy, a_sink, 6)
+    assert rows.shape == (6, 10) and sinks.shape == (6,)
+    logits = torch.randn(6, 10)
+    got = copying.mixed(logits, rows, sinks, 9)
+    want = logits[:, :9].log_softmax(-1)
+    np.testing.assert_allclose(got[4:, :9].numpy(), want[4:].numpy(), rtol=1e-5)
+    assert torch.isneginf(got[:, 9]).all()
+
+
+def test_the_pointer_s_pytorch_path_reads_nothing_on_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What a CUDA graph cannot capture, a host read of a device tensor, raises
+    here: the op's PyTorch path and the logits' mixture take none, and padded
+    requests' rows past the step are clamped into it."""
+
+    def no(*args: Any) -> Any:
+        raise AssertionError("a host read of a device tensor")
+
+    cache = torch.zeros(4, 1, 4, copying.row_width(8))
+    rows = copying.encode(torch.randn(6, 8), torch.arange(6), torch.float32, None)
+    cache.view(-1, rows.shape[-1])[:6] = rows[:, 0]
+    table = torch.tensor([[0, 1], [2, 3], [0, 0]])  # a padded request last
+    last = copying.sampled(torch.tensor([3, 5, -1]), 6)
+    assert last.tolist() == [3, 5, 0]
+    for name in ("item", "tolist", "cpu", "nonzero", "__int__", "__bool__"):
+        monkeypatch.setattr(torch.Tensor, name, no)
+    q, sink = torch.randn(3, 8), torch.randn(3)
+    p_copy, a_sink = copying.pointed(
+        q, sink, cache, table, torch.tensor([3, 2, 0]), 10, None, 8
+    )
+    rows_, sinks = copying.rows_of(p_copy, a_sink, 5)
+    copying.mixed(torch.randn(5, 10), rows_, sinks, 9)
+    monkeypatch.undo()
+    assert torch.allclose(p_copy.sum(-1) + a_sink, torch.ones(3))
+    assert a_sink[2] == 1  # nothing before position 0
+
+
+def test_rows_no_step_wrote_point_inside_the_cache_and_the_vocabulary() -> None:
+    """vLLM's dummy and capture runs point padded requests at the null block, whose
+    rows hold anything, and at block-table entries of -1: the pointer reads inside
+    the cache and gives every token an index of the vocabulary."""
+    cache = torch.full((3, 1, 4, copying.row_width(8)), torch.nan)
+    cache[1, 0, :, 8:] = torch.tensor([-5.0, 1e30, 300.0, 0.0])
+    _, tokens = copying.decode(cache, 8, None)
+    assert ((tokens >= 0) & (tokens < 2**24)).all()
+    table = torch.tensor([[-1, 7], [1, 1]])
+    p_copy, a_sink = copying.pointed(
+        torch.randn(2, 8),
+        torch.randn(2),
+        cache,
+        table,
+        torch.tensor([8, 8]),
+        10,
+        None,
+        8,
+    )
+    assert p_copy.shape == (2, 10) and a_sink.shape == (2,)
 
 
 class RunnerState:

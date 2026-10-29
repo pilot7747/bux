@@ -368,6 +368,7 @@ _NEWER_LAYER_FIELDS = {
         "ffn_experts_per_token": None,
     },
     "mamba2": {"num_heads": None},
+    "head": {"pointer": None},
     "gqa": {
         "gate_head_bias": False,
         "power_scale": None,
