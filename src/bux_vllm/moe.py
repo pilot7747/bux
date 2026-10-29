@@ -11,7 +11,9 @@ parallelism each rank keeps every expert's share of the hidden units, as vLLM sp
 them, and the projections whole. With zero experts (``num_zero_experts``) the layer
 routes once, beside the fused MoE in the compiled graph: the zero experts' output
 adds each token times its zero picks' weights, and the fused MoE takes the routed
-experts' picks and weights as given (`bux_vllm.routing.given_logits`). The routed
+experts' picks and weights as given (`bux_vllm.routing.given_logits`), a zero
+pick as a phantom expert that its expert map skips (`bux_vllm.routing.phantom_map`),
+so that a token costs the GEMMs of its FFN experts alone. The routed
 experts, the shared experts and the latent's projections take the engine's
 quantization config
 (`bux_vllm.common.quantization`); the router, which the layer computes itself in
@@ -34,6 +36,7 @@ from .routing import (
     apart,
     expert_shards,
     given_logits,
+    phantom_map,
     pick_given,
     pick_rows,
     zero_split,
@@ -130,8 +133,9 @@ class MoE(Layer):
             if c["router_bias"]
             else None
         )
+        phantom = 1 if self.zero else 0  # the expert the zero experts' picks become
         self.experts = FusedMoEFactory(
-            num_experts=n,
+            num_experts=n + phantom,
             top_k=1 if apart_ else c["top_k"],
             hidden_size=latent,
             intermediate_size=expert["intermediate_size"],
@@ -145,6 +149,8 @@ class MoE(Layer):
             # vLLM's names of the shards, which a non-gated MoE has no up of
             ckpt_names=("gate_proj", "down_proj", "up_proj" if self.gated else None),
         )
+        if self.zero:
+            self._skip_phantom()
         self.shared = None
         if c["num_shared_experts"]:
             shared = c["shared_expert"] or expert
@@ -158,6 +164,23 @@ class MoE(Layer):
         )
         sinks = _sink_of(c) if c["shared_expert_sink"] else None
         self.register_buffer("sink_of", sinks, persistent=False)
+
+    def _skip_phantom(self) -> None:
+        """Give the fused MoE the expert map of `phantom_map`, as expert parallelism
+        gives it its own, so that its Triton kernels skip the zero experts' picks:
+        moe_align_block_size counts them to the phantom, whose blocks write zeros and
+        multiply nothing, or drops them (``ignore_invalid_experts``), and moe_sum
+        leaves them out.
+
+        Raises:
+            NotImplementedError: Under expert parallelism, whose own map the phantom
+                would need a place in.
+        """
+        routed = self.experts.routed_experts
+        if routed.use_ep:
+            raise NotImplementedError("moe: zero experts under expert parallelism")
+        # On the default device vLLM builds the model on, as the experts' own map.
+        routed.register_buffer("_expert_map", phantom_map(self.num_experts), False)
 
     def _routing(self, apart_: bool) -> dict:
         """How vLLM's fused MoE routes: by bux's rule (`Router`), by one-hot rows
@@ -198,6 +221,8 @@ class MoE(Layer):
         if bias and stem == "w2" and rank != 0:  # the ranks' outputs sum: one adds it
             shards = [(shard, torch.zeros_like(t)) for shard, t in shards]
         for shard, stacked in shards:
+            if self.zero:  # the phantom expert's, which nothing reads: zeros
+                stacked = torch.cat([stacked, torch.zeros_like(stacked[:1])])
             for e in range(stacked.shape[0]):
                 where = f"experts.{e}.{shard}.{'bias' if bias else 'weight'}"
                 # The parameter's loader: vLLM's online quantization wraps it
@@ -241,7 +266,8 @@ class MoE(Layer):
         else:
             weights, idx, _ = self.router.route(logits, self.top_k)
             zero, weights, idx = zero_split(z, weights, idx, self.num_experts)
-            y = apart(self.experts, self.expert_norm, z, weights, idx, self.num_experts)
+            width = self.num_experts + (1 if self.zero else 0)  # the phantom too
+            y = apart(self.experts, self.expert_norm, z, weights, idx, width)
             y = y + zero if self.zero else y
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
