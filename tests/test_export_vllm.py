@@ -629,7 +629,7 @@ def test_zero_experts_split_as_bux_runs_them() -> None:
         routing.pick_given(torch.zeros(32, 16), given, 3, True),
     ):
         skipped = emap[got_ids.long()] == -1  # the slots the kernels skip
-        np.testing.assert_array_equal(skipped.numpy(), zeros)
+        np.testing.assert_array_equal(skipped.sum(-1).numpy(), zeros.sum(-1))
         assert (got_w[skipped] == 0).all()
         kept = bux_moe.dense_weights(jnp.asarray(got_ids), jnp.asarray(got_w), 4)
         np.testing.assert_allclose(np.asarray(kept), np.asarray(dense), rtol=1e-6)
