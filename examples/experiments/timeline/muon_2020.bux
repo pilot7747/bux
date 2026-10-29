@@ -1,0 +1,11 @@
+# Muon on the 2020 baseline (baseline.bux: gpt3_2020.bux at every rung), its model
+# unchanged: does Muon's gain on the factorial's candidate (ideas_opt.bux's muon,
+# -2.2% at d512) hold on older architectures? A training option, not architecture.
+# Muon (Jordan et al., 2024) for the matrices in the blocks, at Moonlight's update
+# RMS of 0.2, so AdamW's learning rate suits it; AdamW at the baseline's 2e-3 for the
+# rest: the embedding, the head, the norms and the biases.
+use gpt3_2020
+use timeline_code
+use rungs
+
+optimizer = muon(lr=2e-3, weight_decay=0.1, adam=adamw(lr=2e-3, weight_decay=0.1))

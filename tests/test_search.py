@@ -76,6 +76,7 @@ def test_a_trial_takes_its_values_is_named_for_them_and_prints_back_the_same():
     assert again.id == run.id
     short = space.trial({"optimizer.lr": 3e-3}, steps=3)
     assert short.name.endswith("weight_decay=0.1, steps=3]") and short.train.steps == 3
+    assert short.axes == ("optimizer.lr", "optimizer.weight_decay", "steps")
 
 
 def test_a_choice_picks_any_value_or_block_and_names_its_trials_by_its_option():
@@ -114,6 +115,7 @@ def test_each_run_of_a_sweep_is_a_search_of_its_own():
     assert [s.run.name for s in found] == ["tune[mha]", "tune[mqa]"]
     trial = found[1].trial({"optimizer.lr": 2e-3})
     assert trial.name == "tune[mqa, optimizer.lr=2e-3]"
+    assert trial.axes == ("attn.num_kv_heads", "optimizer.lr")
 
 
 def test_a_macros_dimension_takes_one_value_at_every_call():
@@ -179,6 +181,22 @@ def test_an_objective_is_a_weighted_sum_of_metrics_and_prints_as_one():
 )
 def test_an_objective_reads_only_what_the_run_logs(objective, message):
     assert message in error(SOURCE + f"objective = {objective}\n")
+
+
+def test_an_objective_reads_an_eval_s_buckets_of_positions():
+    assert tcfg.buckets([2048, 8192, 10000]) == ["0", "2k", "8k", "10000"]
+    one = "eval = eval(data=synthetic, every=100, batches=1)"
+    source = SOURCE.replace(one, "eval = eval(data=synthetic, positions=[4, 2048])")
+    [run] = compile_runs(source + "objective = eval_loss_2k\n", filename="tune.bux")
+    assert run.train.objective is not None
+    assert run.train.objective.terms[0].metric == "eval_loss_2k"
+    listed = "they log eval_loss, eval_loss_0, eval_loss_2k, eval_loss_4"
+    assert listed in error(source + "objective = eval_loss_8k\n")
+    assert "bits per byte need a tokenizer" in error(
+        source + "objective = eval_bpb_4\n"
+    )
+    unordered = SOURCE.replace(one, "eval = eval(data=synthetic, positions=[8, 4])")
+    assert "positions go up, one after another: [8, 4]" in error(unordered)
 
 
 def test_the_editor_shows_a_dimension_and_an_objective_on_hover():

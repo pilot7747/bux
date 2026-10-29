@@ -1,0 +1,77 @@
+# Choices of the 2025-26 zoo that no axis settles, one change at a time from the 2021
+# reference, GPT-3's decoder with RoPE (gpt3_rope.bux). The zoo disagrees on how far
+# and how often its layers look: attention.bux's `swa` (3 layers of 4 see 512 keys)
+# is one point, and these arms move its window, its ratio, its sinks and its global
+# layers' positions, so compare them with `swa` as well as with the reference. The
+# others are the gate's form, a norm without statistics, and how much of a hybrid is
+# linear (mixers.bux's `kda` is KDA in 3 layers of 4). Arms: era, source, what it was
+# claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+layer(a) = [norm a] [norm ffn]
+lm(a)    = embed layer(a)^layers norm head(tied=true)
+local(w) = layer(attn(sliding_window_size=w))
+G        = block
+
+# The sparsest ratio of local to global layers in the zoo that the depth divides: 7:1
+# in the 8 layers of d512 (MiMo-V2.6), 5:1 in the 12 of d768 (Inkling, Beam 1.0).
+sparse = d512: 7 | d768: 5 | d1024: 7 | d1280: 9
+
+# DyT in place of every norm after the embedding e, alpha from a.
+dyt_lm(e, a) = e ([dyt(alpha_init=a) attn] [dyt(alpha_init=a) ffn])^layers
+               dyt(alpha_init=a) head(tied=true)
+
+# mixers.bux's KDA: query and key heads of 128, as wide together as the stream, twice
+# as many value heads, the decay bounded at -5 as Kimi K3's.
+K = layer(kda(num_heads=d_model // 128, num_v_heads=d_model // 64, head_dim=128,
+              gate_lower_bound=-5))
+
+model = # 2026 Trinity, Beam 1.0, Muse Spark, Command A+, North Mini Code: swa's local
+        # layers, its global layers without positions; long context
+        swa_nope:   embed (local(512)^3 layer(attn(rope=none)))^(layers // 4)
+                    norm head(tied=true)
+      # 2025 Qwen3-Next, 2026 Qwen3.8, MiMo-V2.6, MiniMax-M3: swa's global layers
+      # rotate a quarter of the dims at base 10M, which YaRN extends; long context
+      | swa_prope:  embed (local(512)^3
+                           layer(attn(rope=rope(base=10000000, fraction=0.25))))^(layers // 4)
+                    norm head(tied=true)
+      # 2025 gpt-oss, 2026 MiMo-V2.6: swa with a learned sink logit per head in every
+      # layer; long context, stability of the local layers
+      | swa_sinks:  embed (layer(attn(sliding_window_size=512, sinks=true))^3
+                           layer(attn(sinks=true)))^(layers // 4)
+                    norm head(tied=true)
+      # 2025 gpt-oss, 2026 MiMo-V2.6, DeepSeek-V4.1's window: swa with a window of
+      # 128; KV cache, throughput
+      | swa_128:    embed (local(128)^3 G)^(layers // 4) norm head(tied=true)
+      # 2026 Muse Spark: swa with a window of 2048, the rows' length, so it differs
+      # from the reference in the 16k phase alone; long context at a bounded cache
+      | swa_2048:   embed (local(2048)^3 G)^(layers // 4) norm head(tied=true)
+      # 2024 Gemma 2, 2025 gpt-oss: swa in every other layer; quality at a bounded cache
+      | swa_1to1:   embed (local(512) G)^(layers // 2) norm head(tied=true)
+      # 2025 Gemma 3, 2026 Inkling, Beam 1.0, MiMo-V2.6: swa with one global layer in
+      # 8 at d512, in 6 at d768; KV cache, throughput
+      | swa_sparse: embed (local(512)^sparse G)^(layers // (sparse + 1))
+                    norm head(tied=true)
+      # 2026 Laguna XS 2.1: a softplus gate, one value per head, on every head's
+      # output; attention.bux's `gated` has one per channel, by a sigmoid; stability
+      | gate_head:  lm(attn(gated=true, gate_per_head=true, gate_activation=softplus))
+      # 2025 Zhu et al. (DyT): tanh(alpha x) with a gain and a bias in place of every
+      # LayerNorm, no statistics; throughput
+      | dyt:        embed ([dyt attn] [dyt ffn])^layers dyt head(tied=true)
+      # dyt with alpha starting at 0.05, 0.1 and 0.2: the paper's LLMs take a smaller
+      # one the wider they are; does a smaller one train?
+      | dyt_a005:   dyt_lm(embed, 0.05)
+      | dyt_a01:    dyt_lm(embed, 0.1)
+      | dyt_a02:    dyt_lm(embed, 0.2)
+      # dyt with the embedding scaled by sqrt(d_model), so that the tanh reads inputs
+      # of order 1 where a norm would (embeddings start at 0.02); alpha from 0.5 and 0.2
+      | dyt_emb:    dyt_lm(embed(scale_by_sqrt_dim=true), 0.5)
+      | dyt_emb_a02: dyt_lm(embed(scale_by_sqrt_dim=true), 0.2)
+      # 2024 Gemma 2's ratio, 2025 Kimi Linear's 1:1 ablation: KDA in every other
+      # layer; quality, the hybrid's cost of attention
+      | kda_1to1:   embed (K G)^(layers // 2) norm head(tied=true)
+      # 2024 Jamba, 2025 MiniMax-01, Nemotron-H: KDA in all but one layer in 8 at
+      # d512, in 6 at d768; long-context cost
+      | kda_sparse: embed (K^sparse G)^(layers // (sparse + 1)) norm head(tied=true)

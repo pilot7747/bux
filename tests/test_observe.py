@@ -327,11 +327,7 @@ def fake_wandb(monkeypatch) -> types.SimpleNamespace:
         calls.init.append(kwargs)
         return Run()
 
-    ids = itertools.count()
-
     class Wandb(types.ModuleType):
-        util = types.SimpleNamespace(generate_id=lambda: f"id{next(ids)}")
-
         @staticmethod
         def init(**kwargs):
             return init(**kwargs)
@@ -367,7 +363,32 @@ def test_wandb_logs_a_run_s_metrics_and_resumes_the_w_b_run_it_started(
     assert calls.logged[1][1]["act/hist/attn.00"][0] == "histogram"
     Wandb(WandbConfig(), run, tmp_path, start=10)  # resumes the W&B run it started
     Wandb(WandbConfig(), run, tmp_path, start=0)  # a fresh run starts its own
-    assert [c["id"] for c in calls.init] == ["id0", "id0", "id1"]
+    ids = [c["id"] for c in calls.init]
+    assert ids[0] == ids[1] != ids[2] and all(len(i) == 8 for i in ids)
+
+
+def test_wandb_names_each_axis_counts_parameters_and_logs_the_objective(
+    tmp_path, monkeypatch
+):
+    calls = fake_wandb(monkeypatch)
+    sweep = source(
+        MOE,
+        variant="a: 1 | b: 2",
+        seed="variant",
+        optimizer="adamw(lr=1e-3 | 3e-3)",
+        eval='[eval(name="code", data=synthetic), eval(name="repo", data=synthetic)]',
+        objective="0.5 * code_loss + 0.25 * repo_loss + 1",
+    )
+    run = compile_runs(sweep, filename="pos.bux")[-1]
+    sink = Wandb(WandbConfig(), run, tmp_path, start=0)
+    config = calls.init[0]["config"]
+    assert config["axes"] == {"variant": "b", "optimizer.lr": "3e-3"}
+    # Two MoEs of 4 experts, each a token takes 2 of: half of 2 × (4096 + 2048) idle.
+    assert config["params"] - config["active_params"] == 6144
+    for scalars in ({"loss": 3.0}, {"code_loss": 2.0}, {"repo_loss": 4.0}, {"loss": 1}):
+        sink.write(1, scalars)
+    logged = [data.get("objective") for _, data in calls.logged]
+    assert logged == [None, None, 0.5 * 2 + 0.25 * 4 + 1, None]
 
 
 def events(folder) -> list:

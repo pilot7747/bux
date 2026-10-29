@@ -109,7 +109,7 @@ from bux.architecture.layers.embedding import Embedding, Head, NextN, ValueEmbed
 from bux.architecture.layers.engram import Engram
 from bux.architecture.layers.mlp import MLP
 from bux.architecture.layers.norm import DyT, Norm
-from bux.architecture.model import Model, num_params
+from bux.architecture.model import Model, active_params, num_params
 from bux.architecture.recurrent.linear_attention import (
     DeltaNet,
     GatedDeltaNet,
@@ -187,6 +187,7 @@ __all__ = [
     "SoftmaxAttention",
     "Taps",
     "ValueEmbedding",
+    "active_params",
     "build_node",
     "num_params",
     "positions",

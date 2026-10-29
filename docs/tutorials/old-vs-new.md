@@ -23,10 +23,12 @@ whole repositories. Getting there takes seven steps:
 6. Fit a scaling law to each ladder and extrapolate to the two targets.
 7. Read the results and their caveats.
 
-This is the advanced tutorial. It runs on a node of 8 GPUs, not a laptop, and puts
-together pieces that the other tutorials introduce one at a time: sweeps and labels,
-searches, curricula, evals, exports and vLLM. All of it takes about 15 hours on one
-node ([Time and hardware](#time-and-hardware)). Every number here was measured as
+This is the first of two advanced tutorials, and
+[2020 to 2026, one change at a time](timeline.md) builds on it. This one runs on a
+node of 8 GPUs, not a laptop, and puts together pieces that the earlier tutorials
+introduce one at a time: sweeps and labels, searches, curricula, evals, exports and
+vLLM. All of it takes about 15 hours on one node
+([Time and hardware](#time-and-hardware)). Every number here was measured as
 written, on nodes of 8 NVIDIA B300s, on 2026-10-26 and 2026-10-27, with the 2026
 family's Gated DeltaNet making its decays in bfloat16. bux makes them in float32,
 so a rerun of the 2026 family computes slightly differently.
@@ -722,8 +724,9 @@ those hours, it takes under 5, with a fit of three 2026 rungs.
 
 ## Next steps
 
-- Sweep one change of the 2026 family at a time on its ladder: the experiment the
-  caveats call for, with the same files.
+- [2020 to 2026, one change at a time](timeline.md): the experiment the caveats call
+  for. Measure each change to the decoder since GPT-3 alone, on this tutorial's data
+  and at its serving cost, then stack the changes into each year's milestones.
 - [Searching hyperparameters](../training/searching.md): dimensions, methods and
   halving.
 - [Exporting models](../export/index.md) and [Serving in vLLM](../export/vllm.md):

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jaxtyping import Array, Int
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import kernels
@@ -140,16 +140,17 @@ def test_mtp_engram_and_taps_run(residual, body):
         "hc(expansion=4)",
         "hc(dynamic=false)",
         "hc(single_pass=true)",
-        "mhc",
-        "mhc(dynamic=false)",
-        "mhc(single_pass=true)",
+        "mhc(post_bias=0)",
+        "mhc(dynamic=false, post_bias=0)",
+        "mhc(single_pass=true, post_bias=0)",
         "attnres(block_size=3)",
         "vpgate",
     ],
 )
 def test_at_init_an_algebra_is_the_pre_norm_residual(residual):
-    """hc as the paper initializes it, and mhc, attnres and vpgate as they are here,
-    start as the pre-norm residual with the same weights (they take no random init).
+    """hc as the paper initializes it, mhc writing to every stream alike, and attnres
+    and vpgate as they are here, start as the pre-norm residual with the same weights
+    (they take no random init).
     Up to the norms' eps, which weighs on the copies of a widened stream apart: it
     shows on embeddings as small as the default init's."""
     body = "norm.eps = 1e-12\nmodel = embed ([norm attn] [norm ffn])^3 norm head"
@@ -171,6 +172,58 @@ def test_hc_reads_stream_k_mod_n_and_keeps_and_writes_all_of_them():
     assert (merge.reader.static_alpha[...] == 1).all()  # the paper's sum of the streams
 
 
+def test_mhc_starts_the_k_th_branch_on_stream_k_mod_n():
+    blocks = "[norm attn] [norm ffn] [norm attn] [norm ffn]"
+    m = model("mhc(expansion=3, res_bias=-6)", f"model = embed {blocks} norm head")
+    _, *branches, merge, _, _ = top(m)
+    for k, branch in enumerate(branches):
+        assert isinstance(branch, ManifoldHyperConnections)
+        favored = 2 * jax.nn.one_hot(k % 3, 3) - 1  # mHC-lite's +-1
+        bias = branch.bias[...]
+        assert (bias[:3] == favored).all() and (bias[3:6] == favored).all()
+        assert (bias[6:].reshape(3, 3) == -6 * (1 - jnp.eye(3))).all()
+    assert isinstance(merge, Merge)
+    assert isinstance(merge.reader, ManifoldHyperConnections)
+    assert jnp.allclose(jax.nn.sigmoid(merge.reader.bias[...]), 1 / 3)  # the mean
+
+
+def next_token_loss(m: Model, t: Int[Array, "b t"]) -> Float[Array, ""]:
+    logp = jax.nn.log_softmax(m(t)[:, :-1])
+    return -jnp.take_along_axis(logp, t[:, 1:, None], -1).mean()
+
+
+def bias_grads(m: Model) -> list[Float[Array, " k"]]:
+    """The next-token loss's gradients by each mhc branch's static logits b."""
+    grads = nnx.grad(next_token_loss)(m, tokens())
+    graphdef, _, rest = nnx.split(m, nnx.Param, ...)
+    tree = top(nnx.merge(graphdef, grads, rest))
+    kept = [b for b in tree if isinstance(b, ManifoldHyperConnections) and b.body]
+    return [b.bias[...] for b in kept]
+
+
+@pytest.mark.parametrize(
+    ("residual", "apart"),
+    [
+        ("mhc", True),
+        ("mhc(post_bias=0)", True),
+        ("mhc(pre_bias=0, post_bias=0)", False),
+    ],
+)
+def test_mhc_streams_part_unless_their_biases_start_alike(residual, apart):
+    """Streams apart from the start, or set apart by the first gradients as under
+    post_bias=0, train apart: the writes' gradients differ across them. Streams that
+    start alike stay so for good: every gradient treats them alike, and the mixing
+    gets none, since it sums copies of one stream to that stream."""
+    m = model(residual, "model = embed [norm attn] [norm ffn] [norm attn] norm head")
+    first, second, _ = bias_grads(m)
+    post = first[4:8]
+    spread = jnp.abs(post - post.mean()).max() / jnp.abs(post).max()
+    assert bool(spread > 1e-2) == apart
+    mixing = jnp.linalg.norm(second[8:]) / jnp.linalg.norm(second[4:8])
+    assert bool(mixing > 1e-4) == (residual == "mhc")  # the streams differ at once
+    assert apart or bool(mixing < 1e-6)
+
+
 def test_mhc_mixes_the_streams_through_doubly_stochastic_matrices():
     logits = jax.random.normal(jax.random.key(0), (5, 4, 4))
     res = sinkhorn(logits, 20)
@@ -181,7 +234,7 @@ def test_mhc_mixes_the_streams_through_doubly_stochastic_matrices():
     arch = compile(PRELUDE + "residual = mhc(expansion=4)\nmodel = embed [attn] head")
     c = arch.residual
     assert isinstance(c, cfg.HyperConnectionsConfig)
-    branch = ManifoldHyperConnections(c, D, Zero())
+    branch = ManifoldHyperConnections(c, D, 0, Zero())
     randomize(branch, scale=0.1)
     assert branch.scale is not None
     branch.scale[...] = jnp.ones(3)  # logits of about unit size
@@ -205,7 +258,7 @@ def test_single_pass_mhc_is_deepseek_v4_1s():
     with stream 0 alone), and the head reads with the last pre."""
     c = cfg.HyperConnectionsConfig(type="mhc", single_pass=True, norm_eps=1e-20)
     bodies = [Tanh(k) for k in range(3)]
-    branches = [ManifoldHyperConnections(c, D, body) for body in bodies]
+    branches = [ManifoldHyperConnections(c, D, k, b) for k, b in enumerate(bodies)]
     for k, branch in enumerate(branches):
         randomize(branch, seed=k, scale=0.3)
     x = 1e-3 * jax.random.normal(jax.random.key(9), (2, 8, 4, D))  # small: eps shows
@@ -235,7 +288,7 @@ def test_a_single_pass_stream_stays_in_its_dtype():
     """The first branch reads stream 0 alone in the stream's dtype: a float32 read
     would turn every branch after it to float32 under bfloat16 parameters."""
     c = cfg.HyperConnectionsConfig(type="mhc", single_pass=True)
-    branches = [ManifoldHyperConnections(c, D, Zero()) for _ in range(2)]
+    branches = [ManifoldHyperConnections(c, D, k, Zero()) for k in range(2)]
     y, taps = jnp.ones((2, 8, 4, D), jnp.bfloat16), Taps()
     for branch in branches:
         y = cast(branch, jnp.bfloat16)(y, taps)  # as the trainer casts a model
@@ -244,7 +297,7 @@ def test_a_single_pass_stream_stays_in_its_dtype():
 
 def test_mhc_without_dynamic_has_static_coefficients():
     c = cfg.HyperConnectionsConfig(type="mhc", dynamic=False)
-    branch = ManifoldHyperConnections(c, D, Zero())
+    branch = ManifoldHyperConnections(c, D, 0, Zero())
     assert branch.proj is None and branch.scale is None
     randomize(branch)
     res = sinkhorn(branch.bias[...][8:].reshape(4, 4), 20)

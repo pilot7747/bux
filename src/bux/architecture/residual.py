@@ -213,6 +213,27 @@ class HyperConnections(nnx.Module):
         return shard_stream(kept + beta[..., None] * y[:, :, None])
 
 
+def _favoring(n: int, index: int, bias: float) -> Float[Array, " n"]:
+    """Return logits of `bias` at stream ``index mod n`` and of ``-bias`` elsewhere."""
+    return bias * (2 * jax.nn.one_hot(index % n, n, dtype=jnp.float32) - 1)
+
+
+def _mean_read(n: int) -> Float[Array, " n"]:
+    """Return the read logits whose sigmoids are 1 / n: the mean of the n streams.
+    Float32, as every parameter of mhc: a weakly typed one would turn strong at its
+    first update, and the step compile again."""
+    return jnp.full(n, -math.log(n - 1), jnp.float32)
+
+
+def _mhc_bias(config: cfg.HyperConnectionsConfig, index: int) -> Float[Array, " k"]:
+    """Return the k-th branch's static mhc logits, b_pre, b_post, then b_res row by
+    row: `_favoring` its stream, and the mixing near the identity."""
+    n = config.expansion
+    res = config.res_bias * (1 - jnp.eye(n, dtype=jnp.float32))
+    pre, post = (_favoring(n, index, b) for b in (config.pre_bias, config.post_bias))
+    return jnp.concatenate([pre, post, res.reshape(-1)])
+
+
 class ManifoldHyperConnections(nnx.Module):
     """Manifold-constrained hyper-connections around one branch f (DeepSeek mHC, 2025),
     ``mhc``, as DeepSeek-V4's code computes them. With r the n streams x flattened
@@ -222,12 +243,16 @@ class ManifoldHyperConnections(nnx.Module):
     ``a_res r W_res + b_res``.
 
     The projections W start at 0, and the gates a at 0.01, as the paper's do. The paper
-    and DeepSeek's code give no init for the biases b, so these start it as a pre-norm
-    residual, as hc starts: reading the mean of the streams (pre = 1/n), adding f to
-    each (post = 1) and keeping them (b_res = -8 off the diagonal, so that res is I to
-    within e^-8, as arXiv 2605.21724 starts its mHC baselines). Without f it is the
-    read alone, as DeepSeek-V4's head reads the streams: ``merge``. Without `dynamic`
-    there are no W and a, and the coefficients are the biases' alone.
+    and DeepSeek's code give no init for the biases b, so these start them as mHC-lite
+    does (arXiv 2601.05732): the k-th branch favors stream k mod n, as hc's reads it,
+    with b_pre and b_post at `pre_bias` there and at minus it elsewhere, and b_res is
+    `res_bias` off the diagonal and 0 on it, so that res starts as I to within
+    e^res_bias. Biases alike on every stream would keep the copies alike for good:
+    every gradient would treat them alike, and res, which mixes copies of one stream
+    into that stream whatever its coefficients, would get none. Without f it is the
+    read alone, as DeepSeek-V4's head reads the streams, of their mean at first:
+    ``merge``. Without `dynamic` there are no W and a, and the coefficients are the
+    biases' alone.
 
     With `single_pass`, f reads with the pre the branch before computed, or stream 0
     alone in the first branch, as DeepSeek-V4.1 reads
@@ -238,20 +263,21 @@ class ManifoldHyperConnections(nnx.Module):
     Args:
         config: The algebra's settings.
         d: The model's width, of each stream.
+        index: Which branch outside any other this is, from 0.
         body: The branch f; None for the read alone.
     """
 
     def __init__(
-        self, config: cfg.HyperConnectionsConfig, d: int, body: nnx.Module | None = None
+        self,
+        config: cfg.HyperConnectionsConfig,
+        d: int,
+        index: int,
+        body: nnx.Module | None = None,
     ):
         n, write = config.expansion, body is not None
         self.body, self.single_pass = body, config.single_pass
         self.iters, self.norm_eps = config.sinkhorn_iters, config.norm_eps
-        # sigmoid(b_pre) = 1 / n; float32, as every parameter here: a weakly typed one
-        # would turn strong at its first update, and the step compile again.
-        pre = jnp.full(n, -math.log(max(n - 1, 1)), jnp.float32)
-        res = -8.0 * (1 - jnp.eye(n))
-        bias = jnp.concatenate([pre, jnp.zeros(n), res.reshape(-1)]) if write else pre
+        bias = _mhc_bias(config, index) if write else _mean_read(n)
         proj = jnp.zeros((n * d, bias.shape[0]))
         scale = jnp.full(3 if write else 1, 0.01, jnp.float32)
         self.proj = nnx.Param(proj) if config.dynamic else None  # W
@@ -625,7 +651,7 @@ def _algebra(
         case cfg.HyperConnectionsConfig(type="hc"):
             return HyperConnections(residual, d, index, body)
         case cfg.HyperConnectionsConfig():
-            return ManifoldHyperConnections(residual, d, body)
+            return ManifoldHyperConnections(residual, d, index, body)
         case cfg.GatedResidualConfig():
             return GatedResidual(residual, d, ctx.rngs, body)
         case cfg.AttentionResidualConfig():

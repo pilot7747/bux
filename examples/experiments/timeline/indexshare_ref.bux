@@ -1,0 +1,28 @@
+# Index sharing (GLM-5.2's IndexShare, after IndexCache) where every attention layer is
+# sparse, as GLM-5.2's are: attention.bux's dsa on the 2021 reference (GPT-3's decoder
+# with RoPE and multi-head attention), where only every fourth layer runs the indexer
+# and the three after it attend to its picks, with no indexer of their own. Everything
+# else is attention[dsa]'s, so each arm pairs with it by seed; indexshare.bux shares
+# among the candidate's global layers, a layer in four.
+# Arms: era, source, what it was claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+dsa_ix = indexer(num_heads=4, head_dim=64, top_k=2048)  # attention.bux's dsa
+
+# A layer that runs the indexer ix and exports its picks, one that reuses them, and the
+# group's last, which pops them.
+F(ix) = [norm attn(indexer=ix, index=@topk)] [norm ffn]
+S     = [norm attn(index=$topk)] [norm ffn]
+E     = [norm attn(index=$topk!)] [norm ffn]
+
+shared4(ix) = embed (F(ix) S S E)^(layers // 4) norm head(tied=true)
+
+model = # 2026 GLM-5.2, GLM-5.3 (IndexShare; IndexCache, Bai et al.): one layer in four
+        # runs the indexer, the next three reuse its picks; long-context cost
+        ref_is4:  shared4(dsa_ix)
+      # 2026 IndexCache (Bai et al.), training-aware: each layer that reads the picks
+      # also distills the indexer towards its own attention over them
+      # (loss_over=served); long-context quality
+      | ref_is4x: shared4(dsa_ix(loss_over=served))

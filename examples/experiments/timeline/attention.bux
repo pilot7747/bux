@@ -1,0 +1,41 @@
+# Attention, one change at a time from the 2021 reference, GPT-3's decoder with RoPE
+# (gpt3_rope.bux). Its attention is multi-head: as many key and value heads as query
+# heads of 64, with biases. Every arm keeps RoPE. Arms: era, source, what it was
+# claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+lm(a) = embed ([norm a] [norm ffn])^layers norm head(tied=true)
+L = [norm attn(sliding_window_size=512)] [norm ffn]
+G = block
+
+# MLA's keys and values come from a 256-wide latent (4 heads' worth, as DeepSeek-V2's),
+# its queries at full rank (as V2-Lite's); 32 shared dims rotated.
+latent = mla(num_heads=d_model // 64, kv_lora_rank=256, qk_nope_head_dim=64,
+             qk_rope_head_dim=32, v_head_dim=64, rope=rope())
+
+model = base:    model
+      # 2023 Llama 2, 2024 Llama 3, Mistral: heads of 128, half as many; throughput
+      | head128: lm(attn(num_heads=d_model // 128, num_kv_heads=d_model // 128))
+      # 2023 Ainslie et al. (GQA), Llama 2 70B, Llama 3: a key and value head for every
+      # 4 query heads; KV cache
+      | gqa4:    lm(attn(num_kv_heads=d_model // 256))
+      # 2019 Shazeer (MQA), 2022 PaLM: one key and value head; KV cache
+      | mqa:     lm(attn(num_kv_heads=1))
+      # 2024 DeepSeek-V2 (MLA): keys and values from a latent; KV cache
+      | mla:     lm(latent)
+      # 2024 Gemma 2, 2025 Gemma 3, gpt-oss, 2026 Mellum2, Laguna: 3 layers of 4 see
+      # 512 keys; KV cache, throughput
+      | swa:     embed "LLLG"^(layers // 4) norm head(tied=true)
+      # 2025 Qiu et al., Qwen3-Next, 2026 Kimi K3, Trinity: a sigmoid gate on every
+      # head's output; stability, no attention sink
+      | gated:   lm(attn(gated=true))
+      # 2023 Xiao et al. (StreamingLLM), 2025 gpt-oss, 2026 MiMo-V2.6: a learned sink
+      # logit per head; long context
+      | sinks:   lm(attn(sinks=true))
+      # 2026 Inkling: a causal conv of 4 taps on the keys and values; quality
+      | kvconv:  lm(attn(kv_conv_size=4))
+      # 2025 DeepSeek-V3.2 (DSA): an indexer keeps each query's 2048 best keys, so it is
+      # dense in rows of 2k and sparse at 16k; long-context cost
+      | dsa:     lm(attn(indexer=indexer(num_heads=4, head_dim=64, top_k=2048)))

@@ -1,0 +1,29 @@
+# The CPLM copy pointer (newlayers_cplm.bux's nl_cplm) and GatedNorm (ideas.bux's
+# gnorm) together on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv).
+# They are the two changes whose gains held past d512: gnorm's -0.71% kept -0.49% at
+# d768, while stack3.bux's other winners shrank or reversed. Does CPLM's -4.1% at d512
+# add to it? The MTP module's call of the shared head keeps its plain softmax, and its
+# layer keeps the hybrid's norm, as each change's own arm did.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# 2026 modded-nanogpt PR 379 (CPLM): a <copy> row of the head, whose mass goes to a
+# pointer over the document's earlier final hidden states.
+shared fr_out = head(pointer=copy_pointer())
+
+# 2026 Qwen (GatedNorm, arXiv 2601.22966): every branch's norm times a gate of rank 16
+# on its own output.
+gated_norm = fr_norm (_ * (linear(features=16) swish linear(features=d_model) sigmoid))
+gn_layer(mixer, ffn=fr_experts) = [gated_norm mixer] [gated_norm ffn]
+
+g_k   = fr_global(kv_conv_size=4)
+model = embed
+        gn_layer(hy_delta, fr_dense) gn_layer(hy_delta)^2 gn_layer(g_k(v=@v1))
+        (gn_layer(hy_delta)^3 gn_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan).
+optimizer.lr = 2e-3

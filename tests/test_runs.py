@@ -14,6 +14,9 @@ from bux.train import config as tcfg
 
 ROOT = Path(__file__).parent.parent
 EXPERIMENTS = sorted(ROOT.joinpath("examples", "experiments").rglob("*.bux"))
+#: Files that compile only where others use them, after a model: the timeline's
+#: rungs set d_model, so alone they are a model file without a model.
+PARTS = {"rungs"}
 
 ARCH = """
 d_model = 16
@@ -607,6 +610,20 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
     assert run_of(None).id == run_of(before).id == old != run_of(after).id
 
 
+def test_hc_keeps_its_ids_and_mhc_gets_new_ones_with_its_biases():
+    """mhc's streams started alike before its biases could be set, at no value of
+    theirs; hc has none."""
+
+    def id_of(residual: str) -> str:
+        [run] = runs(LECUN + f"residual = {residual}\n" + ARCH + TRAIN)
+        return run.id
+
+    assert id_of("hc(expansion=4)") == "3abf98537b"  # the ids before the biases
+    assert id_of("hc(expansion=2, dynamic=false)") == "9201c69cf2"
+    assert id_of("mhc(expansion=4)") not in ("66b96516db", id_of("mhc(pre_bias=0.5)"))
+    assert id_of("mhc(res_bias=-8)") == id_of("mhc") != id_of("mhc(res_bias=-4)")
+
+
 def test_strings_that_name_a_setting_print_quoted():
     """A bare `data` would be the run's data, not the mesh axis."""
     [run] = runs(RUN + 'layout.batch = ["data", "expert"]')
@@ -615,11 +632,13 @@ def test_strings_that_name_a_setting_print_quoted():
     assert again.train == run.train
 
 
-@pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)
+@pytest.mark.parametrize(
+    "path", [p for p in EXPERIMENTS if p.stem not in PARTS], ids=lambda p: p.stem
+)
 def test_experiments_compile_and_print_back_to_the_same_runs(path):
     report = check(path.read_text(), filename=str(path))
     assert report.errors == []
-    if report.arch is None:  # a recipe: settings without a model
+    if report.run is None:  # a recipe, or an architecture that others train
         return
     for run in compile_runs(path.read_text(), filename=str(path)):
         [again] = compile_runs(run_to_source(run))

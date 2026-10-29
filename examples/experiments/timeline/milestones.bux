@@ -1,0 +1,24 @@
+# The milestone families over the rungs, one run for each family at each width: what a
+# year's architecture predicts at the same data, with the timeline's recipe. Each
+# family is its own file, m2020_gpt3.bux to m2026_hybrid.bux, with names of its own, so
+# that one file sweeps them all. The mixtures of experts go through as much MLP a token
+# as the dense families (see each file); their experts' state is sharded at the wider
+# rungs. To train one family alone: bux launch milestones.bux --only m2022_palm.
+use m2020_gpt3
+use m2021_neox
+use m2022_palm
+use m2023_llama2
+use m2024_llama3
+use m2024_dsv3
+use m2025_qwen3next
+use m2026_frontier
+use m2026_hybrid
+use timeline_code
+use rungs
+
+model = m2020_gpt3: gpt3 | m2021_neox: neox | m2022_palm: palm | m2023_llama2: llama2
+      | m2024_llama3: llama3 | m2024_dsv3: dsv3 | m2025_qwen3next: qwen3next
+      | m2026_frontier: frontier | m2026_hybrid: frontier_hybrid
+
+mesh = d512: mesh(data=1) | d768: mesh(data=1)
+     | d1024: mesh(data=1, fsdp=2) | d1280: mesh(data=1, fsdp=4)

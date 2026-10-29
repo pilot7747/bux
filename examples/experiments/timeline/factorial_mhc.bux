@@ -1,0 +1,6 @@
+# The factorial's off-design arm r1v1k1f0p0s0, hc with V and K on the late-2026
+# hybrid (factorial.bux), with mhc in place of hc.
+use factorial
+
+model    = vres(g_k, fr_experts)
+residual = mhc(expansion=4)

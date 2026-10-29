@@ -1,0 +1,19 @@
+# stack5's one dense layer moved to the end (stack5.bux: the factorial's candidate with
+# the CPLM copy pointer and GatedNorm): stack5_d0.bux, its first layer routed, with the
+# last layer's FFN the dense SwiGLU, as dense_last.bux moves the candidate's. A probe,
+# from no model: does the gain of a dense last layer hold beside the pointer and
+# GatedNorm? The MTP module keeps its layer of experts. Everything else is stack5's, so
+# it pairs with stack5, stack5_d0 and the candidate by seed.
+use stack5
+
+# The groups of four after the first, layers // 4 - 1 of them, the last with the dense
+# FFN. A repeat cannot run 0 times, as the others would at d512: each rung has its own.
+group = gn_layer(hy_delta)^3 gn_layer(g_k(v=$v1))
+last  = gn_layer(hy_delta)^3 gn_layer(g_k(v=$v1), fr_dense)
+tail  = d512: last | d768: group last | d1024: group^2 last | d1280: group^3 last
+
+stack5_dl = embed
+            gn_layer(hy_delta) gn_layer(hy_delta)^2 gn_layer(g_k(v=@v1))
+            tail
+            fr_norm @h fr_out hy_mtp
+model     = stack5_dl

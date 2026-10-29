@@ -23,11 +23,12 @@ reference and what the editor shows on hover (`bux.lang.reference`).
 
 import itertools
 import math
+from collections.abc import Sequence
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
-from bux.config import Config
+from bux.config import Config, RoPEScalingConfig
 
 Positive = Annotated[int, Field(gt=0)]
 Fraction = Annotated[float, Field(ge=0, le=1)]
@@ -521,9 +522,9 @@ def warmup_steps(c: ScheduleConfig, steps: int) -> int:
 
 # --- Curriculum and ramps ---------------------------------------------------------------
 # What a run reads can change as it trains: each phase of a `curriculum` takes rows of
-# another `seq_len`, another `batch` or other `data` from a step on, and a `batch_ramp`
-# grows the batch over the first steps. The steps compile again at every new shape of
-# batch (bux.train.curriculum).
+# another `seq_len`, another `batch` or other `data` from a step on, and its full
+# attention another RoPE; a `batch_ramp` grows the batch over the first steps. The
+# steps compile again at every new shape of batch and RoPE (bux.train.curriculum).
 
 # A step, or a share of the steps below 1, rounded to a step.
 At = Annotated[int, Field(gt=0)] | Annotated[float, Field(gt=0, lt=1)]
@@ -538,7 +539,14 @@ class PhaseConfig(Config):
     A source goes on, from one phase to the next, from the row it stopped at, where
     it is read at the same `seq_len`; at another, it is a dataset of its own, which
     starts from its first row. An eval reads rows of the run's own `seq_len` and
-    `batch`, whichever phase it is in."""
+    `batch`, whichever phase it is in.
+
+    `rope_scaling` and `rope_base` extend the context as DeepSeek-V3 and Qwen do:
+    from the phase's first step on, every attention layer that rotates and has no
+    `sliding_window_size` takes them in place of its own, as does its indexer; so do
+    the evals made from that step on, and an export of a checkpoint from then.
+    ``phase(at=0.9, seq_len=16384, rope_scaling=yarn(factor=8, original_max_len=2048))``
+    trains the last tenth at 16k tokens with YaRN."""
 
     type: Literal["phase"] = "phase"
     at: At  # the step it starts at, or a share of the steps: 0.9 starts the last tenth
@@ -546,6 +554,11 @@ class PhaseConfig(Config):
     seq_len: Annotated[int, Field(ge=2)] | None = None
     batch: Positive | None = None  # rows per step; none: as before
     data: DataConfig | None = None  # a source or a mixture; none: as before
+    # The RoPE scaling of full-attention layers (yarn, pi, llama3); none: as before.
+    rope_scaling: RoPEScalingConfig | None = None
+    # The RoPE base of full-attention layers, raised for long context (Llama 3's
+    # ABF); none: as before.
+    rope_base: Annotated[float, Field(gt=0)] | None = None
 
     def start(self, steps: int) -> int:
         """Return the step it starts at, in a run of `steps`."""
@@ -612,6 +625,19 @@ class LossConfig(Config):
     prefix: PrefixConfig | None = None
 
 
+def _ascending(v: tuple[int, ...]) -> tuple[int, ...]:
+    """Check positions go up."""
+    if any(a >= b for a, b in itertools.pairwise(v)):
+        raise ValueError(f"positions go up, one after another: {list(v)}")
+    return v
+
+
+# Where buckets of targets by position start: a position, or a list of them in order.
+Positions = Annotated[
+    tuple[Positive, ...], BeforeValidator(_listed), AfterValidator(_ascending)
+]
+
+
 class EvalConfig(Config):
     """Held-out loss every `every` steps and after the last, over the same `batches`
     batches of `data` each time: the first head's mean cross-entropy over their
@@ -631,7 +657,14 @@ class EvalConfig(Config):
 
     Held-out batches are a stream of their own seed, not other documents: hold
     documents out of training by their hash, as `eval(data=web(split=[0.99, 1]))`
-    beside `data = web(split=[0, 0.99])`."""
+    beside `data = web(split=[0, 0.99])`.
+
+    `positions` measures long context: it cuts the targets into buckets by their
+    position in their document, the tokens of it before them in the row, and logs
+    each bucket's loss and bits per byte too, named by its first position
+    (`buckets`). `eval(name="repo", data=repos, seq_len=16384, positions=[2048,
+    8192])` logs `repo_bpb_0`, `repo_bpb_2k` and `repo_bpb_8k`, of the targets at
+    positions below 2048, from 2048 to 8191, and from 8192 on, and as many losses."""
 
     type: Literal["eval"] = "eval"
     # What its metrics' names start with: eval_loss, eval_bpb.
@@ -642,6 +675,24 @@ class EvalConfig(Config):
     # Tokens per row, at least 2; none: the run's seq_len.
     seq_len: Annotated[int, Field(ge=2)] | None = None
     batch: Positive | None = None  # rows per batch; none: the run's batch
+    # Where buckets of targets by position in their document start, after the first
+    # at 0, in order: [2048, 8192] logs eval_bpb_0, eval_bpb_2k, eval_bpb_8k too.
+    positions: Positions = ()
+
+
+def buckets(positions: Sequence[int]) -> list[str]:
+    """Return the name of each bucket of targets that `positions` starts, after the
+    first at 0: its first position, in k of 1024 where it is a multiple of 1024.
+    ``buckets([2048, 8192, 10000])`` is ``["0", "2k", "8k", "10000"]``."""
+    return [f"{p // 1024}k" if p and p % 1024 == 0 else str(p) for p in (0, *positions)]
+
+
+def metrics(e: EvalConfig, bpb: bool) -> list[str]:
+    """Return the metrics eval `e` logs: its loss, its bits per byte where `bpb`,
+    and each of theirs by bucket of `positions`."""
+    kinds = ["loss", "bpb"] if bpb else ["loss"]
+    found = [f"{e.name}_{k}" for k in kinds]
+    return found + [f"{m}_{b}" for m in found for b in buckets(e.positions)]
 
 
 def _each(evals: EvalConfig | tuple[EvalConfig, ...] | None) -> tuple[EvalConfig, ...]:

@@ -44,7 +44,7 @@ from bux.export.hf import moe as hf_moe
 from bux.export.hf import residual as hf_residual
 from bux.export.hf import rwkv7 as hf_rwkv7
 from bux.export.huggingface import save
-from bux.lang import compile, compile_file, ir
+from bux.lang import compile, compile_file, compile_runs, ir
 from bux_vllm import (
     common,
     compressed,
@@ -68,6 +68,11 @@ from bux_vllm import (
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
 FILES = sorted(Path(plan.__file__).parent.glob("*.py"))
+TIMELINE = ROOT / "examples" / "experiments" / "timeline"
+#: The timeline's files whose arms set a residual algebra.
+ALGEBRA_ARMS = [
+    p for p in sorted(TIMELINE.glob("*.bux")) if "\nresidual" in p.read_text()
+]
 
 
 def script(name: str) -> ModuleType:
@@ -81,6 +86,7 @@ def script(name: str) -> ModuleType:
 
 
 vllm_parity = script("vllm_parity")
+serving = script("timeline/serving")
 vllm_fp8 = script("vllm_fp8")
 
 
@@ -112,6 +118,16 @@ def test_layers_are_where_bux_export_puts_them(path: Path) -> None:
 @pytest.mark.parametrize("name", vllm_parity.CASES)
 def test_parity_cases_are_where_bux_export_puts_them(name: str) -> None:
     assert_placed_as_bux_export(compile(vllm_parity.CASES[name]))
+
+
+@pytest.mark.parametrize("path", ALGEBRA_ARMS, ids=lambda p: p.stem)
+def test_the_timeline_residual_arms_are_where_bux_export_puts_them(path: Path) -> None:
+    """Every arm of a timeline file that sets a residual algebra, at every rung."""
+    runs = compile_runs(path.read_text(), filename=str(path))
+    archs = {r.arch.model_dump_json(): r.arch for r in runs if r.arch.residual}
+    assert archs
+    for arch in archs.values():
+        assert_placed_as_bux_export(arch)
 
 
 def test_reserved_labels_are_named_as_bux_export_names_them() -> None:
@@ -2493,6 +2509,29 @@ def test_csa_caches_a_window_and_compressed_latents(name: str) -> None:
         if c.indexer is not None:
             assert rows["index"] == (c.indexer.head_dim, r, None)
         assert rows.get("state") == ((2 * c.head_dim, 1, r) if r > 1 else None)
+
+
+@pytest.mark.parametrize("name", ["csa", "csa-latent"])
+def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
+    """Each csa call keeps what scripts/timeline/serving.py prices: a window of
+    token latents, and a compressed latent with its indexer key for each
+    compress_ratio tokens, all of it in bfloat16."""
+    for layer in compile(vllm_parity.CASES[name]).layers():
+        c = layer.config
+        if c.type != "csa":
+            continue
+        rows = compressed.cache_rows(c.model_dump(mode="json"))
+        window, *latents = serving._csa(c)
+        width, per, kept = rows["window"]
+        assert (width * serving.BF16 / per, kept) == (window.token, window.window)
+        if "compressed" not in rows:
+            assert not latents
+            continue
+        (latent,) = latents
+        width, per, kept = rows["compressed"]
+        assert (width * serving.BF16 / per, kept) == (latent.token, latent.window)
+        width, per, _ = rows.get("index", (0, 1, None))
+        assert width * serving.BF16 / per == latent.index
 
 
 def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:

@@ -1,0 +1,34 @@
+# Norms and biases, one change at a time from the 2021 reference, GPT-3's decoder
+# with RoPE (gpt3_rope.bux). Its blocks are pre-norm, and its LayerNorms and
+# projections have biases. Arms: era, source, what it was claimed for. Gemma's and
+# Qwen3-Next's zero-centered gain is not an arm: weight decay leaves every gain
+# alone, so it trains as the plain one.
+use gpt3_rope
+use timeline_code
+use rungs
+
+lm(b) = embed b^layers norm head(tied=true)
+rms   = rmsnorm(eps=1e-5)
+plain = layernorm(eps=1e-5)
+post  = norm(gain_init=layers ^ -0.5)
+
+model = base:           model
+      # 2019 Zhang & Sennrich, 2023 Llama: RMSNorm, no mean and no bias; throughput
+      | rmsnorm:        embed ([rms attn] [rms ffn])^layers rms
+                        head(tied=true)
+      # 2023 Dehghani et al. (ViT-22B), 2024 OLMo 2, 2025 Qwen3: QK-norm; stability at
+      # high learning rates
+      | qknorm:         lm([norm attn(qk_norm=rms)] [norm ffn])
+      # 2022 PaLM: no biases in any projection or norm; stability, throughput
+      | nobias:         embed
+                        ([plain attn(bias=false)] [plain ffn(bias=false)])^layers plain
+                        head(tied=true)
+      # 2024 Gemma 2, 2025 Gemma 3: sandwich norms, the output normalized too; stability
+      | sandwich:       lm([norm attn norm] [norm ffn norm])
+      # 2024 OLMo 2: the output alone normalized, x + norm(f(x)); stability
+      | postnorm:       lm([attn norm] [ffn norm])
+      # 2026 Trinity: sandwich norms, the output gains from 1 / sqrt(layers); stability
+      | sandwich_depth: lm([norm attn post] [norm ffn post])
+      # 2024 Gemma 2: the logits soft-capped at 30; stability
+      | softcap:        embed block^layers norm
+                        head(tied=true, softcap=30)

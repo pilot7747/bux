@@ -958,6 +958,23 @@ def test_a_step_takes_the_state_without_walking_the_model_and_leaves_it_there(
     assert len(alive) == len(jax.tree.leaves(nnx.state(model)))  # not the donated
 
 
+def test_a_step_that_compiled_is_waited_for_so_that_its_failure_raises_there(
+    monkeypatch,
+):
+    # On a GPU, a step that runs out of memory fails as it runs, and its error comes
+    # from the next program that reads its outputs, by that one's name: the log's.
+    trainer, batch = _small_trainer()
+    waited: list[object] = []
+    wait = jax.block_until_ready
+    monkeypatch.setattr(jax, "block_until_ready", lambda x: waited.append(x) or wait(x))
+    first = trainer.train_on_batch(batch)  # compiles
+    assert len(waited) == 1 and waited[0] is first
+    assert set(trainer.timers.read()) == {"compile", "wait"}
+    trainer.train_on_batch(batch)
+    assert len(waited) == 1  # the steps after are launched, not waited for
+    assert set(trainer.timers.read()) == {"launch"}
+
+
 def test_a_step_starts_from_the_values_a_hook_left():
     trainer, batch = _small_trainer()
     trainer.train_on_batch(batch)
@@ -1034,6 +1051,36 @@ def test_held_out_sums_the_loss_over_targets_and_bits_over_their_bytes():
     assert np.isclose(nats, (ce * targets).sum())
     assert size == counted.sum()
     assert np.isclose(bits, (ce * (counted > 0)).sum() / np.log(2))
+
+
+def test_held_out_sums_by_bucket_of_positions_in_one_pass_over_the_logits():
+    arch = compile(ARCH + "model = embed block norm head\n")
+    model = Model(arch, rngs=nnx.Rngs(0))
+    ids = np.arange(1, 17, dtype=np.int32).reshape(2, 8)
+    positions = np.array([[0, 1, 2, 3, 0, 1, 2, 3], list(range(8))], np.int32)
+    batch = Batch(ids, positions, np.ones(ids.shape, bool))
+    nbytes = jnp.asarray(ids % 3 + 1)
+    [head] = forward(model, batch)
+    measured = held_out(head, batch, nbytes, positions=(2, 5))
+    assert list(measured) == [
+        *("loss", "bpb", "loss_0", "bpb_0", "loss_2", "bpb_2", "loss_5", "bpb_5")
+    ]
+    ce = optax.softmax_cross_entropy_with_integer_labels(
+        head.logits()[:, :-1], ids[:, 1:]
+    )
+    # Each target's tokens of its document before it: a row of two documents of 4.
+    before = np.array([[1, 2, 3, 0, 1, 2, 3], list(range(1, 8))])
+    targets = np.asarray(target_mask(batch))
+    for name, low, high in [("0", 0, 2), ("2", 2, 5), ("5", 5, 99)]:
+        inside = targets & (before >= low) & (before < high)
+        nats, n = measured[f"loss_{name}"]
+        assert n == inside.sum() and np.isclose(nats, (ce * inside).sum())
+        bits, size = measured[f"bpb_{name}"]
+        assert size == (np.asarray(nbytes)[:, 1:] * inside).sum()
+        assert np.isclose(bits, (ce * inside).sum() / np.log(2))
+    assert [int(measured[f"loss_{b}"][1]) for b in ("0", "2", "5")] == [3, 7, 3]
+    assert np.isclose(measured["loss"][0], (ce * targets).sum())
+    assert held_out(head, batch).keys() == {"loss"}
 
 
 def test_eval_weighs_every_target_alike_whichever_batch_it_is_in():

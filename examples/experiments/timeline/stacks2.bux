@@ -1,0 +1,51 @@
+# The late-2026 hybrid (m2026_hybrid.bux) on the residual streams the one-change
+# ablations found (residuals.bux), and a hybrid of our own design: do a wider or
+# weighed stream and the value residual add up past the zoo's consensus, and does a
+# model built from the 2021 reference's winners do better than the zoo's? Each
+# arm's residual is set for every branch of its model, the MTP module's too where
+# it has one.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# The hybrid with stacks.bux's value residual: every later global layer mixes the
+# first one's values into its own.
+vres = embed
+       fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(fr_global(v=@v1))
+       (fr_layer(hy_delta)^3 fr_layer(fr_global(v=$v1)))^(layers // 4 - 1)
+       fr_norm @h fr_out hy_mtp
+
+# Ours: the 2021 reference's layers (gpt3_rope.bux: LayerNorms, biases, heads of 64,
+# a tied head, no MTP) with each axis' winner in place. KDA in three layers of four
+# (mixers.bux's kda, the hybrid's own); in the fourth the reference's attention, with
+# RoPE, gated and with QK-norm (interactions.bux's gated_qk) and the value residual
+# (embeddings.bux's value_res); DeepSeek-V3's experts in every layer (moe.bux's
+# moe_dsv3); hyper-connections (residuals.bux's hc).
+ours_norm  = layernorm(eps=1e-5, bias=true)
+ours_attn  = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 64, bias=true,
+                 rope=rope(), gated=true, qk_norm=rmsnorm(eps=1e-5))
+ours_moe   = moe(num_experts=128, top_k=7, num_shared_experts=1, router=sigmoid,
+                 routed_scaling_factor=2.5, load_balancing=aux_free, aux_loss_coef=1e-4,
+                 aux_loss_scope=sequence,
+                 expert=mlp(intermediate_size=d_model // 2, activation=gelu, bias=true))
+ours_layer(mixer) = [ours_norm mixer] [ours_norm ours_moe]
+ours = embed
+       ours_layer(hy_delta)^3 ours_layer(ours_attn(v=@v1))
+       (ours_layer(hy_delta)^3 ours_layer(ours_attn(v=$v1)))^(layers // 4 - 1)
+       ours_norm head(tied=true)
+
+residual = hc: hc(expansion=4)
+         | attnres: attnres(block_size=layers // 4)
+         | hc_vres: hc(expansion=4)
+         | ours: hc(expansion=4)
+
+model = # 2025 Zhu et al. (hyper-connections): copies of the stream, learned reads,
+        # writes and mixing; quality
+        hc:      frontier_hybrid
+      # 2026 Kimi Attention Residuals, Kimi K3: a softmax over depth, blocks of
+      # branches; quality (PreNorm dilution)
+      | attnres: frontier_hybrid
+      # hyper-connections and the value residual together
+      | hc_vres: vres
+      # our own hybrid, from the reference's winners
+      | ours:    ours

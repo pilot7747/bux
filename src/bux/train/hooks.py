@@ -28,7 +28,7 @@ import random
 import shutil
 import socket
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -108,10 +108,10 @@ class Log(Hook):
     Since the last log, too: the wall time a step, ``time/step_ms``; the host's in
     each part of the loop, a step (``Trainer.timers``): ``time/data_ms`` waiting for
     batches, ``time/launch_ms`` launching steps, ``time/hooks_ms`` in hooks and
-    ``time/wait_ms`` waiting for the step before; and ``time/compile_s``, the
-    seconds compiling, where a step compiled. Where the device says, its memory in
-    use, ``mem/gib``, and the most it has held, ``mem/peak_gib``: of the process's
-    device that holds most.
+    ``time/wait_ms`` waiting for the step before, or for one that compiled; and
+    ``time/compile_s``, the seconds compiling, where a step compiled. Where the
+    device says, its memory in use, ``mem/gib``, and the most it has held,
+    ``mem/peak_gib``: of the process's device that holds most.
 
     It also logs the steps that observe the model (``Trainer.observes``), whose
     metrics by layer are among the step's (`bux.train.observe`).
@@ -242,7 +242,8 @@ def memory() -> dict[str, float]:
 class Eval(Hook):
     """Held-out metrics over the first `batches` batches of `data`, the same ones
     every time (``Trainer.evaluate``): the first head's loss, as ``<name>_loss``, and
-    given each token id's bytes of text, its bits per byte, ``<name>_bpb``.
+    given each token id's bytes of text, its bits per byte, ``<name>_bpb``; with
+    `positions`, each by bucket of the targets' positions too, ``<name>_bpb_2k``.
 
     Args:
         data: A function that returns the held-out batches from the first, each time
@@ -252,6 +253,8 @@ class Eval(Hook):
         name: What the metrics' names start with.
         token_bytes: The bytes of text each id of the model's vocabulary stands for
             (``Tokenizer.token_bytes``); None leaves out bits per byte.
+        positions: Where buckets of targets by position in their documents start,
+            after 0, in order (``EvalConfig.positions``); none for no buckets.
 
     Example::
 
@@ -267,15 +270,16 @@ class Eval(Hook):
         batches: int,
         name: str = "eval",
         token_bytes: Int32[np.ndarray, " vocab"] | None = None,
+        positions: Sequence[int] = (),
     ):
         self.data, self.every, self.batches = data, every, batches
-        self.name, self.token_bytes = name, token_bytes
+        self.name, self.token_bytes, self.positions = name, token_bytes, positions
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
         """Return the trainer's means on the batches, each under the eval's name:
         ``{"eval_loss": ..., "eval_bpb": ...}``."""
         held_out = itertools.islice(self.data(), self.batches)
-        means = trainer.evaluate(held_out, self.token_bytes)
+        means = trainer.evaluate(held_out, self.token_bytes, self.positions)
         return {f"{self.name}_{k}": v for k, v in means.items()}
 
 

@@ -1,0 +1,24 @@
+# The layout of the blocks, one change at a time from the 2021 reference, GPT-3's
+# decoder with RoPE (gpt3_rope.bux). Its blocks are sequential and pre-norm, a layer
+# for every 64 of the width. Residual algebras, which replace the stream itself, are
+# in residuals.bux. Arms: era, source, what it was claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+# Deep and thin: 3/4 of the rung's width and twice its layers, the MLP 10/3 as wide as
+# the stream, as many non-embedding parameters as the reference at the rung's width.
+shape     = base: 4  | parallel: 4  | deep_thin: 3    # the width, in quarters of the rung's
+per_layer = base: 64 | parallel: 64 | deep_thin: 24   # the width for every layer
+thirds    = base: 12 | parallel: 12 | deep_thin: 10   # the MLP's, in thirds of the width
+
+d_model = shape * d_model // 4
+layers  = d_model // per_layer
+ffn.intermediate_size = thirds * d_model // 3
+
+model = base:      model
+      # 2021 GPT-J, 2022 PaLM, 2026 Command A+, North Mini Code: attention and MLP
+      # read one norm; throughput
+      | parallel:  embed [norm (attn + ffn)]^layers norm head(tied=true)
+      # 2024 MobileLLM: deeper and thinner at equal parameters; quality of small models
+      | deep_thin: model

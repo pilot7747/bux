@@ -1,0 +1,16 @@
+# No dense layer on stack5 (stack5.bux: the factorial's candidate with the CPLM copy
+# pointer and GatedNorm): its first layer's FFN routed like every other's, as
+# dense0.bux routes the candidate's. On the candidate that left the loss as it was and
+# took away most of the gradient's clipping, whose largest share came from the dense
+# first layer's SwiGLU. Does it hold beside the pointer and GatedNorm? Everything else
+# is stack5's, so it pairs with it by seed, and with the candidate.
+use stack5
+
+# 2023 Mixtral, 2025 Qwen3 MoE, gpt-oss: stack5's model with the first layer's FFN
+# routed, as every other's; a layer of experts' capacity at the same active parameters,
+# every layer alike.
+stack5_d0 = embed
+            gn_layer(hy_delta) gn_layer(hy_delta)^2 gn_layer(g_k(v=@v1))
+            (gn_layer(hy_delta)^3 gn_layer(g_k(v=$v1)))^(layers // 4 - 1)
+            fr_norm @h fr_out hy_mtp
+model     = stack5_d0

@@ -1,0 +1,17 @@
+# Milestone 2023, Llama 2 (Touvron et al., 2023): sequential pre-norm blocks with
+# RMSNorm, grouped-query attention, RoPE on every dim at base 10k, SwiGLU 8/3 as wide as
+# the stream (to the nearest 64), no biases, and an untied head. Heads of 64, a key and
+# value head for every 4 of them (Llama 2 70B shares one among 8, its 7B none), and a
+# layer for every 64 of the width.
+d_model    = 768
+vocab_size = 50304
+layers     = d_model // 64
+
+swiglu_width = (8 * d_model + 96) // 192 * 64
+
+l2_norm = rmsnorm(eps=1e-5)
+l2_attn = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 256, rope=rope())
+l2_ffn  = gated_mlp(intermediate_size=swiglu_width, activation=swish)
+
+llama2 = embed ([l2_norm l2_attn] [l2_norm l2_ffn])^layers l2_norm head
+model  = llama2

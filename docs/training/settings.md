@@ -41,12 +41,12 @@ fields and documents them on hover, as it does for layers
 | `batch` | a positive integer | required | rows per step, over all devices |
 | `batch_ramp` | {bux}`ramp`, or `none` | `none` | a smaller batch at the first step that grows to `batch` ([Batch ramps](curriculum.md#batch-ramps)) |
 | `steps` | a positive integer | required | optimizer steps |
-| `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch` or `data` from a step on ([Curriculum](curriculum.md)) |
+| `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch`, `data` or full attention's RoPE from a step on ([Curriculum](curriculum.md)) |
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number above 0, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
 | `ema` | {bux}`ema`, or `none` | `none` | the weights a run ends on, a blend of an average of its last steps ([The tail EMA](optimizers.md#the-tail-ema)) |
-| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval ([Eval](running.md#eval)) |
+| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval, also by position ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves a run resumes from ([Checkpoints](running.md#checkpoints)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps (10 by default), and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
 | `observe` | {bux}`observe`, or `none` | `none` | the model layer by layer every so many steps ([Observing a run](observing.md)) |

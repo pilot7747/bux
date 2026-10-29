@@ -1,0 +1,32 @@
+# Training options on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv),
+# its model unchanged, from the papers and the speedrun of 2025-26. The study's recipe
+# is AdamW, so these are options beside it, not architecture. Arms: era, source, what
+# it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k   = fr_global(kv_conv_size=4)
+model = embed
+        fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+        (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+residual = hc(expansion=4)
+
+ema = # 2026 modded-nanogpt record 92: the weights a run ends on are its last ones
+      # moved 0.65 of the way to an average of its last quarter of steps; the record
+      # loses 20 mnats without it
+      nl_ema: ema(window=0.25, blend=0.65)
+    | nl_normuon: none
+    | nl_cwd: none
+
+optimizer = nl_ema: adamw(lr=2e-3, weight_decay=0.1)
+            # 2025 NorMuon (arXiv 2510.05491): Muon with each output unit's update
+            # normalized by its own second moment, for the matrices in the blocks;
+            # AdamW for the rest, as ideas_opt.bux's muon arm
+          | nl_normuon: normuon(lr=2e-3, weight_decay=0.1,
+                                adam=adamw(lr=2e-3, weight_decay=0.1))
+            # 2025 cautious weight decay (arXiv 2510.12402): decay a weight only where
+            # its update has its sign; a free change to AdamW
+          | nl_cwd: adamw(lr=2e-3, weight_decay=0.1, cautious_weight_decay=true)

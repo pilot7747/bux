@@ -1,0 +1,24 @@
+# The CPLM copy pointer on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv):
+# its head's next-token distribution mixed with a pointer over the earlier tokens of
+# the document. A file of its own, as the pointer is a setting of the shared head,
+# whose second call, the MTP module's, keeps its plain softmax. Arms: era, source,
+# what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# 2026 modded-nanogpt PR 379 (CPLM): a <copy> row of the head, whose mass a goes to a
+# 128-d pointer over the document's earlier final hidden states, p = p_lm (1 - a) +
+# a p_copy; 12% fewer steps at 124M, the most direct lever for repository bpb
+shared fr_out = nl_cplm: head(pointer=copy_pointer()) | nl_cplm_w4k: head(pointer=copy_pointer(window=4096))
+
+g_k   = fr_global(kv_conv_size=4)
+model = embed
+        fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+        (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

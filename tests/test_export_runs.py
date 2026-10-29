@@ -12,6 +12,7 @@ import pytest
 from conftest import SPECIALS, _byte_alphabet
 from flax import nnx
 
+from bux import config as cfg
 from bux.__main__ import main
 from bux.data.tokenizer import load
 from bux.export import runs
@@ -151,6 +152,22 @@ def test_an_earlier_step_restores_and_a_missing_one_is_named(trained):
     assert runs.restore(folder, step=2).step == 2
     with pytest.raises(FileNotFoundError, match="no checkpoint of step 1: 2, 3"):
         runs.restore(folder, step=1)
+
+
+def test_a_run_exports_with_the_rope_its_last_phase_set(trained, tmp_path):
+    phase = "phase(at=2, seq_len=32, rope_scaling=yarn(factor=4, original_max_len=16))"
+    folder, trained_loss = trained(ARCH, curriculum=phase)
+    done = runs.export(folder, tmp_path / "out", check=True)
+    arch = done.restored.arch
+    yarn = cfg.RoPEConfig(scaling=cfg.YaRNConfig(factor=4, original_max_len=16))
+    configs = [layer.config for layer in arch.layers()]
+    ropes = [c.rope for c in configs if isinstance(c, cfg.GQAConfig)]
+    assert ropes == [yarn] * 4
+    assert loss(done.restored) == pytest.approx(trained_loss, rel=1e-5)
+    assert done.report is not None
+    done.report.check()
+    config = json.loads((done.out / "config.json").read_text())
+    assert config["max_position_embeddings"] == 32  # the phase's seq_len
 
 
 def test_bux_export_writes_a_directory_that_loads_and_checks(trained, tmp_path, capsys):

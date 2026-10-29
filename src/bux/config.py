@@ -1333,10 +1333,13 @@ class HyperConnectionsConfig(Config):
     The stream widens into `expansion` copies, and every residual branch reads its
     input from them, writes its output back to each, and mixes them, by learned
     read/write/mix connections. "mhc" projects the stream mixing onto doubly
-    stochastic matrices with Sinkhorn. Both start as the plain residual stream. With
-    `single_pass`, each branch reads with the coefficients that the branch before it
-    computed (the first reads stream 0 alone), and so does the parameter-free read
-    before the head (DeepSeek-V4.1's Single-Pass mHC)."""
+    stochastic matrices with Sinkhorn. The k-th branch starts on stream k mod n,
+    which sets the copies apart: hc reads that stream alone, and mhc reads and writes
+    it most, by `pre_bias` and `post_bias`. hc starts as the plain residual stream,
+    and so does mhc with ``post_bias=0``. With `single_pass`, each branch reads with
+    the coefficients that the branch before it computed (the first reads stream 0
+    alone), and so does the parameter-free read before the head (DeepSeek-V4.1's
+    Single-Pass mHC)."""
 
     type: Literal["hc", "mhc"]
     # Copies of the stream, 2 or more: one is the plain residual stream.
@@ -1345,6 +1348,14 @@ class HyperConnectionsConfig(Config):
     # top of static ones; else static ones alone.
     dynamic: bool = True
     sinkhorn_iters: Positive = 20  # Sinkhorn-Knopp rounds of mhc's mixing matrix.
+    # mhc's static read logits start at this on the k-th branch's stream, k mod n,
+    # and at minus it on the others (mHC-lite: 1). With both biases at 0 the streams
+    # stay copies of one stream, and the mixing learns nothing.
+    pre_bias: float = 1.0
+    post_bias: float = 1.0  # As `pre_bias`, for mhc's static write logits.
+    # mhc's static mixing logits off the diagonal, 0 on it: the mixing starts as the
+    # identity to within e^res_bias.
+    res_bias: float = -8.0
     single_pass: bool = False  # Read with the coefficients the branch before computed.
     # Epsilon of the norm before the dynamic coefficients (DeepSeek-V4.1: 1e-20).
     norm_eps: float = 1e-6

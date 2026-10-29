@@ -1,0 +1,48 @@
+# The training of the timeline ablations, a module with no model, used beside a
+# family and the rungs:
+#
+#   use gpt3_2020
+#   use timeline_code
+#   use rungs
+#
+# Its data are agentic_code's (docs/tutorials/old-vs-new.md): code files and web text
+# in rows of 2k, then the last tenth in rows of 16k, half of them whole repositories.
+# Five things differ. The learning rate is 2e-3, not 3e-3, a default that each
+# variant's scan replaces. The long phase switches full-attention RoPE to YaRN, 8
+# times the 2k it trained at. An ablation of the extension itself replaces curriculum
+# with long_phase (no YaRN), or with long_phase(rope_base=...) (Llama 3's ABF). The
+# repository eval also logs bits per byte by each token's position in its document
+# (repo_bpb_0, _2k, _8k): how much the long context helps. Every 500 steps, observe
+# logs the model's stream, attention logits and gradients. Every run logs to the W&B
+# project bux-timeline.
+tokenizer  = tokenizer(name="EleutherAI/gpt-neox-20b")
+web        = text(path="data/fineweb-edu/sample/10BT/*.parquet")
+code       = text(path="data/stack-edu/files/train/*.parquet")
+code_eval  = text(path="data/stack-edu/files/eval/*.parquet")
+repos      = text(path="data/stack-edu/repos/train/*.parquet")
+repos_eval = text(path="data/stack-edu/repos/eval/*.parquet")
+packing    = best_fit
+
+data    = 0.6 * code + 0.4 * web(split=[0, 0.999])
+seq_len = 2048
+batch   = 256
+budget  = 10B                            # tokens
+steps   = budget // (batch * seq_len)
+
+long       = 0.5 * repos + 0.3 * code + 0.2 * web(split=[0, 0.999])
+long_phase = phase(at=0.9, seq_len=16384, batch=batch // 8, data=long)
+yarn_phase = long_phase(rope_scaling=yarn(factor=8, original_max_len=2048))
+curriculum = yarn_phase
+
+optimizer = adamw(lr=2e-3, weight_decay=0.1)
+schedule  = wsd(warmup=0.05, decay=0.2, shape=sqrt)
+loss      = loss(z=1e-4)
+
+eval = [eval(name="code", data=code_eval, every=2k, batch=64, batches=40),
+        eval(name="web", data=web(split=[0.999, 1]), every=2k, batch=64, batches=40),
+        eval(name="repo", data=repos_eval, every=2k, seq_len=16384, batch=8, batches=16,
+             positions=[2048, 8192])]
+objective = 0.5 * code_bpb + 0.3 * repo_bpb + 0.2 * web_bpb
+
+observe      = observe(every=500)
+log.trackers = [wandb(project="bux-timeline"),]

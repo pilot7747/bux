@@ -62,6 +62,9 @@ Their settings, with defaults:
 | `expansion` | `hc`, `mhc`, `gr` | 4 | streams; 2 or more for `hc` and `mhc` |
 | `dynamic` | `hc`, `mhc` | `true` | coefficients that depend on the stream, else static ones |
 | `sinkhorn_iters` | `mhc` | 20 | Sinkhorn iterations |
+| `pre_bias` | `mhc` | 1 | the static read logit on the branch's own stream, and minus it on the others; see below |
+| `post_bias` | `mhc` | 1 | the same, for the static write logits |
+| `res_bias` | `mhc` | -8 | the static mixing logits off the diagonal: the mixing starts as the identity to within `e^res_bias` |
 | `single_pass` | `hc`, `mhc` | `false` | see below |
 | `rank` | `gr` | required | rank of the read gate (Qwen3.8-Flash-Next: `d_model / 8`) |
 | `block_size` | `attnres`, `msar` | `none` | branch outputs summed into one source; `none`: each is its own |
@@ -97,6 +100,24 @@ It costs more than it gave at small scale. On a KDA hybrid of 680M parameters at
 width of 512, in place of `hc`, it raised the held-out bits per byte by 0.5% and took
 2.1 times as long a step (503M tokens, 3 seeds, B300s, 2026-10-29). Its vLLM export
 at a width of 3328 served 58% fewer agentic sessions an hour per GPU in FP8.
+
+### How hc and mhc start
+
+`embed` widens its output into copies of one stream. The k-th branch outside any
+other starts on stream k mod n, which sets the streams apart:
+
+- `hc` reads that stream alone, keeps every stream and adds `f` to each, as Zhu et al.
+  start it. It starts as the plain residual stream.
+- `mhc` reads `sigmoid(±pre_bias)` of each stream, `+` on its own and `-` on the
+  others, and writes `2 sigmoid(±post_bias)` of `f` to each, as
+  [mHC-lite](https://arxiv.org/abs/2601.05732) starts it. Its mixing starts at the
+  identity. With `post_bias=0` it writes `f` to every stream alike, and starts as
+  the plain residual stream too.
+
+With `pre_bias=0, post_bias=0`, every stream starts and stays the same. The gradients
+treat the copies alike, and the mixing gets none: it sums copies of one stream to
+that stream, whatever its coefficients. `mhc` then trains as one stream with a
+learned gain on each read and write.
 
 ### Single-pass mHC
 

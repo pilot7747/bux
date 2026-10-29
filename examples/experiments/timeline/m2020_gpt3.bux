@@ -1,0 +1,9 @@
+# Milestone 2020, GPT-3 (Brown et al., 2020): the timeline's baseline itself
+# (gpt3_2020.bux), named `gpt3` so that milestones.bux can sweep it beside the others.
+# Learned positions, LayerNorms and projections with biases, multi-head attention in
+# heads of 64, a GELU MLP 4 times as wide as the stream, a tied head, a layer for every
+# 64 of the width.
+use gpt3_2020
+
+gpt3  = embed(max_positions=positions) block^layers norm head(tied=true)
+model = gpt3

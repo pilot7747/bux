@@ -6,14 +6,17 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import optax
 import pytest
 from flax import nnx
 
+from bux import config as cfg
 from bux.__main__ import main
 from bux.architecture import Model
+from bux.architecture.attention import rope
 from bux.data.pipeline import jobs
 from bux.lang import BuxError, compile, compile_runs
 from bux.lang.printer import run_to_source
@@ -209,6 +212,93 @@ def test_a_phase_at_another_seq_len_prepares_a_dataset_of_its_own():
     ]
 
 
+YARN = cfg.YaRNConfig(factor=4, original_max_len=16)
+LAYERS = (
+    "d_model = 16\nvocab_size = 32\n"
+    "full = gqa(num_heads=2, num_kv_heads=2, rope=rope(fraction=0.5))\n"
+    "local = gqa(num_heads=2, num_kv_heads=2, rope=rope(), sliding_window_size=4)\n"
+    "nope = gqa(num_heads=2, num_kv_heads=2)\n"
+    "latent = mla(num_heads=2, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4,"
+    " v_head_dim=4)\n"
+    "model = embed [rmsnorm full] [rmsnorm local] [rmsnorm nope] [rmsnorm latent]"
+    " rmsnorm head\n"
+)
+
+
+def ropes_of(arch) -> list[Any]:
+    return [
+        layer.config.rope for layer in arch.layers() if hasattr(layer.config, "rope")
+    ]
+
+
+def test_a_phase_sets_the_rope_of_full_attention_from_its_step_on():
+    [run] = compile_runs(
+        LAYERS + "data = synthetic\noptimizer = adamw(lr=1e-3)\n"
+        "seq_len = 16\nbatch = 8\nsteps = 10\n"
+        "curriculum = [phase(at=4, seq_len=64, rope_scaling=yarn(factor=4,"
+        " original_max_len=16)), phase(at=6, batch=4), phase(at=8, rope_base=1e5)]"
+    )
+    before = ropes_of(run.arch)
+    assert ropes_of(run.arch_at(3)) == before and run.arch_at(0) == run.arch
+    full, local, nope, latent = ropes_of(run.arch_at(4))
+    assert full == before[0].model_copy(update={"scaling": YARN})  # fraction kept
+    assert latent == cfg.RoPEConfig(scaling=YARN)
+    assert (local, nope) == (before[1], None)  # a window, and no RoPE
+    assert run.arch_at(7) == run.arch_at(4)  # as before, where a phase sets none
+    full, local, _, _ = ropes_of(run.arch_at(8))
+    assert (full.scaling, full.base, local.base) == (YARN, 1e5, 1e4)
+    yarn = "yarn(factor=4.0, original_max_len=16)"
+    assert curriculum.lines(run.train)[1:] == [
+        f"phase 1, from step 4: 8 × 64 tokens, rope_scaling={yarn}",
+        "phase 2, from step 6: 4 × 64 tokens",
+        "phase 3, from step 8: 4 × 64 tokens, rope_base=100000.0",
+    ]
+    [again] = compile_runs(run_to_source(run))
+    assert again.train == run.train and again.id == run.id
+
+
+def test_a_trainer_computes_with_a_phase_s_rope_from_its_step_on(monkeypatch):
+    """The steps and the evals from the phase's step on rotate by YaRN in its full
+    attention, not in its window; an eval of the same shape compiles again for it."""
+    [run] = compile_runs(
+        LAYERS + "data = synthetic\noptimizer = adamw(lr=1e-3)\n"
+        "seq_len = 8\nbatch = 2\nsteps = 4\n"
+        "curriculum = phase(at=2, rope_scaling=yarn(factor=4, original_max_len=16))"
+    )
+    traced: list[object] = []
+    frequencies = rope.frequencies
+
+    def recorded(config: cfg.RoPEConfig, dims: int):
+        traced.append(config.scaling)
+        return frequencies(config, dims)
+
+    monkeypatch.setattr(rope, "frequencies", recorded)
+    loss = objective(tcfg.LossConfig(), run.arch)
+    long = run.arch_at(2)
+    model = Model(run.arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(
+        model,
+        optax.sgd(0.0),
+        loss,
+        remodel=[(2, lambda: Model(long, rngs=nnx.Rngs(0)))],
+    )
+    batch = plain(np.arange(16, dtype=np.int32).reshape(2, 8) % 32)
+    each: list[set] = []
+    evals: list[float] = []
+    for _ in range(4):
+        traced.clear()
+        evals.append(trainer.evaluate([batch])["loss"])
+        trainer.train_on_batch(batch)
+        each.append(set(map(repr, traced)))
+    yarn, plain_rope = repr(YARN), repr(None)
+    # Step 0 traces the eval and the step, without YaRN; step 2 both again, with it
+    # in the full attention and the latent one, not in the window.
+    assert each == [{plain_rope}, set(), {plain_rope, yarn}, set()]
+    assert evals[0] == evals[1] != evals[2] == evals[3]  # the step's lr is 0
+    as_built = Trainer(Model(long, rngs=nnx.Rngs(0)), optax.sgd(0.0), loss)
+    assert as_built.evaluate([batch])["loss"] == evals[2]
+
+
 def test_a_trainer_compiles_again_for_batches_of_a_new_shape_and_counts_their_flops():
     arch = compile(
         "d_model = 16\nvocab_size = 32\n"
@@ -238,8 +328,10 @@ def test_a_run_trains_through_its_phases_and_resumes_where_it_stopped(tmp_path):
         "log = log(every=1)",
         "checkpoint = checkpoint(every=3, keep=3)",
         "batch_ramp = ramp(start=2, steps=3)",
-        "curriculum = phase(at=5, seq_len=32, batch=4)",
+        "curriculum = phase(at=5, seq_len=32, batch=4,"
+        " rope_scaling=yarn(factor=4, original_max_len=16))",
         "mesh = mesh(data=1)",
+        'eval = eval(name="eval", data=synthetic, every=4, batches=1)',
     )
     said: list[str] = []
     whole = train(run, tmp_path, echo=said.append)
@@ -248,7 +340,11 @@ def test_a_run_trains_through_its_phases_and_resumes_where_it_stopped(tmp_path):
         in line
         for line in said
     )
-    assert any("phase 1, from step 5: 4 × 32 tokens" in line for line in said)
+    assert any(
+        "phase 1, from step 5: 4 × 32 tokens, "
+        "rope_scaling=yarn(factor=4.0, original_max_len=16)" in line
+        for line in said
+    )
     folder = directory(run, tmp_path)
     lines = [json.loads(line) for line in (folder / "metrics.jsonl").open()]
     logged = [line for line in lines if "loss" in line]
@@ -261,6 +357,7 @@ def test_a_run_trains_through_its_phases_and_resumes_where_it_stopped(tmp_path):
         4,
         6,
     ]
+    assert [line["step"] for line in lines if "eval_loss" in line] == [4, 8]
 
     # Lose the checkpoints after step 3: the run resumes there, before its phase, and
     # ends where it did.
@@ -270,7 +367,16 @@ def test_a_run_trains_through_its_phases_and_resumes_where_it_stopped(tmp_path):
     resumed = train(run, tmp_path, echo=said.append)
     assert said[0].endswith("resuming at step 3")
     assert resumed["loss"] == whole["loss"]
+    assert resumed["eval_loss"] == whole["eval_loss"]
     assert resumed["tokens"] == whole["tokens"] == sum(each)
+
+    # And from inside it, with its RoPE.
+    shutil.rmtree(folder / "checkpoints" / "8")
+    said.clear()
+    inside = train(run, tmp_path, echo=said.append)
+    assert said[0].endswith("resuming at step 6")
+    assert inside["loss"] == whole["loss"]
+    assert inside["eval_loss"] == whole["eval_loss"]
 
 
 def test_bux_check_says_how_many_tokens_each_phase_takes(capsys):
@@ -313,7 +419,8 @@ def test_an_eval_of_its_own_shape_prepares_its_rows_and_reads_them(tmp_path):
     run = smoke(
         "steps = 4",
         'eval = [eval(name="short", data=synthetic, every=2),'
-        ' eval(name="long", data=synthetic, every=2, seq_len=128, batch=8)]',
+        ' eval(name="long", data=synthetic, every=2, seq_len=128, batch=8,'
+        " positions=[64, 1024])]",
     )
     said: list[str] = []
     train(run, tmp_path, echo=said.append)
@@ -322,6 +429,10 @@ def test_an_eval_of_its_own_shape_prepares_its_rows_and_reads_them(tmp_path):
         json.loads(line) for line in (directory(run, tmp_path) / "metrics.jsonl").open()
     ]
     assert [line["step"] for line in lines if "long_loss" in line] == [2, 4]
+    [last] = [line for line in lines if line["step"] == 4 and "long_loss" in line]
+    short, long = last["long_loss_0"], last["long_loss_64"]
+    assert min(short, long) <= last["long_loss"] <= max(short, long)
+    assert np.isnan(last["long_loss_1k"]) and "short_loss_0" not in last
 
 
 def test_an_eval_runs_its_batch_whole_but_in_a_pipeline_s_microbatches(tmp_path):

@@ -4,8 +4,9 @@ its ``curriculum``'s phases, cut wherever its ``batch_ramp`` grows the batch.
 A stretch's settings are the run's, with the ``seq_len``, ``batch`` and ``data`` in
 force during it, so what reads a run's settings reads a stretch's as they are: the
 batches (`bux.train.data.training_batches`), the datasets to prepare
-(`bux.data.pipeline.jobs`), the checks of the mesh. It needs no JAX, so the compiler
-and ``bux check`` read it too::
+(`bux.data.pipeline.jobs`), the checks of the mesh. The RoPE a phase sets is the
+model's (`ropes`, `bux.lang.ir.Run.arch_at`). It needs no JAX, so the compiler and
+``bux check`` read it too::
 
     for s in stretches(run.train):
         print(s.start, s.stop, s.config.batch, s.config.seq_len)
@@ -17,8 +18,11 @@ from typing import NamedTuple
 
 from bux.train.config import RampConfig, TrainConfig
 
-#: The settings a phase changes.
+#: The settings of the run a phase changes.
 CHANGES = ("seq_len", "batch", "data")
+#: The settings of its full-attention layers' RoPE a phase changes, by field of the
+#: phase, and of ``RoPEConfig``.
+ROPE = {"rope_scaling": "scaling", "rope_base": "base"}
 
 
 class Stretch(NamedTuple):
@@ -37,6 +41,26 @@ def phases(t: TrainConfig) -> list[tuple[int, TrainConfig]]:
         changed = {k: v for k in CHANGES if (v := getattr(phase, k)) is not None}
         found.append((phase.start(t.steps), found[-1][1].model_copy(update=changed)))
     return found
+
+
+def ropes(t: TrainConfig) -> list[tuple[int, dict[str, object]]]:
+    """Return the step each phase of `t` starts at and the fields of ``RoPEConfig``
+    its full-attention layers take then (`ROPE`): each phase's, where it sets them,
+    else the phase before's; none from step 0."""
+    found: list[tuple[int, dict[str, object]]] = [(0, {})]
+    for phase in t.curriculum:
+        changed = {
+            f: v for k, f in ROPE.items() if (v := getattr(phase, k)) is not None
+        }
+        found.append((phase.start(t.steps), found[-1][1] | changed))
+    return found
+
+
+def rope_at(t: TrainConfig, step: int) -> dict[str, object]:
+    """Return the fields of ``RoPEConfig`` `t`'s full-attention layers take at `step`
+    (`ropes`): in the step that takes a run from `step` steps to the next, and in an
+    eval after `step` steps."""
+    return next(rope for start, rope in reversed(ropes(t)) if start <= step)
 
 
 def ramped(ramp: RampConfig, batch: int, step: int) -> int:
@@ -177,7 +201,8 @@ def lines(t: TrainConfig) -> list[str]:
 
         lines(run.train)
         # ['from step 0: 512 × 1024 tokens, ramped from 64 rows over the first 2,000
-        #   steps in 7 sizes', 'phase 1, from step 9,000: 64 × 8192 tokens']
+        #   steps in 7 sizes', 'phase 1, from step 9,000: 64 × 8192 tokens,
+        #   rope_scaling=yarn(factor=4.0, original_max_len=1024)']
     """
     from bux.lang.printer import value_to_source  # bux.lang imports this module
 
@@ -189,6 +214,9 @@ def lines(t: TrainConfig) -> list[str]:
         line += f": {c.batch} × {c.seq_len} tokens"
         if c.data != before.data:
             line += f", data={value_to_source(c.data)}"
+        for k in ROPE if n else ():
+            if (v := getattr(t.curriculum[n - 1], k)) is not None:
+                line += f", {k}={value_to_source(v)}"
         found.append(line)
         before = c
     if (ramp := t.batch_ramp) is not None:

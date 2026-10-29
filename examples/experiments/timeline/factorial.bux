@@ -1,0 +1,113 @@
+# Today's best architecture, by a fractional factorial on the late-2026 hybrid
+# (m2026_hybrid.bux: KDA in three layers of four, gated GQA with QK-norm and no
+# positions in the fourth, sigmoid aux-free fine-grained MoE with a shared expert, MTP).
+# Six winners it lacks, each a factor on top of it, in 16 arms; three seeds each, at
+# one learning rate (a factorial screen holds it fixed; the hybrid is flat in it).
+#
+#   R  residual stream: 0 plain, 1 hyper-connections (hc), 2 AttnRes (residuals.bux)
+#   V  value residual on the global layers (stacks.bux's vres)
+#   K  a causal conv of 4 taps on the global layers' keys and values (stacks.bux)
+#   F  the experts' activation ReLU² instead of SwiGLU, 1.5 times as wide to the
+#      nearest block of 64, as the grouped GEMMs take them: about as many active
+#      parameters (ffn.bux's relu2); the first, dense layer stays SwiGLU
+#   P  the global layers' positions: 0 none, 1 partial RoPE at base 500k (stacks.bux)
+#   S  a DSA indexer on the global layers (sparse.bux's hybrid_dsa)
+#
+# The design is a 2^(7-3) of resolution IV in seven two-level columns: a, b, c, d and
+# F = c, K = d, P = abc, S = abd, V = acd (sums mod 2). Columns a and b make R: 00
+# plain, 10 hc, 01 AttnRes, and 11 plain again, so plain has 8 arms and hc and
+# AttnRes 4 each. The first arm, every column 0, is the hybrid itself. The design's
+# words are abFP, abKS, FPKS, aVFK, aVPS, bVKP and bVFS. So:
+# - No main effect is aliased with another, nor with an interaction of two of V, K,
+#   F, P and S; V is aliased with no 2-factor interaction at all.
+# - hc against AttnRes is clear. R against plain carries F×P and K×S: within plain,
+#   K and S are always equal, as are F and P, and the hc and AttnRes arms part them.
+# - K, S, F and P each carry a part of R's interaction with S, K, P and F, which 16
+#   runs cannot avoid with a 3-level factor and five 2-level ones. V, whose
+#   interaction with R is the likely one (stacks2.bux's hc_vres), carries none.
+# - V×K, V×P, V×S, V×F, K×P and P×S can each be told from the others.
+#
+#   arm           R        V K F P S     a b c d
+#   r0v0k0f0p0s0  plain    0 0 0 0 0     0 0 0 0   the hybrid
+#   r0v1k1f0p0s1  plain    1 1 0 0 1     0 0 0 1
+#   r0v1k0f1p1s0  plain    1 0 1 1 0     0 0 1 0
+#   r0v0k1f1p1s1  plain    0 1 1 1 1     0 0 1 1
+#   r2v0k0f0p1s1  AttnRes  0 0 0 1 1     0 1 0 0
+#   r2v1k1f0p1s0  AttnRes  1 1 0 1 0     0 1 0 1
+#   r2v1k0f1p0s1  AttnRes  1 0 1 0 1     0 1 1 0
+#   r2v0k1f1p0s0  AttnRes  0 1 1 0 0     0 1 1 1
+#   r1v1k0f0p1s1  hc       1 0 0 1 1     1 0 0 0
+#   r1v0k1f0p1s0  hc       0 1 0 1 0     1 0 0 1
+#   r1v0k0f1p0s1  hc       0 0 1 0 1     1 0 1 0
+#   r1v1k1f1p0s0  hc       1 1 1 0 0     1 0 1 1
+#   r0v1k0f0p0s0  plain    1 0 0 0 0     1 1 0 0   stacks.bux's vres
+#   r0v0k1f0p0s1  plain    0 1 0 0 1     1 1 0 1
+#   r0v0k0f1p1s0  plain    0 0 1 1 0     1 1 1 0
+#   r0v1k1f1p1s1  plain    1 1 1 1 1     1 1 1 1
+#
+# The MTP module keeps the hybrid's layer; the residual is every branch's, the MTP
+# module's too. scripts/timeline/factorial.py fits the effects.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+rope_g  = rope(base=500000, fraction=0.25)
+dsa_g   = indexer(num_heads=4, head_dim=64, top_k=2048)
+relu2_e = fr_experts(expert=mlp(intermediate_size=(3 * expert_width // 2 + 32) // 64 * 64,
+                                activation=relu2))
+
+# The hybrid with g in its global layers and e as its experts; vres(g, e) also mixes
+# the first global layer's values into every later one's.
+plain(g, e) = embed
+              fr_layer(hy_delta, fr_dense) fr_layer(hy_delta, e)^2 fr_layer(g, e)
+              (fr_layer(hy_delta, e)^3 fr_layer(g, e))^(layers // 4 - 1)
+              fr_norm @h fr_out hy_mtp
+vres(g, e)  = embed
+              fr_layer(hy_delta, fr_dense) fr_layer(hy_delta, e)^2 fr_layer(g(v=@v1), e)
+              (fr_layer(hy_delta, e)^3 fr_layer(g(v=$v1), e))^(layers // 4 - 1)
+              fr_norm @h fr_out hy_mtp
+
+g_k   = fr_global(kv_conv_size=4)
+g_p   = fr_global(rope=rope_g)
+g_s   = fr_global(indexer=dsa_g)
+g_ks  = fr_global(kv_conv_size=4, indexer=dsa_g)
+g_kp  = fr_global(kv_conv_size=4, rope=rope_g)
+g_ps  = fr_global(rope=rope_g, indexer=dsa_g)
+g_kps = fr_global(kv_conv_size=4, rope=rope_g, indexer=dsa_g)
+
+hc_r      = hc(expansion=4)
+attnres_r = attnres(block_size=layers // 4)
+
+model = r0v0k0f0p0s0: plain(fr_global, fr_experts)
+      | r0v1k1f0p0s1: vres(g_ks, fr_experts)
+      | r0v1k0f1p1s0: vres(g_p, relu2_e)
+      | r0v0k1f1p1s1: plain(g_kps, relu2_e)
+      | r2v0k0f0p1s1: plain(g_ps, fr_experts)
+      | r2v1k1f0p1s0: vres(g_kp, fr_experts)
+      | r2v1k0f1p0s1: vres(g_s, relu2_e)
+      | r2v0k1f1p0s0: plain(g_k, relu2_e)
+      | r1v1k0f0p1s1: vres(g_ps, fr_experts)
+      | r1v0k1f0p1s0: plain(g_kp, fr_experts)
+      | r1v0k0f1p0s1: plain(g_s, relu2_e)
+      | r1v1k1f1p0s0: vres(g_k, relu2_e)
+      | r0v1k0f0p0s0: vres(fr_global, fr_experts)
+      | r0v0k1f0p0s1: plain(g_ks, fr_experts)
+      | r0v0k0f1p1s0: plain(g_p, relu2_e)
+      | r0v1k1f1p1s1: vres(g_kps, relu2_e)
+      # Off the design: the screen's predicted best (hc, V, K), and the same without
+      # the key-value conv, whose conv state costs serving throughput in vLLM.
+      | r1v1k1f0p0s0: vres(g_k, fr_experts)
+      | r1v1k0f0p0s0: vres(fr_global, fr_experts)
+
+residual = r0v0k0f0p0s0: none      | r0v1k1f0p0s1: none
+         | r0v1k0f1p1s0: none      | r0v0k1f1p1s1: none
+         | r2v0k0f0p1s1: attnres_r | r2v1k1f0p1s0: attnres_r
+         | r2v1k0f1p0s1: attnres_r | r2v0k1f1p0s0: attnres_r
+         | r1v1k0f0p1s1: hc_r      | r1v0k1f0p1s0: hc_r
+         | r1v0k0f1p0s1: hc_r      | r1v1k1f1p0s0: hc_r
+         | r0v1k0f0p0s0: none      | r0v0k1f0p0s1: none
+         | r0v0k0f1p1s0: none      | r0v1k1f1p1s1: none
+         | r1v1k1f0p0s0: hc_r      | r1v1k0f0p0s0: hc_r
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

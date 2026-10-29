@@ -1,0 +1,63 @@
+# The new layers' winners (newlayers.bux) stacked on the factorial's candidate
+# (factorial.bux's r1v1k1f0p0s0: the late-2026 hybrid with hyper-connections, the value
+# residual and the key-value conv on its global layers), to see whether their gains add
+# up. Each beat the candidate paired by seed at d512, if narrowly (3 seeds; none by
+# twice the paired noise of a run), repo_bpb_8k no worse, as architecture; mimetic
+# init and the training options stay out. Three factors:
+#
+#   V  a value-embedding table before each global layer (newlayers.bux's nl_ve, -0.35%)
+#   X  exclusive self-attention on the global layers, its share learned per head
+#      (nl_xsa_learned, -0.20%, the steadiest over seeds)
+#   D  differential attention V2 on the global layers (nl_diff, -0.25%)
+#
+# With newlayers.bux's three singles and the candidate, these arms make all 2^3 cells.
+# stack3.bux's gains of under 1% at d512 shrank or reversed at d768, so the whole
+# stack also runs there. s4_gvxd adds stack3.bux's GatedNorm (ideas.bux's gnorm).
+#
+#   arm        V X D
+#   s4_v1x1d0  1 1 0
+#   s4_v1x0d1  1 0 1
+#   s4_v0x1d1  0 1 1
+#   s4_v1x1d1  1 1 1   all three
+#   s4_gvxd    1 1 1   and GatedNorm
+#
+# The residual is hc in every arm, every branch's, the MTP module's too; the MTP
+# module keeps the hybrid's layer, as each winner's own arm did.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+gated_norm = fr_norm (_ * (linear(features=16) swish linear(features=d_model) sigmoid))
+ve_g       = value_embed(features=d_model // 4)
+
+# The candidate's global layers with X, D or both.
+g_x  = fr_global(kv_conv_size=4, exclusive=learned)
+g_d  = fr_global(kv_conv_size=4, differential=true)
+g_xd = fr_global(kv_conv_size=4, exclusive=learned, differential=true)
+
+# The candidate with n as its branches' norm and g as its global layers, the first of
+# which gives its values to the rest; stack_ve adds a table of value embeddings before
+# every global layer, its own.
+lay(n, mixer, ffn=fr_experts) = [n mixer] [n ffn]
+stack(n, g)    = embed
+                 lay(n, hy_delta, fr_dense) lay(n, hy_delta)^2 lay(n, g(v=@v1))
+                 (lay(n, hy_delta)^3 lay(n, g(v=$v1)))^(layers // 4 - 1)
+                 fr_norm @h fr_out hy_mtp
+stack_ve(n, g) = embed
+                 lay(n, hy_delta, fr_dense) lay(n, hy_delta)^2
+                 ve_g(ve=@vt) lay(n, g(v=@v1, ve=$vt!))
+                 (lay(n, hy_delta)^3 ve_g(ve=@vt) lay(n, g(v=$v1, ve=$vt!)))^(layers // 4 - 1)
+                 fr_norm @h fr_out hy_mtp
+
+model = s4_v1x1d0: stack_ve(fr_norm, g_x)
+      | s4_v1x0d1: stack_ve(fr_norm, g_d)
+      | s4_v0x1d1: stack(fr_norm, g_xd)
+      | s4_v1x1d1: stack_ve(fr_norm, g_xd)
+      | s4_gvxd:   stack_ve(gated_norm, g_xd)
+
+residual = s4_v1x1d0: hc(expansion=4) | s4_v1x0d1: hc(expansion=4)
+         | s4_v0x1d1: hc(expansion=4) | s4_v1x1d1: hc(expansion=4)
+         | s4_gvxd: hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

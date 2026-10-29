@@ -1,0 +1,23 @@
+# Auxiliary losses on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv),
+# its model unchanged, from the speedrun of 2026. They change what training minimizes,
+# not the model: the evals stay the plain next-token loss and bits per byte. Arms:
+# era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k   = fr_global(kv_conv_size=4)
+model = embed
+        fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+        (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+residual = hc(expansion=4)
+
+# 2026 modded-nanogpt record 88: the first head also predicts each target's prefix
+# token, the longest proper byte prefix of it that is a token, by the same softmax, at
+# 0.25 for the first third of the steps, to 0 over the second; -1% steps, beside MTP
+loss = loss(z=1e-4, prefix=prefix(weight=0.25, hold=1/3, decay=1/3))
+
+seed         = 0 | 1 | 2
+optimizer.lr = 2e-3

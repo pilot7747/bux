@@ -1,0 +1,15 @@
+# Milestone 2021, GPT-J and GPT-NeoX (EleutherAI, 2021-22): GPT-3's decoder with two
+# changes, RoPE on a quarter of each head's dims instead of learned positions, and the
+# parallel block, attention and MLP reading one norm. Heads of 64 and a layer for every
+# 64 of the width, as GPT-3's; GPT-NeoX's own head is untied, this one stays tied.
+d_model    = 768
+vocab_size = 50304
+layers     = d_model // 64
+
+neox_norm = layernorm(eps=1e-5, bias=true)
+neox_attn = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 64, bias=true,
+                rope=rope(fraction=0.25))
+neox_ffn  = mlp(intermediate_size=4 * d_model, activation=gelu, bias=true)
+
+neox  = embed [neox_norm (neox_attn + neox_ffn)]^layers neox_norm head(tied=true)
+model = neox

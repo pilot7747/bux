@@ -1,0 +1,34 @@
+# The late-2026 hybrid (m2026_hybrid.bux: KDA in three layers of four, gated GQA with
+# QK-norm and no positions in the fourth, a fine-grained MoE, MTP) with the one-change
+# winners it lacks stacked on top: does what each axis found add up past the zoo's
+# consensus? Each arm adds to `base`, the milestone as the zoo builds it.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+rope_g = rope(base=500000, fraction=0.25)
+
+stack(g) = embed
+           fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g(v=@v1))
+           (fr_layer(hy_delta)^3 fr_layer(g(v=$v1)))^(layers // 4 - 1)
+           fr_norm @h fr_out hy_mtp
+plain(g) = embed
+           fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g)
+           (fr_layer(hy_delta)^3 fr_layer(g))^(layers // 4 - 1)
+           fr_norm @h fr_out hy_mtp
+
+model = base:      frontier_hybrid
+      # 2024 ResFormer: every later global layer mixes the first one's values into
+      # its own; alone, it gains on the reference (embeddings.bux)
+      | vres:      stack(fr_global)
+      # 2026 Inkling: a causal conv of 4 taps on the global layers' keys and values;
+      # it gains on the reference alone and beside QK-norm, which these layers have
+      # (attention.bux, interactions.bux)
+      | kvconv:    plain(fr_global(kv_conv_size=4))
+      # 2024 Llama 3, 2025 Qwen3-Next: partial RoPE at base 500k in the global layers,
+      # not NoPE
+      | rope:      plain(fr_global(rope=rope_g))
+      # all three
+      | best:      stack(fr_global(kv_conv_size=4, rope=rope_g))
+      # value residual and the conv, global layers still NoPE
+      | best_nope: stack(fr_global(kv_conv_size=4))

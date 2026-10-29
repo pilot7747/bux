@@ -1,0 +1,62 @@
+# Follow-ups to ideas.bux and canon.bux on the factorial's candidate (factorial.bux's
+# r1v1k1f0p0s0: the late-2026 hybrid with hyper-connections, the value residual and
+# the key-value conv on its global layers): what their arms leave apart, the
+# residual's cost to serve, and the schedule's floor. Arms: era, source, what it was
+# claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k = fr_global(kv_conv_size=4)
+
+# factorial.bux's vres(g_k, fr_experts), and the same with the embedding scaled.
+cand   = embed
+         fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+         (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+         fr_norm @h fr_out hy_mtp
+emb_sd = embed(scale_by_sqrt_dim=true)
+         fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+         (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+         fr_norm @h fr_out hy_mtp
+
+# canon.bux's Canon-A alone: the conv before the mixer.
+canon_a(mixer, ffn=fr_experts) = [fr_norm [conv] mixer] [fr_norm ffn]
+a = embed
+    canon_a(hy_delta, fr_dense) canon_a(hy_delta)^2 canon_a(g_k(v=@v1))
+    (canon_a(hy_delta)^3 canon_a(g_k(v=$v1)))^(layers // 4 - 1)
+    fr_norm @h fr_out hy_mtp
+
+# ideas.bux's GatedNorm, on AttnRes.
+gated_norm = fr_norm (_ * (linear(features=16) swish linear(features=d_model) sigmoid))
+gn_layer(mixer, ffn=fr_experts) = [gated_norm mixer] [gated_norm ffn]
+gn = embed
+     gn_layer(hy_delta, fr_dense) gn_layer(hy_delta)^2 gn_layer(g_k(v=@v1))
+     (gn_layer(hy_delta)^3 gn_layer(g_k(v=$v1)))^(layers // 4 - 1)
+     fr_norm @h fr_out hy_mtp
+
+model = # Canon-A alone, before the mixer (canon.bux's canon_ac less canon_c)
+        canon_a:   a
+      # 2018 Gemma's and T5's sqrt(d_model) times the embedding, ideas.bux's
+      # emb_norm without the norm; -0.02 loss at 280M-1.3B (LongCat, arXiv
+      # 2601.21204)
+      | emb_sqrt:  emb_sd
+      # 2026 Qwen3.8-Next (arXiv 2608.30320): GatedNorm where Qwen measured it, on
+      # AttnRes (-0.004 to -0.005 loss there, -0.002 on a plain stream)
+      | ar_gnorm:  gn
+      # 2026 DeepSeek-V4.1's single-pass mHC, for hc: each branch reads with the
+      # coefficients the branch before it computed, so the read fuses into that
+      # branch's write; one pass over the copies for each branch, not two
+      | hc_single: cand
+      # 2025 modded-nanogpt (record 72), OpenAI's parameter-golf: the decay ends at a
+      # tenth of the peak, not at 0
+      | lr_floor:  cand
+
+residual = canon_a: hc(expansion=4) | emb_sqrt: hc(expansion=4)
+         | ar_gnorm: attnres(block_size=layers // 4)
+         | hc_single: hc(expansion=4, single_pass=true) | lr_floor: hc(expansion=4)
+
+schedule = canon_a: schedule | emb_sqrt: schedule | ar_gnorm: schedule
+         | hc_single: schedule | lr_floor: wsd(warmup=0.05, decay=0.2, shape=sqrt, final=0.1)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

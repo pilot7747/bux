@@ -36,7 +36,15 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bux.config import FanInitConfig, Init, LayerConfig, ResidualConfig
+from bux.config import (
+    FanInitConfig,
+    Init,
+    LayerConfig,
+    QuadraticAttentionConfig,
+    ResidualConfig,
+    RoPEConfig,
+)
+from bux.train import curriculum
 from bux.train.config import PrecisionConfig, TrainConfig
 
 #: What a layer reads, as the compiler infers it.
@@ -262,6 +270,30 @@ def replace_children(node: Node, new: tuple[Node, ...]) -> Node:
             return node
 
 
+def full_attention_rope(arch: Architecture, **fields: object) -> Architecture:
+    """Return `arch` with `fields` set on the ``RoPEConfig`` of every layer of full
+    attention, softmax attention that rotates and has no ``sliding_window_size``, as
+    a curriculum's phase sets them (`bux.train.curriculum.ROPE`); `arch` itself for
+    none. A sparse attention's indexer rotates as its layer does."""
+
+    def remade(node: Node) -> Node:
+        if isinstance(node, Layer) and (rope := _full_rope(node.config)) is not None:
+            config = node.config.model_copy(
+                update={"rope": rope.model_copy(update=fields)}
+            )
+            return node.model_copy(update={"config": config})
+        return replace_children(node, tuple(remade(c) for c in children(node)))
+
+    return arch.model_copy(update={"graph": remade(arch.graph)}) if fields else arch
+
+
+def _full_rope(config: object) -> RoPEConfig | None:
+    """Return the RoPE of `config` where it is full attention's, else None."""
+    if isinstance(config, QuadraticAttentionConfig) and not config.sliding_window_size:
+        return getattr(config, "rope", None)  # gqa's, mla's and csa's
+    return None
+
+
 def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
     """Return the node without labels, inferred widths or both, to compare structure.
 
@@ -316,6 +348,8 @@ _NEWER_FIELDS = {
     "schedule": {"horizon": 1.0},
     "loss": {"prefix": None},
 }
+# Fields of a curriculum's phases newer than run ids, at what runs computed before them.
+_NEWER_PHASE_FIELDS = {"rope_scaling": None, "rope_base": None}
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
 # Fields of a layer's settings, or of the model's init, newer than run ids, by its
@@ -355,6 +389,10 @@ _NEWER_LAYER_FIELDS = {
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
     "normal": {"embed": None, "head": None, "out": None},  # the model's init
+    # hc has no biases. mhc's read and write ones started alike on every stream
+    # before, at no value of theirs, so that its ids are new.
+    "hc": {"pre_bias": 1.0, "post_bias": 1.0, "res_bias": -8.0},
+    "mhc": {"res_bias": -8.0},
 }
 # How every weight matrix started before the model's `init` was a normal, and before
 # it could be set, as flax's layers start them: runs that set it keep their ids. But
@@ -384,14 +422,18 @@ def _experts_as_they_run(
 
 
 def _without_newer_fields(train: dict) -> dict:
-    """`train`, dumped, without the `_NEWER_FIELDS` that compute as runs did before,
-    nor the `_UNCOMPUTED_FIELDS`."""
+    """`train`, dumped, without the `_NEWER_FIELDS` and `_NEWER_PHASE_FIELDS` that
+    compute as runs did before, nor the `_UNCOMPUTED_FIELDS`."""
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
         for part in (given, given.get("adam") or {}):  # and Muon's own AdamW
             for field, before in fields.items():
                 if field in part and part[field] == before:
                     del part[field]
+    for phase in train.get("curriculum") or ():
+        for field, before in _NEWER_PHASE_FIELDS.items():
+            if field in phase and phase[field] == before:
+                del phase[field]
     for setting, names in _UNCOMPUTED_FIELDS.items():
         for name in names:
             (train.get(setting) or {}).pop(name, None)
@@ -429,6 +471,8 @@ class Run(BaseModel):
         train: How to train it: data, optimizer, schedule, steps, mesh, ...
         choices: The alternative taken on each axis of the sweep, in the order
             written: ``("mqa", "optimizer.lr=0.01")``.
+        axes: The name of each of those axes: the definition and setting its first
+            alternative is written at, ``("attn", "optimizer.lr")``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -437,6 +481,14 @@ class Run(BaseModel):
     arch: Architecture
     train: TrainConfig
     choices: tuple[str, ...] = ()
+    axes: tuple[str, ...] = ()
+
+    def arch_at(self, step: int) -> Architecture:
+        """Return the model as it computes at `step`, in the step that takes the run
+        from `step` steps to the next and in an eval after `step` steps: `arch`, with
+        the RoPE of its full-attention layers as its curriculum's phase then sets it
+        (`full_attention_rope`)."""
+        return full_attention_rope(self.arch, **curriculum.rope_at(self.train, step))
 
     @property
     def id(self) -> str:

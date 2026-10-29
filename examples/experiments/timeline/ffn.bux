@@ -1,0 +1,22 @@
+# The MLP, one change at a time from the 2021 reference, GPT-3's decoder with RoPE
+# (gpt3_rope.bux). Its MLP is 4 times as wide as the stream, with GELU and biases.
+# The gated arms are 8/3 as wide, to the nearest 64, so they hold about as many
+# parameters. Arms: era, source, what it was claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+gated_width = (8 * d_model + 96) // 192 * 64
+
+ffn = base:   ffn
+    # 2020 Shazeer, 2022 PaLM, 2023 Llama: SwiGLU, a SiLU gate; quality at equal
+    # parameters
+    | swiglu: gated_mlp(intermediate_size=gated_width, activation=swish, bias=true)
+    # 2020 Shazeer, 2024 Gemma: GeGLU, a GELU gate; quality at equal parameters
+    | geglu:  gated_mlp(intermediate_size=gated_width, activation=gelu, bias=true)
+    # 2021 Primer, 2024 modded-nanogpt, 2025 Nemotron-H and 3: squared ReLU; quality
+    | relu2:  mlp(intermediate_size=4 * d_model, activation=relu2, bias=true)
+    # 2026 Kimi K3: SiTU-GLU, SiLU's linear factor and the up branch soft-capped;
+    # stability
+    | situ:   gated_mlp(intermediate_size=gated_width, activation=situ, up_softcap=25,
+                        bias=true)

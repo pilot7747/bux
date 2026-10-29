@@ -11,11 +11,11 @@ smoke: runs/smoke-5a4f0f7d85, on 1 × cpu
 smoke: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.003), wsd(warmup=10)
 smoke: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.2429  lr 3.00e-03  grad 0.607  7,844 tok/s  65 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:03
-smoke step 20/50  loss 6.2618  lr 3.00e-03  grad 0.642  77,133 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 30/50  loss 6.2731  lr 3.00e-03  grad 0.516  77,903 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 40/50  loss 6.2478  lr 3.00e-03  grad 0.440  77,802 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  74,244 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 10/50  loss 6.2429  lr 3.00e-03  grad 0.607  7,788 tok/s  66 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:03
+smoke step 20/50  loss 6.2618  lr 3.00e-03  grad 0.642  78,507 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 30/50  loss 6.2731  lr 3.00e-03  grad 0.516  76,792 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 40/50  loss 6.2478  lr 3.00e-03  grad 0.440  76,448 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  77,939 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 ```
 
 The first lines say where the run writes, its model and tokens, and what it logs.
@@ -158,8 +158,8 @@ ids and resume.
 the last, to the console and to `metrics.jsonl`:
 
 ```text
-{"step": 10, "grad_norm": 0.6074022650718689, "loss": 6.2429351806640625, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 7844.047464570489, "time/step_ms": 65.27242502197623, "time/data_ms": 0.08244607597589493, "time/wait_ms": 0.00047925859689712524, "time/hooks_ms": 0.0015832018107175827, "time/launch_ms": 0.3369542770087719, "time/compile_s": 0.5486519997939467}
-{"step": 20, "grad_norm": 0.6416390538215637, "loss": 6.261777877807617, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 77132.63393675412, "time/step_ms": 6.637916713953018, "time/hooks_ms": 9.552074875682592, "time/data_ms": 0.006195856258273125, "time/launch_ms": 0.21903333254158497, "time/wait_ms": 0.03154585137963295}
+{"step": 10, "grad_norm": 0.6074022650718689, "loss": 6.2429351806640625, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 7788.019834385738, "time/step_ms": 65.74200000613928, "time/data_ms": 0.07968749850988388, "time/wait_ms": 2.943520527333021, "time/hooks_ms": 0.0019207131117582321, "time/launch_ms": 0.3474459517747164, "time/compile_s": 0.530834125354886}
+{"step": 20, "grad_norm": 0.6416390538215637, "loss": 6.261777877807617, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 78506.736954646, "time/step_ms": 6.521733291447163, "time/hooks_ms": 8.866466768085957, "time/data_ms": 0.006345659494400024, "time/launch_ms": 0.24111680686473846, "time/wait_ms": 0.0270831398665905}
 ```
 
 | Metric | What it is |
@@ -252,6 +252,7 @@ step. It logs `eval_loss`, the first head's cross-entropy, and, where the run ha
 | `batches` | `10` | batches of `batch` rows each, the same ones every time |
 | `seq_len` | `none` | tokens per row, at least 2; none: the run's `seq_len` |
 | `batch` | `none` | rows per batch; none: the run's `batch` |
+| `positions` | `[]` | where buckets of targets by position start, after 0, in order: each bucket's loss and bits per byte are logged too ([By position](#by-position)) |
 
 An eval is a training step's forward on packed rows, with no backward. Each batch
 sums what it measures over its targets, and the eval adds up the sums:
@@ -308,6 +309,32 @@ trains, the run checks that the eval's rows split over its mesh, as a phase's mu
 Unlike a step, an eval runs its batch whole, so its rows need not split into
 `methods.microbatches`, except under a pipeline, which takes them in microbatches.
 The eval's step compiles once more, for its shape.
+
+### By position
+
+A long eval's mean hides where its targets are: most of a 16k row is far from the
+start of its document. `positions` cuts the targets into buckets by their position,
+and logs the loss and bits per byte of each bucket beside the eval's own:
+
+```bux
+eval = eval(name="repo", data=repos_eval, seq_len=16384, batch=8,
+            positions=[2048, 8192])
+```
+
+This eval logs `repo_bpb_0`, `repo_bpb_2k` and `repo_bpb_8k`: the targets at positions
+0 to 2047, 2048 to 8191, and 8192 on. It logs `repo_loss_0`, `repo_loss_2k` and
+`repo_loss_8k` as well. A target's position is the count of tokens of its document
+before it in the row, so it is the context the target is predicted from. A row of
+2048 tokens has every target in the first bucket.
+
+- **Names:** each bucket is named by its first position, in units of 1024 where the
+  position is a multiple of 1024 (`2048` is `2k`), else in full (`2000` is `2000`).
+  An `objective` can read them: `objective = repo_bpb_8k`
+  ([Searching](searching.md)).
+- **Cost:** the buckets add sums over the same pass, which makes the logits once
+  for every metric of the eval.
+- **Empty buckets:** a bucket that no target reaches logs NaN, as a 2k eval's `8k`
+  bucket would.
 
 ## Checkpoints
 
