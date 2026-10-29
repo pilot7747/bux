@@ -3105,3 +3105,41 @@ def test_doc_copy_hands_the_model_each_steps_candidates_contiguous(
         stepped = inputs.prepare_inputs(batch, None)["doc_copy"]
         for x in (found, stepped):
             assert x.shape == (n, 2) and x.stride() == torch.empty(n, 2).stride()
+
+
+class ContiguousTable(torch.nn.Module):
+    """A stand-in of vLLM's vocab-parallel embedding, whose kernel under tensor
+    parallelism takes contiguous ids alone."""
+
+    def __init__(self, table: torch.Tensor) -> None:
+        super().__init__()
+        self.table = table
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        assert ids.is_contiguous(), "vocab_parallel_embedding requires contiguous ids"
+        return self.table[ids]
+
+
+def test_doc_copy_looks_up_contiguous_ids(stood_in: ModuleType) -> None:
+    """The layer looks its candidates' rows up by contiguous ids, as vLLM's
+    vocab-parallel embedding kernel takes them, though the runner's buffer holds
+    each token's candidate and bucket side by side; and adds their vector."""
+    from bux_vllm import doc_copy  # stood in: Triton's
+
+    d, table = 8, torch.randn(16, 8)
+    embedding = SimpleNamespace(tokens=ContiguousTable(table))
+    c = {"gain": 0.5, "lengths": [1, 2], "counts": 3}
+    config = SimpleNamespace(bux={"d_model": d})
+    site = common.Site("model.copy", None, config, embedding=embedding)
+    layer = doc_copy.DocCopy(c, d, site)
+    layer.scale.data = torch.randn(layer.scale.shape)
+    layer.bucket_embed.data = torch.randn(layer.bucket_embed.shape)
+    found = torch.stack([torch.arange(5) % 16, torch.arange(5) % 7], 1).int()
+    buffer = torch.zeros(64, 2, dtype=torch.int32)
+    buffer[:5] = found
+    x = torch.randn(5, d)
+    y = layer(x, SimpleNamespace(doc_copy=buffer))
+    want = docmatch.vector(
+        table[found[:, 0]], found[:, 1].long(), layer.scale, layer.bucket_embed
+    )
+    torch.testing.assert_close(y, x + 0.5 * want)

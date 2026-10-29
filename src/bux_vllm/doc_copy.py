@@ -70,7 +70,8 @@ class DocCopy(Layer):
         else:
             assert ctx.doc_copy is not None, "doc_copy reads the runner's candidates"
             found = ctx.doc_copy[: x.shape[0]]
-            rows = self.embedding[0].tokens(found[:, 0])
+            # vLLM's vocab-parallel embedding kernel (under TP) takes contiguous ids.
+            rows = self.embedding[0].tokens(found[:, 0].contiguous())
             v = docmatch.vector(rows, found[:, 1].long(), self.scale, self.bucket_embed)
         for name, tap, mode in self.ports:
             if name == "copy" and mode == "write":
