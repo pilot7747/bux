@@ -382,6 +382,10 @@ def test_msa_takes_minimax_s_settings_alone() -> None:
     assert keys.shape == (1, 2, 256)
     assert keys[0, 0, :2].tolist() == [256, 257] and not valid[0, 0, 128:].any()
     assert valid[0, 0, :45].all() and not valid[0, 0, 45:].any()  # 256..300 seen
+    held = torch.ones(2)  # an FP8 cache's scales, read in place, as a CUDA graph can
+    k, v = msa._scales(torch.zeros(1, dtype=torch.float8_e4m3fn), held)
+    assert k.data_ptr() == held.data_ptr() and v.data_ptr() == held[1:].data_ptr()
+    assert msa._scales(torch.zeros(1, dtype=torch.bfloat16), held) == (None, None)
     assert valid[0, 1].all()
 
 
@@ -2468,6 +2472,12 @@ def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:
             for target in node.targets:
                 elts = target.elts if isinstance(target, ast.Tuple) else [target]
                 has |= {e.attr for e in elts if isinstance(e, ast.Attribute)}
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr == "register_buffer":  # self.register_buffer("name", ...)
+            name = node.args[0]
+            assert isinstance(name, ast.Constant)
+            has.add(str(name.value))
     outside = [n for n in tree.body if n is not paged]  # its own reads a config
     reads = {
         n.attr

@@ -70,11 +70,12 @@ def padded(iq: torch.Tensor) -> torch.Tensor:
     return iq if not pad else torch.nn.functional.pad(iq, (0, 0, 0, pad))
 
 
-def _scales(kv: torch.Tensor, scales: tuple[float, float]) -> tuple:
-    """An FP8 cache's scales as the kernels take them, tensors of one; none else."""
+def _scales(kv: torch.Tensor, scales: torch.Tensor) -> tuple:
+    """An FP8 cache's keys' and values' `scales`, (2,) float32, as the kernels take
+    them: views of one each, which a CUDA graph's capture may read; none else."""
     if kv.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         return None, None
-    return tuple(torch.tensor(s, device=kv.device) for s in scales)
+    return scales[0], scales[1]
 
 
 def prompt(
@@ -84,14 +85,14 @@ def prompt(
     kv: torch.Tensor,
     rows: torch.Tensor,
     n: int,
-    attending: tuple[int, float, tuple[float, float]],
+    attending: tuple[int, float, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A prompt chunk's outputs, (Q, h, d), and its picks, (g, Q, k) block ids with
     -1 for none: the chunk is the last Q of its request's `n` tokens, its index
     queries `iq`, (Q, g, i), over the request's index `keys`, (blocks, 128, i), and
     its queries `q` over the paged `kv`, (blocks, g, 128, 2 d), by the request's
     block table `rows`, (1, blocks). `attending` is the blocks a query keeps, the
-    attention's scale and an FP8 cache's scales."""
+    attention's scale and an FP8 cache's scales (`_scales`)."""
     from vllm.models.minimax_m3.common.ops import (
         minimax_m3_index_score,
         minimax_m3_index_topk,
@@ -122,7 +123,7 @@ def decode(
     table: torch.Tensor,
     lens: torch.Tensor,
     longest: int,
-    attending: tuple[int, float, tuple[float, float]],
+    attending: tuple[int, float, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decoded tokens' outputs, (B, h, d), and picks, (g, B, k): each one's index
     query over its request's keys, of `lens` (B,) int32, and its queries over the

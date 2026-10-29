@@ -564,10 +564,11 @@ def check_qsa(decoding: bool) -> bool:
     return best
 
 
-def check_msa(decoding: bool, g: int = 2) -> bool:
+def check_msa(decoding: bool, g: int = 2, fp8: bool = False) -> bool:
     """MSA on vLLM's MiniMax-M3 kernels (`bux_vllm.msa`): its picks of blocks of
     128 per kv head's group against bux's (`bux_vllm.picks.choose`), which must
-    agree but at ties, and its attention against PyTorch's over the same picks."""
+    agree but at ties, and its attention against PyTorch's over the same picks; with
+    `fp8`, over an FP8 copy of the keys and values, decoded in a CUDA graph."""
     from bux_vllm import dsa, msa, picks
 
     torch.manual_seed(0)
@@ -594,12 +595,18 @@ def check_msa(decoding: bool, g: int = 2) -> bool:
     q = torch.randn(count, h, dk, device="cuda", dtype=torch.bfloat16)
     iq = torch.randn(count, g, dims, device="cuda", dtype=torch.bfloat16)
     scale = dk**-0.5
-    attending = (top_k // block, scale, (1.0, 1.0))
-    kv = cache[:, :g]
+    attending = (top_k // block, scale, torch.ones(2, device="cuda"))
+    kv = cache[:, :g].to(torch.float8_e4m3fn) if fp8 else cache[:, :g]
     if decoding:
         positions = torch.tensor([n - 1 for n in lengths], device="cuda")
         lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
-        out, chosen = msa.decode(raw.keys, iq, q, kv, table, lens, 1024, attending)
+        args = (raw.keys, iq, q, kv, table, lens, 1024, attending)
+        out, chosen = msa.decode(*args)
+        if fp8:  # as vLLM's full CUDA graphs decode: captured, then replayed
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out, chosen = msa.decode(*args)
+            graph.replay()
         rows = list(range(len(lengths)))
     else:
         positions = torch.arange(lengths[0], device="cuda")
@@ -617,11 +624,11 @@ def check_msa(decoding: bool, g: int = 2) -> bool:
         a = torch.where(kept[1][t], kept[0][t], -1).sort(-1).values
         b = torch.where(theirs[1][0], theirs[0][0], -1).sort(-1).values
         agree.append((a == b).float().mean().item())
-    gathered = picks.gather(kv, table[rows], kept[0])
+    gathered = picks.gather(kv.to(q.dtype), table[rows], kept[0])
     want = picks.attend(q, gathered, kept[1], dk, scale)
     error = (out.float() - want.float()).abs().max().item()
     share = sum(agree) / len(agree)
-    layout = "decoding" if decoding else "prefill"
+    layout = ("decoding" if decoding else "prefill") + (" in FP8" if fp8 else "")
     print(
         f"plugin msa {layout}, {g} kv heads: picks agreeing with bux's {share:.3f}, "
         f"output error {error:.1e}"
@@ -835,6 +842,7 @@ def main() -> int:
             results.append(
                 attempt("plugin msa", lambda d=decoding, n=g: check_msa(d, n))
             )
+    results.append(attempt("plugin msa fp8", lambda: check_msa(True, 3, fp8=True)))
     attempt("attention", lambda: time_attention(16384, 64, 20000))
     attempt("heads", lambda: time_heads(16384, 64, 20000))
     print("all agree" if all(results) else "MISMATCH")

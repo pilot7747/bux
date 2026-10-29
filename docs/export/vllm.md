@@ -979,7 +979,8 @@ float32, with the kernels forced (`BUX_VLLM_SPARSE_KERNELS=native`), they differ
 from that reference by up to 3.4: FP8 scores often tie exactly, and vLLM's top-k
 breaks a tie its own way, where bux keeps the first key.
 `msa-native`'s prompts fit in one block of 128, so it checks the kernels' attention
-and plumbing; `scripts/vllm_native.py` checks their picks, which agree with bux's.
+and plumbing; `scripts/vllm_native.py` checks their picks, which agree with bux's,
+and their attention over an FP8 cache in a CUDA graph's decoding step.
 `gdn`, `kda`, `kda-odd`, `kda-kimi` and the `mla` cases run in bfloat16 only, and
 `gla` without a conv in float32 alone. A `-` marks a case not measured that way.
 
