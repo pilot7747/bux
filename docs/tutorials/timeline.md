@@ -225,6 +225,7 @@ curriculum = base: yarn_phase | rope: yarn_phase | rope_500k: yarn_phase | ...
 | `dense0.bux` | the candidate (step 8) | its first layer's FFN routed like every other's: no dense layer before the experts |
 | `stack5_d0.bux` | `stack5.bux` | its first layer's FFN routed like every other's, as `dense0.bux` routes the candidate's |
 | `dense_last.bux` | `dense0.bux` | the candidate's one dense layer moved from the first layer to the last |
+| `stack5_dl.bux` | `stack5_d0.bux` | stack5's one dense layer moved from the first layer to the last |
 
 Some changes are not arms. Zero-centered gains train as plain ones, since bux's
 weight decay leaves every gain alone. ALiBi has no layer in bux.
