@@ -69,9 +69,9 @@ class DocCopy(Layer):
             v = ctx.read(tap, pop)
         else:
             assert ctx.doc_copy is not None, "doc_copy reads the runner's candidates"
-            found = ctx.doc_copy[:, : x.shape[0]]
-            rows = self.embedding[0].tokens(found[0])
-            v = docmatch.vector(rows, found[1].long(), self.scale, self.bucket_embed)
+            found = ctx.doc_copy[: x.shape[0]]
+            rows = self.embedding[0].tokens(found[:, 0])
+            v = docmatch.vector(rows, found[:, 1].long(), self.scale, self.bucket_embed)
         for name, tap, mode in self.ports:
             if name == "copy" and mode == "write":
                 ctx.push(tap, v)
@@ -81,7 +81,7 @@ class DocCopy(Layer):
 
 class DocCopyInputs:
     """What a model runner state adds to the inputs of a model with ``doc_copy``:
-    each of the step's tokens' candidate and bucket, (2, T), in a buffer of a fixed
+    each of the step's tokens' candidate and bucket, (T, 2), in a buffer of a fixed
     shape that CUDA graphs replay, 0 for none and for padding."""
 
     lengths: tuple[int, ...] = ()
@@ -90,13 +90,15 @@ class DocCopyInputs:
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         tokens, device = self.max_num_tokens, self.device  # ty: ignore[unresolved-attribute]
-        self.doc_copy = torch.zeros(2, tokens, dtype=torch.int32, device=device)
+        # Tokens first: any step's rows of it are contiguous, as a compiled graph that
+        # replays them takes them, whatever the step's count.
+        self.doc_copy = torch.zeros(tokens, 2, dtype=torch.int32, device=device)
         self.doc_lengths = torch.tensor(self.lengths, dtype=torch.int32, device=device)
 
     def prepare_inputs(self, input_batch: Any, req_states: Any) -> dict[str, Any]:
         out = super().prepare_inputs(input_batch, req_states)  # ty: ignore[unresolved-attribute]
         padded = input_batch.num_tokens_after_padding
-        found = self.doc_copy[:, :padded]
+        found = self.doc_copy[:padded]
         found.zero_()
         n, t = input_batch.num_reqs, input_batch.num_tokens
         if n and t:
@@ -107,7 +109,7 @@ class DocCopyInputs:
             seq = torch.searchsorted(starts[1:], token, right=True)
             pos = computed[seq] + token - starts[seq]
             history = req_states.all_token_ids.gpu
-            self._scan(history, reqs[seq], pos, found[:, :t])
+            self._scan(history, reqs[seq], pos, found[:t])
         return out | {"doc_copy": found}
 
     def _scan(
@@ -128,7 +130,7 @@ class DocCopyInputs:
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         out = super().prepare_dummy_inputs(num_reqs, num_tokens)  # ty: ignore[unresolved-attribute]
         self.doc_copy.zero_()
-        return out | {"doc_copy": self.doc_copy[:, :num_tokens]}
+        return out | {"doc_copy": self.doc_copy[:num_tokens]}
 
 
 def inputs_class(config: Any) -> type | None:
@@ -186,5 +188,5 @@ def _scan_kernel(
     times = tl.max(tl.where(which == best, seen, 0), axis=0)
     candidate = tl.load(h + at + 1, mask=best >= 0, other=0)
     bucket = tl.where(best >= 0, best * COUNTS + tl.minimum(times, COUNTS), 0)
-    tl.store(out_ptr + tok, tl.where(best >= 0, candidate, 0))
-    tl.store(out_ptr + out_stride + tok, bucket)
+    tl.store(out_ptr + tok * out_stride, tl.where(best >= 0, candidate, 0))
+    tl.store(out_ptr + tok * out_stride + 1, bucket)

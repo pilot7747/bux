@@ -121,7 +121,7 @@ class Ctx:
             as vLLM's model runner gives them to a model that asks (engram's).
         ngram_context: Each sequence's last ids before the step, (R, C), -1 for
             none, likewise.
-        doc_copy: Each token's ``doc_copy`` candidate and bucket, (2, T), as the
+        doc_copy: Each token's ``doc_copy`` candidate and bucket, (T, 2), as the
             model runner's state found them (`bux_vllm.doc_copy`).
     """
 

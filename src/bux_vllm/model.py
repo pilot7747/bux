@@ -318,7 +318,7 @@ def _repeat(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
         "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
-        "doc_copy": -1,
+        "doc_copy": 0,
     }
 )
 class BuxModel(Scoped):

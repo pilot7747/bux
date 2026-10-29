@@ -2900,3 +2900,38 @@ def test_the_fp8_emulation_rounds_what_vllm_quantizes(tmp_path: Path) -> None:
         ]
         assert all(torch.equal(a, x) for a, x in zip(again, w if w.dim() == 3 else [w]))
         assert not torch.equal(p, before[name]), name
+
+
+class RunnerState:
+    """A stand-in of vLLM's model runner state, the base `DocCopyInputs` extends."""
+
+    max_num_tokens, device = 64, torch.device("cpu")
+
+    def __init__(self) -> None:
+        pass
+
+    def prepare_inputs(self, input_batch: Any, req_states: Any) -> dict[str, Any]:
+        return {}
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        return {}
+
+
+def test_doc_copy_hands_the_model_each_steps_candidates_contiguous(
+    stood_in: ModuleType,
+) -> None:
+    """Whatever a step's count of tokens, the runner's candidates and buckets it
+    hands the compiled model are rows of its buffer laid out as a fresh tensor of
+    them is, (T, 2) of strides (2, 1): a graph traced on one count replays every
+    other, whose inputs' strides Inductor's compiled code asserts."""
+    from bux_vllm import doc_copy  # stood in: Triton's
+
+    inputs = type(
+        "Inputs", (doc_copy.DocCopyInputs, RunnerState), {"lengths": (1, 2)}
+    )()
+    for n in (1, 5, 64):
+        found = inputs.prepare_dummy_inputs(1, n)["doc_copy"]
+        batch = SimpleNamespace(num_tokens_after_padding=n, num_reqs=0, num_tokens=n)
+        stepped = inputs.prepare_inputs(batch, None)["doc_copy"]
+        for x in (found, stepped):
+            assert x.shape == (n, 2) and x.stride() == torch.empty(n, 2).stride()

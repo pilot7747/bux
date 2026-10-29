@@ -244,9 +244,9 @@ def compare_doc_copy(vocab: int, length: int) -> bool:
     inputs = doc_copy.DocCopyInputs.__new__(doc_copy.DocCopyInputs)
     inputs.lengths, inputs.counts = lengths, 3
     inputs.doc_lengths = torch.tensor(lengths, dtype=torch.int32, device=dev)
-    got = torch.zeros(2, len(pos), dtype=torch.int32, device=dev)
+    got = torch.zeros(len(pos), 2, dtype=torch.int32, device=dev)
     inputs._scan(history, rows.int(), pos.int(), got)
-    ok = all(torch.equal(g.long(), w) for g, w in zip(got, want, strict=True))
+    ok = all(torch.equal(g.long(), w) for g, w in zip(got.T, want, strict=True))
     print(
         f"doc_copy scan, {vocab} tokens, sequences of {length}: {'ok' if ok else 'DIFFERS'}"
     )
