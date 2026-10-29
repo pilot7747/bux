@@ -314,6 +314,7 @@ _NEWER_FIELDS = {
         "cautious_weight_decay": False,
     },
     "schedule": {"horizon": 1.0},
+    "loss": {"prefix": None},
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}

@@ -69,6 +69,7 @@ names: dict[str, str] = {
     "head": "Linear output layer",
     "nextn": "Multi-token prediction",
     "engram": "Engram memory",
+    "doc_copy": "Document-local copy",
     "value_embed": "Value embedding",
     "rmsnorm": "RMSNorm",
     "layernorm": "LayerNorm",
@@ -446,6 +447,12 @@ def _(c: cfg.DropoutConfig, ctx: Context) -> list[str]:
 def _(c: cfg.ValueEmbeddingConfig, ctx: Context) -> list[str]:
     """How wide a row is."""
     return [f"{c.features} wide"]
+
+
+@chips.register("doc_copy")
+def _(c: cfg.DocCopyConfig, ctx: Context) -> list[str]:
+    """Its gain, and the longest context it matches."""
+    return [f"gain {c.gain:g}", f"contexts to {max(c.lengths, default=0)}"]
 
 
 @chips.register("engram")

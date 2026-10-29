@@ -436,6 +436,7 @@ and so do its evals ([Copy pointer](../architectures/layers.md#copy-pointer)):
 |-------|---------|----------|
 | `z` | `0` | `z` times the z-loss, the mean of log(Z)² of the first head (PaLM: 1e-4) |
 | `mtp` | `0.3` | `mtp` times the mean cross-entropy of the heads after the first (DeepSeek-V3) |
+| `prefix` | `none` | the cross-entropy of each target's prefix token, by its schedule's weight ([below](#prefix-token-prediction)) (modded-nanogpt) |
 
 Each head predicts one token further ahead for every `nextn` before it, so a model
 with heads after its first predicts several tokens at each position
@@ -446,7 +447,8 @@ gradient even where float32 rounds a target's probability to 1
 ([Softmax and cross-entropy at large margins](precision.md#softmax-and-cross-entropy-at-large-margins)).
 
 The log names each term: `loss` is the first head's cross-entropy alone, then
-`z_loss` with a z-loss, and `mtp` with heads after the first. Layers add their own
+`z_loss` with a z-loss, `mtp` with heads after the first, and `prefix` with prefix
+tokens. Layers add their own
 terms, such as an MoE's balance loss and a sparse attention indexer's loss, which the
 log names `balance_loss` and `indexer_loss` (see [Experts](../architectures/experts.md)
 and [Attention](../architectures/attention.md)). Eval leaves those out.
@@ -454,3 +456,34 @@ and [Attention](../architectures/attention.md)). Eval leaves those out.
 Whether the loss takes a head's logits in chunks of positions or whole is
 `methods.loss` ([Loss methods](extending.md#loss-methods)). A term of your own is a
 function ([Objective terms](extending.md#objective-terms)).
+
+### Prefix-token prediction
+
+`loss(prefix=prefix())` has the first head also predict each target's *prefix
+token*, as modded-nanogpt's record 88 does: the token whose bytes are the longest
+proper prefix of the target's that the vocabulary has. A target `" running"` also
+teaches the longest of `" runnin"`, `" runni"`, ..., `" r"` that is a token. It needs
+the run's `tokenizer`, which says each token's bytes.
+
+```bux
+loss = loss(z=1e-4, prefix=prefix(weight=0.25, hold=1/3, decay=1/3))
+```
+
+- **The term.** At each target, `weight` times the cross-entropy of its prefix
+  token, by the same softmax as the target's. A target without one, such as a single
+  byte or a special token, adds nothing; the mean is over all the targets, as the
+  loss's.
+- **Its schedule.** The weight holds for the first `hold` of the run's steps, then
+  falls linearly to 0 over the next `decay`, and stays there. The defaults are the
+  record's: 0.25 for the first third, to 0 over the second.
+- **The log.** `prefix_loss` is the prefix tokens' cross-entropy, unweighted;
+  `prefix` is the term the loss adds.
+- **Evals** measure the plain next-token loss and bits per byte.
+
+It takes the first head alone, beside any heads after it, and a document's own
+targets, as the loss does. It costs the first head's loss a second pass over the
+vocabulary, by `methods.loss`.
+
+On a KDA hybrid of 680M parameters at a width of 512, the record's setting left the
+held-out bits per byte where they were: -0.09% on average, -0.10%, +0.13% and -0.29%
+by seed (503M tokens, 3 seeds, B300s, 2026-10-29).

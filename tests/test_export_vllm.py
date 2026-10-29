@@ -51,6 +51,7 @@ from bux_vllm import (
     config,
     copying,
     delta,
+    docmatch,
     dplr,
     feeds,
     kv,
@@ -1304,6 +1305,56 @@ def test_msar_convs_over_steps_are_the_whole_sequences() -> None:
         torch.testing.assert_close(out[1], want[1][14 + step])
     torch.testing.assert_close(pack[1:, :d], before[1:, :d])  # the other call's
     torch.testing.assert_close(pack[3], before[3])
+
+
+@pytest.mark.parametrize("lengths", [(1, 2, 3, 4, 6), (2, 8)], ids=["short", "gaps"])
+def test_doc_copy_scans_each_tokens_sequence_as_bux_matches(lengths: tuple) -> None:
+    """The plugin's scan of each token's sequence so far, for a step of two prompt
+    chunks (the second after its cached tokens) and a decoded token, finds bux's
+    candidates and buckets of each whole sequence."""
+    from bux.architecture.layers.doc_copy import candidates
+
+    tokens = jax.random.randint(jax.random.key(0), (3, 30), 0, 3)
+    seqs = jnp.ones_like(tokens), jnp.broadcast_to(jnp.arange(30), (3, 30))
+    want = [np.asarray(w) for w in candidates(tokens, *seqs, lengths, 3)]
+    history = torch.from_numpy(np.array(tokens)).int()
+    # Row 0's tokens 0-11 whole, row 1's 20-29 after 20 cached, row 2's token 29.
+    rows = torch.tensor([0] * 12 + [1] * 10 + [2])
+    pos = torch.cat([torch.arange(12), torch.arange(20, 30), torch.tensor([29])])
+    got = docmatch.scan(history, rows, pos, list(lengths), 3)
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(g.numpy(), w[rows.numpy(), pos.numpy()])
+
+
+def test_doc_copy_vectors_are_buxs() -> None:
+    source = (
+        HEAD
+        + "model = embed doc_copy(copy=@c) [rmsnorm] doc_copy(gain=1, copy=$c!) head"
+    )
+    m = Model(compile(source), rngs=nnx.Rngs(0))
+    from bux.architecture import DocCopy, Taps
+
+    first = next(x for _, x in nnx.iter_graph(m) if isinstance(x, DocCopy))
+    first.scale[...] = jax.random.normal(jax.random.key(1), first.scale.shape)
+    first.bucket_embed[...] = jax.random.normal(
+        jax.random.key(2), first.bucket_embed.shape
+    )
+    tokens = jax.random.randint(jax.random.key(3), (1, 24), 0, 3)
+    want = np.asarray(first.vector(Taps(tokens=tokens)))[0]
+    history = torch.from_numpy(np.array(tokens)).int()
+    c, b = docmatch.scan(
+        history,
+        torch.zeros(24, dtype=torch.long),
+        torch.arange(24),
+        list(first.lengths),
+        3,
+    )
+    table = torch.from_numpy(np.array(first.embedding.tokens.embedding[...]))
+    scale, embed = (
+        torch.from_numpy(np.array(p[...])) for p in (first.scale, first.bucket_embed)
+    )
+    got = docmatch.vector(table[c], b, scale, embed)
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
@@ -3218,3 +3269,76 @@ def test_rows_no_step_wrote_point_inside_the_cache_and_the_vocabulary() -> None:
         8,
     )
     assert p_copy.shape == (2, 10) and a_sink.shape == (2,)
+
+
+class RunnerState:
+    """A stand-in of vLLM's model runner state, the base `DocCopyInputs` extends."""
+
+    max_num_tokens, device = 64, torch.device("cpu")
+
+    def __init__(self) -> None:
+        pass
+
+    def prepare_inputs(self, input_batch: Any, req_states: Any) -> dict[str, Any]:
+        return {}
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        return {}
+
+
+def test_doc_copy_hands_the_model_each_steps_candidates_contiguous(
+    stood_in: ModuleType,
+) -> None:
+    """Whatever a step's count of tokens, the runner's candidates and buckets it
+    hands the compiled model are rows of its buffer laid out as a fresh tensor of
+    them is, (T, 2) of strides (2, 1): a graph traced on one count replays every
+    other, whose inputs' strides Inductor's compiled code asserts."""
+    from bux_vllm import doc_copy  # stood in: Triton's
+
+    inputs = type(
+        "Inputs", (doc_copy.DocCopyInputs, RunnerState), {"lengths": (1, 2)}
+    )()
+    for n in (1, 5, 64):
+        found = inputs.prepare_dummy_inputs(1, n)["doc_copy"]
+        batch = SimpleNamespace(num_tokens_after_padding=n, num_reqs=0, num_tokens=n)
+        stepped = inputs.prepare_inputs(batch, None)["doc_copy"]
+        for x in (found, stepped):
+            assert x.shape == (n, 2) and x.stride() == torch.empty(n, 2).stride()
+
+
+class ContiguousTable(torch.nn.Module):
+    """A stand-in of vLLM's vocab-parallel embedding, whose kernel under tensor
+    parallelism takes contiguous ids alone."""
+
+    def __init__(self, table: torch.Tensor) -> None:
+        super().__init__()
+        self.table = table
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        assert ids.is_contiguous(), "vocab_parallel_embedding requires contiguous ids"
+        return self.table[ids]
+
+
+def test_doc_copy_looks_up_contiguous_ids(stood_in: ModuleType) -> None:
+    """The layer looks its candidates' rows up by contiguous ids, as vLLM's
+    vocab-parallel embedding kernel takes them, though the runner's buffer holds
+    each token's candidate and bucket side by side; and adds their vector."""
+    from bux_vllm import doc_copy  # stood in: Triton's
+
+    d, table = 8, torch.randn(16, 8)
+    embedding = SimpleNamespace(tokens=ContiguousTable(table))
+    c = {"gain": 0.5, "lengths": [1, 2], "counts": 3}
+    config = SimpleNamespace(bux={"d_model": d})
+    site = common.Site("model.copy", None, config, embedding=embedding)
+    layer = doc_copy.DocCopy(c, d, site)
+    layer.scale.data = torch.randn(layer.scale.shape)
+    layer.bucket_embed.data = torch.randn(layer.bucket_embed.shape)
+    found = torch.stack([torch.arange(5) % 16, torch.arange(5) % 7], 1).int()
+    buffer = torch.zeros(64, 2, dtype=torch.int32)
+    buffer[:5] = found
+    x = torch.randn(5, d)
+    y = layer(x, SimpleNamespace(doc_copy=buffer))
+    want = docmatch.vector(
+        table[found[:, 0]], found[:, 1].long(), layer.scale, layer.bucket_embed
+    )
+    torch.testing.assert_close(y, x + 0.5 * want)

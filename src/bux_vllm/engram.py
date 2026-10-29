@@ -264,13 +264,18 @@ class NGramInputs:
 
 def model_state(vllm_config: Any) -> type:
     """The class of vLLM's model runner state for the model: vLLM's own for a
-    hybrid model, or another, with `NGramInputs` where it has engrams."""
+    hybrid model, or another, with `NGramInputs` where it has engrams and
+    `bux_vllm.doc_copy.DocCopyInputs` where it has ``doc_copy``."""
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
+    from .doc_copy import inputs_class
+
     hybrid = vllm_config.model_config.is_hybrid
-    base = MambaHybridModelState if hybrid else DefaultModelState
-    n = context(vllm_config.model_config.hf_config)
-    if not n:
-        return base
-    return type("BuxNGramModelState", (NGramInputs, base), {"context": n})
+    bases: list[type] = [MambaHybridModelState if hybrid else DefaultModelState]
+    config = vllm_config.model_config.hf_config
+    if n := context(config):
+        bases.insert(0, type("BuxNGramInputs", (NGramInputs,), {"context": n}))
+    if (copies := inputs_class(config)) is not None:
+        bases.insert(0, copies)
+    return bases[0] if len(bases) == 1 else type("BuxModelState", tuple(bases), {})

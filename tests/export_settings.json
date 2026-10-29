@@ -318,6 +318,12 @@
   "type",
   "vocab_classes"
  ],
+ "DocCopyConfig": [
+  "counts",
+  "gain",
+  "lengths",
+  "type"
+ ],
  "MergeConfig": [
   "type"
  ],

@@ -136,6 +136,18 @@ ENGRAM = {
     "no attention": engram(model="embed mem [rmsnorm ffn] mem rmsnorm head"),
 }
 
+#: The document-local copy feature at PR 378's two sites, on one stream and on hc's
+#: copies, on prompts of few tokens that repeat.
+DOC_COPY = {
+    "doc copy": BLOCK
+    + "model = embed doc_copy(copy=@c) block^2 doc_copy(gain=1, copy=$c!) rmsnorm head",
+    "doc copy, short contexts, on the streams": under(
+        "hc(expansion=2)",
+        "model = embed doc_copy(lengths=[1, 2, 3], counts=2, copy=@c) block^2 merge"
+        " doc_copy(gain=1, copy=$c!) rmsnorm head",
+    ),
+}
+
 GRAPH = {
     "shared repeat": BLOCK
     + "shared stack = block^2\nmodel = embed stack stack rmsnorm head",
@@ -286,3 +298,8 @@ def test_engram_hashes_as_bux_builds_it() -> None:
 def test_nextn_pads_past_the_row_as_bux_does() -> None:
     """A row shorter than the tokens ahead embeds token 0 for all of them."""
     check.compare(compile(NEXTN["fresh, three times"]), length=2, steps=2).check()
+
+
+@pytest.mark.parametrize("source", DOC_COPY.values(), ids=DOC_COPY.keys())
+def test_doc_copy_exports(source: str) -> None:
+    check.compare(compile(source)).check()
