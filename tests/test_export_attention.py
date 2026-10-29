@@ -91,6 +91,8 @@ GQA_SETTINGS = {
     "kv conv": GQA + ", kv_conv_size=3)",
     "kv conv, window": GQA + ", kv_conv_size=3, sliding_window_size=4)",
     "dropouts": GQA + ", attention_dropout=0.1, output_dropout=0.1)",
+    "mimetic init": GQA + ", mimetic_vo=0.05, mimetic_noise=0.02, gated=true,"
+    " kv_conv_size=3)",
     "everything at once": "gqa(num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=12,"
     " bias=true, sinks=true, softcap=3.0, gated=true, output_norm=rmsnorm,"
     " qk_norm=rmsnorm, log_scale=0.3, log_scale_floor=3, relative_bias=relbias(rank=2,"

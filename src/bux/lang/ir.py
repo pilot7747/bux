@@ -333,6 +333,8 @@ _NEWER_LAYER_FIELDS = {
         "power_scale": None,
         "power_scale_length": 2048,
         "qk_norm_all_heads": False,
+        "mimetic_vo": None,
+        "mimetic_noise": 0.01,
     },
     "mla": {"gate_head_bias": False},
     "csa": {"gate_head_bias": False},

@@ -502,6 +502,7 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
         (MOE, "bias_momentum", "0.5", "0.9"),
         ("mamba2(state_size=8, head_dim=8)", "num_heads", "none", "4"),
         ("gqa(num_heads=2, num_kv_heads=2)", "power_scale", "none", "0.1"),
+        ("gqa(num_heads=2, num_kv_heads=2)", "mimetic_vo", "none", "0.05"),
         (
             "gqa(num_heads=2, num_kv_heads=2, gated=true)",
             "gate_head_bias",
@@ -563,6 +564,7 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         ("moe", "bias_momentum"): "087eeedead",
         ("mamba2", "num_heads"): "ccdcaff2f8",
         ("gqa", "power_scale"): "4de8bfe6fd",
+        ("gqa", "mimetic_vo"): "4de8bfe6fd",
         ("gqa", "gate_head_bias"): "370e873062",
         ("gqa", "qk_norm_all_heads"): "9a5d6c3ed2",
         ("mla", "gate_head_bias"): "fa0bdd5558",

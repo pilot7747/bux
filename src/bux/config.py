@@ -560,6 +560,20 @@ class GQAConfig(QuadraticAttentionConfig):
     # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
     # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
+    # Mimetic init of the values and the output at this beta (modded-nanogpt's 0.05;
+    # Trockman & Kolter, 2023): v's and o's kernels start as blocks of +sqrt(beta)
+    # and -sqrt(beta) identities, so that the layer's value-output map starts at
+    # -beta I, plus noise; with kv heads, each of a group's query heads takes 1 / its
+    # group's size of it. None: as the init starts them.
+    mimetic_vo: Annotated[float, Field(gt=0)] | None = None
+    mimetic_noise: float = 0.01  # The std of the noise on v and o under mimetic_vo.
+
+    @model_validator(mode="after")
+    def _mimetic(self) -> Self:
+        """Check that the noise of the mimetic init comes with it."""
+        if self.mimetic_noise != 0.01 and self.mimetic_vo is None:
+            raise ValueError("mimetic_noise sets the init that mimetic_vo adds")
+        return self
 
 
 class MLAConfig(QuadraticAttentionConfig):

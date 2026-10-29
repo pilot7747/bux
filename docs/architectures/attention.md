@@ -57,6 +57,7 @@ model = embed block^12 norm head(tied=true)
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
+| `mimetic_vo`, `mimetic_noise` | `none`, `0.01` | values and output started at a value-output map of $-\beta I$, plus noise ([Initialization](initialization.md#mimetic-values-and-output)) (modded-nanogpt) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):

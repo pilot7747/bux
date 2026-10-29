@@ -26,7 +26,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture import observe
 from bux.architecture.attention import sparse
 from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
@@ -247,7 +247,9 @@ class Attention(SoftmaxAttention):
     all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
     run's ``methods.attention`` (`bux.parallel.context`). The heads' outputs then go
-    through `SoftmaxAttention`'s norm, gate, output projection and dropout.
+    through `SoftmaxAttention`'s norm, gate, output projection and dropout. Under
+    ``mimetic_vo`` its value and output kernels start near a value-output map of
+    ``-beta I`` (`~bux.initializers.mimetic_vo`).
     `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
     the config needs them.
 
@@ -340,6 +342,23 @@ class Attention(SoftmaxAttention):
         shape = (2,) if config.value_residual == "learned" else ()
         trained = reads(ports, "v") and config.value_residual != "fixed"
         self.v_mix = nnx.Param(jnp.full(shape, 0.5, jnp.float32)) if trained else None
+        if config.mimetic_vo is not None:
+            self._mimetic(config, width, rngs)
+
+    def _mimetic(self, config: cfg.GQAConfig, width: int, rngs: nnx.Rngs) -> None:
+        """Start v's and o's kernels as `~bux.initializers.mimetic_vo` makes them, after
+        every other draw: v's columns of a fused qkv, and o's alone in a layer that
+        reads its kv port, whose values are its writer's."""
+        assert config.mimetic_vo is not None
+        h, g, dv = self.heads, self.kv_heads, self.v_head_dim
+        beta, noise = config.mimetic_vo, config.mimetic_noise
+        v, o = initializers.mimetic_vo(width, h, g, dv, beta, noise, rngs.params())
+        self.o.kernel[...] = o
+        if self.v is not None:
+            self.v.kernel[...] = v
+        elif self.qkv is not None:
+            start = (h + g) * self.head_dim  # after q and k
+            self.qkv.kernel[...] = self.qkv.kernel[...].at[:, start:].set(v)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         """Attend each position to those before it in its document, and to itself.
