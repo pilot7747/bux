@@ -3,112 +3,193 @@
 | family | against | verdict | `d512` | `d768` | `d1024` | × per parameter | GPU-hours, speedup | 1T tokens |
 |---|---|---|---|---|---|---|---|---|
 | `positions/rope` | the 2021 reference |  |  |  |  |  | 1 | +0.00 [0.00, 0.00] |
-| `milestones/m2026_hybrid` | the 2020 baseline | better | -14.99 | -13.30 | -12.18 | 19 | 1.67 | -8.68 [-9.46, -7.67] |
-| `milestones/m2024_dsv3` | the 2020 baseline | better | -10.59 | -9.66 | -8.74 | 7.46 | 2.89 | -8.00 [-8.59, -7.24] |
-| `milestones/m2026_frontier` | the 2020 baseline | better | -12.35 | -10.77 | -9.76 | 10.4 | 1.47 | -7.91 [-9.11, -7.19] |
-| `moe/moe_latent` | the 2021 reference | better | -4.17 | -5.67 | -6.25 | 3.96 | 8.43 | -5.46 [-6.39, -4.31] |
-| `moe/moe_dsv3` | the 2021 reference | better | -4.89 | -5.85 | -6.23 | 4.27 | 7.95 | -5.23 [-6.06, -4.24] |
-| `milestones/m2025_qwen3next` | the 2020 baseline | better | -14.12 | -12.47 |  | 9.49 | 0.785 | -6.55 [-7.13, -5.49] |
-| `moe/moe_fine` | the 2021 reference | better | -4.28 | -4.74 | -5.10 | 3.71 | 5.68 | -4.24 [-5.01, -3.35] |
-| `moe/moe_8x2` | the 2021 reference | better | -2.04 | -2.56 | -2.80 | 1.81 | 2.93 | -2.29 [-3.13, -1.19] |
-| `mixers/kda` | the 2021 reference | better | -3.75 | -3.63 | -3.39 | 1.92 | 1.6 | -4.96 [-5.64, -3.75] |
-| `positions/irope` | the 2020 baseline | better | -6.81 | -4.25 |  | 2.29 | 3.04 | -2.78 [-3.16, -2.14] |
-| `positions/rope_partial` | the 2020 baseline | better | -6.43 | -3.92 |  | 2.15 | 2.88 | -2.16 [-2.42, -1.65] |
-| `positions/abf` | the 2020 baseline | better | -6.23 | -3.57 |  | 2.05 | 2.8 | -2.48 [-2.84, -1.96] |
-| `positions/rope_10m_partial` | the 2020 baseline | better | -5.70 | -3.14 |  | 1.9 | 2.59 | -2.26 [-2.49, -1.69] |
-| `mixers/gdn2` | the 2021 reference | better | -4.73 | -3.38 |  | 1.87 | 1.78 | -3.70 [-4.16, -3.08] |
-| `interactions/gated_qk` | the 2021 reference | better | -3.59 | -2.83 |  | 1.94 | 2.21 | -2.03 [-2.44, -1.70] |
-| `factorial/r1v1k1f0p0s0` | the 2026 hybrid | better | -2.61 | -2.04 |  | 1.79 | 1.31 | -0.40 [-0.58, -0.12] |
-| `positions/rope_noyarn` | the 2020 baseline | better | -4.32 | -2.27 |  | 1.59 | 2.09 | -1.69 [-1.99, -1.18] |
-| `factorial/r1v1k1f1p0s0` | the 2026 hybrid | better | -2.63 |  |  | 1.73 | 1.3 | -0.36 [-0.50, -0.10] |
-| `factorial/r2v1k1f0p1s0` | the 2026 hybrid | better | -2.22 |  |  | 1.66 | 1.25 | -0.37 [-0.54, -0.11] |
-| `interactions/kvconv_qk` | the 2021 reference | better | -2.27 | -1.81 |  | 1.61 | 1.8 | -1.29 [-1.63, -1.09] |
-| `zoo/kda_1to1` | the 2021 reference | better | -2.92 | -2.87 |  | 1.65 | 1.69 | -3.07 [-3.43, -2.51] |
-| `factorial/r1v1k0f0p0s0` | the 2026 hybrid | better | -1.96 | -1.77 |  | 1.6 | 1.26 | -0.31 [-0.41, -0.08] |
-| `factorial/r1v0k1f0p1s0` | the 2026 hybrid | better | -1.99 |  |  | 1.58 | 1.27 | -0.28 [-0.40, -0.08] |
-| `ffn/relu2` | the 2021 reference | better | -0.28 | -1.12 | -1.07 | 1.24 | 1.74 | -1.26 [-2.18, -0.17] |
-| `zoo/kda_sparse` | the 2021 reference | better | -3.23 | -3.29 |  | 1.61 | 1.14 | -4.72 [-5.31, -3.75] |
-| `factorial/r1v1k0f0p1s1` | the 2026 hybrid | better | -1.77 |  |  | 1.49 | 1.1 | -0.40 [-0.56, -0.11] |
-| `milestones/m2024_llama3` | the 2020 baseline | better | -4.56 | -3.32 | -2.27 | 1.85 | 1.88 | -4.31 [-5.35, -3.87] |
-| `ffn/swiglu` | the 2021 reference | no measurable difference | -0.09 | -0.90 | -0.92 | 1.19 | 1.6 | -1.04 [-2.04, -0.10] |
-| `residuals/attnres` | the 2021 reference | better | -1.61 | -1.50 | -1.18 | 1.45 | 1.59 | -0.98 [-2.28, 0.53] |
-| `mixers/gdn` | the 2021 reference | better | -2.63 | -2.32 | -2.47 | 1.43 | 1.16 | -4.05 [-5.27, -2.72] |
-| `factorial/r2v0k0f0p1s1` | the 2026 hybrid | better | -1.23 |  |  | 1.34 | 1.06 | -0.32 [-0.44, -0.09] |
-| `factorial/r0v1k1f0p0s1` | the 2026 hybrid | better | -1.23 |  |  | 1.34 | 1.06 | -0.32 [-0.46, -0.10] |
-| `factorial/r1v0k0f1p0s1` | the 2026 hybrid | better | -1.46 |  |  | 1.33 | 1.05 | -0.32 [-0.46, -0.09] |
-| `stacks/best` | the 2026 hybrid | better | -1.19 | -0.74 |  | 1.28 | 1.14 | -0.21 [-0.32, -0.06] |
-| `norms/qknorm` | the 2021 reference | no measurable difference | -1.16 | -1.20 | -0.88 | 1.31 | 1.41 | -0.76 [-1.69, 0.64] |
-| `stacks/best_nope` | the 2026 hybrid | better | -1.09 | -0.52 |  | 1.23 | 1.13 | -0.19 [-0.29, -0.06] |
-| `zoo/swa_prope` | the 2021 reference | no measurable difference | -1.07 | -0.82 |  | 1.28 | 1.2 | -3.80 [-4.40, -3.10] |
-| `baseline` | the 2021 reference | worse | +6.72 | +3.94 | +2.39 | 0.532 | 1.35 | -0.66 [-1.12, 1.28] |
-| `zoo/gate_head` | the 2021 reference | no measurable difference | -0.93 | -0.79 |  | 1.25 | 1.34 | -0.62 [-0.99, -0.44] |
-| `interactions/olmo2` | the 2021 reference | no measurable difference | -0.88 | -0.69 |  | 1.23 | 1.34 | -0.64 [-1.02, -0.51] |
-| `attention/kvconv` | the 2021 reference | no measurable difference | -1.03 | -0.97 | -0.74 | 1.26 | 1.3 | -0.53 [-1.64, 1.09] |
-| `stacks2/ours` | the 2026 hybrid | no measurable difference | -0.54 |  |  | 1.22 | 1.29 | +0.07 [-0.06, 0.15] |
-| `residuals/vpgate` | the 2021 reference | no measurable difference | -0.49 | -0.84 |  | 1.21 | 1.26 | -0.52 [-0.90, -0.34] |
-| `mixers/rwkv7` | the 2021 reference | better | -2.91 | -1.86 | -2.07 | 1.63 | 1.21 | -2.82 [-3.82, -1.52] |
-| `factorial/r2v0k1f1p0s0` | the 2026 hybrid | better | -0.82 |  |  | 1.18 | 1.1 | -0.10 [-0.22, -0.00] |
-| `mixers/mamba2` | the 2021 reference | better | -1.49 | -1.18 | -1.46 | 1.21 | 1.08 | -3.55 [-4.43, -2.27] |
-| `stacks/kvconv` | the 2026 hybrid | no measurable difference | -0.54 | -0.50 |  | 1.17 | 1.09 | -0.11 [-0.21, -0.02] |
-| `attention/mla` | the 2021 reference | no measurable difference | +0.52 | +0.62 | +0.21 | 1.03 | 1.12 | -4.26 [-5.23, -2.98] |
-| `attention/gated` | the 2021 reference | better | -2.16 | -1.68 | -1.54 | 1.41 | 1.25 | -0.61 [-1.78, 0.45] |
-| `attention/sinks` | the 2021 reference | no measurable difference | -0.33 | -0.67 |  | 1.17 | 1.21 | -0.40 [-0.79, -0.24] |
-| `factorial/r0v0k1f0p0s1` | the 2026 hybrid | no measurable difference | -0.47 |  |  | 1.15 | 1.01 | -0.20 [-0.31, -0.05] |
-| `stacks/vres` | the 2026 hybrid | no measurable difference | -0.47 | +0.13 |  | 1.07 | 1.05 | -0.12 [-0.21, -0.04] |
-| `ffn/geglu` | the 2021 reference | no measurable difference | -0.22 | -0.88 |  | 1.19 | 1.21 | -0.44 [-0.83, -0.29] |
-| `zoo/swa_nope` | the 2021 reference | no measurable difference | -0.32 | -0.49 |  | 1.14 | 1.12 | -3.56 [-4.04, -2.76] |
-| `embeddings/mtp` | the 2021 reference | no measurable difference | -0.42 | -0.29 |  | 1.13 | 1.14 | -0.42 [-0.82, -0.26] |
-| `interactions/attn_softcap` | the 2021 reference | no measurable difference | -0.23 | -0.50 |  | 1.13 | 1.2 | -0.40 [-0.79, -0.22] |
-| `embeddings/engram` | the 2021 reference | no measurable difference | -0.14 | -0.30 |  | 1.1 | 1.07 | +0.09 [-0.37, 0.23] |
-| `factorial/r2v1k0f1p0s1` | the 2026 hybrid | no measurable difference | -0.48 |  |  | 1.1 | 0.98 | -0.16 [-0.25, -0.04] |
-| `norms/softcap` | the 2021 reference | no measurable difference | -0.15 | -0.11 |  | 1.08 | 1.13 | -0.29 [-0.72, -0.09] |
-| `attention/head128` | the 2021 reference | no measurable difference | -0.11 | -0.08 |  | 1.07 | 0.958 | +0.58 [0.00, 0.70] |
-| `zoo/swa_1to1` | the 2021 reference | no measurable difference | -0.12 | -0.01 |  | 1.07 | 1.23 | -2.13 [-2.53, -1.71] |
-| `zoo/swa_128` | the 2021 reference | no measurable difference | -0.10 | +0.59 |  | 1 | 1.07 | -3.48 [-4.03, -2.78] |
-| `zoo_moe/softmax` | the 2026 frontier | no measurable difference | +0.08 | -0.46 |  | 1.08 | 1.21 | +0.43 [0.08, 0.56] |
-| `ffn/situ` | the 2021 reference | no measurable difference | +0.22 | -0.64 |  | 1.11 | 1.09 | -0.21 [-0.61, -0.08] |
-| `norms/nobias` | the 2021 reference | no measurable difference | +0.17 | -0.10 | -0.21 | 1.04 | 1.07 | -0.15 [-1.41, 1.06] |
-| `norms/sandwich_depth` | the 2021 reference | no measurable difference | +0.10 | +0.08 |  | 1.03 | 1.05 | -0.13 [-0.55, -0.01] |
-| `structure/deep_thin` | the 2021 reference | no measurable difference | -0.21 | -0.31 | -0.33 | 1.09 | 0.526 | +2.17 [0.75, 3.48] |
-| `factorial/r0v1k1f1p1s1` | the 2026 hybrid | no measurable difference | -0.15 |  |  | 1.03 | 0.957 | -0.11 [-0.21, -0.03] |
-| `zoo/swa_sinks` | the 2021 reference | no measurable difference | +0.13 | +0.13 |  | 1.03 | 1.05 | -3.35 [-3.96, -2.57] |
-| `milestones/m2023_llama2` | the 2020 baseline | better | -3.70 | -2.22 | -1.22 | 1.62 | 1.48 | -3.47 [-4.63, -2.65] |
-| `norms/sandwich` | the 2021 reference | no measurable difference | +0.32 | +0.13 |  | 1.01 | 1.03 | -0.08 [-0.47, 0.06] |
-| `interactions/qknorm_fixed` | the 2021 reference | no measurable difference | +0.24 | +0.30 |  | 0.997 | 1.02 | -0.06 [-0.57, 0.09] |
-| `attention/dsa` | the 2021 reference | no measurable difference | +0.10 | +0.10 |  | 0.99 | 1.01 | -3.23 [-3.63, -2.59] |
-| `norms/rmsnorm` | the 2021 reference | no measurable difference | +0.02 | -0.16 | -0.15 | 1.05 | 0.997 | -0.03 [-0.90, 1.22] |
-| `attention/gqa4` | the 2021 reference | worse | +1.10 | +0.75 | +1.11 | 0.972 | 1.19 | -3.04 [-3.57, -1.62] |
-| `zoo_moe/noshared` | the 2026 frontier | no measurable difference | +0.40 | +0.30 |  | 0.97 | 1.17 | +0.58 [0.15, 0.70] |
-| `stacks/rope` | the 2026 hybrid | no measurable difference | +0.42 | +0.38 |  | 0.962 | 0.991 | +0.02 [-0.08, 0.09] |
-| `sparse/qsa` | the 2021 reference | no measurable difference | +0.23 |  |  | 0.973 | 1 | -3.19 [-3.57, -2.48] |
-| `zoo_moe/smebu` | the 2026 frontier | no measurable difference | +0.51 | +0.23 |  | 0.969 | 1.14 | +0.54 [0.14, 0.68] |
-| `residuals/mhc` | the 2021 reference | no measurable difference | -0.86 | -0.57 | -0.56 | 1.16 | 0.831 | +0.77 [-0.51, 1.88] |
-| `zoo_moe/sqrtsoftplus` | the 2026 frontier | no measurable difference | +0.51 | +0.34 |  | 0.958 | 1.14 | +0.55 [0.13, 0.71] |
-| `residuals/hc` | the 2021 reference | better | -2.39 | -2.48 | -1.27 | 1.61 | 0.908 | +0.31 [-1.08, 1.31] |
-| `sparse/msa` | the 2021 reference | no measurable difference | +0.16 |  |  | 0.948 | 1.06 | -1.13 [-1.66, -0.48] |
-| `factorial/r0v0k1f1p1s1` | the 2026 hybrid | no measurable difference | +0.40 |  |  | 0.934 | 0.922 | -0.03 [-0.12, 0.07] |
-| `factorial/r0v0k0f1p1s0` | the 2026 hybrid | worse | +0.67 |  |  | 0.899 | 0.971 | +0.12 [-0.02, 0.24] |
-| `embeddings/value_res` | the 2021 reference | better | -2.13 | -1.08 | -1.01 | 1.37 | 0.873 | +0.24 [-0.72, 1.42] |
-| `structure/parallel` | the 2021 reference | no measurable difference | +0.94 | +1.18 |  | 0.856 | 0.856 | +0.27 [-0.18, 0.40] |
-| `factorial/r0v1k0f1p1s0` | the 2026 hybrid | worse | +0.78 |  |  | 0.882 | 0.963 | +0.14 [-0.01, 0.31] |
-| `milestones/m2021_neox` | the 2020 baseline | better | -6.04 | -3.36 | -2.08 | 1.78 | 0.828 | +0.36 [-1.78, 1.28] |
-| `attention/swa` | the 2021 reference | worse | +1.49 | +1.44 | +0.88 | 0.818 | 1.14 | -2.89 [-3.64, -1.67] |
-| `zoo/swa_sparse` | the 2021 reference | worse | +1.42 | +0.53 |  | 0.876 | 0.793 | -3.78 [-4.39, -2.84] |
-| `positions/rope_500k` | the 2020 baseline | better | -7.09 | -4.28 | -2.84 | 2.09 | 0.633 | +0.89 [-0.69, 1.73] |
-| `zoo/swa_2048` | the 2021 reference | worse | +1.74 | +2.07 |  | 0.732 | 0.871 | -2.40 [-2.77, -1.82] |
-| `embeddings/untied` | the 2021 reference | worse | +2.31 | +0.89 |  | 0.782 | 0.615 | +0.88 [0.31, 1.03] |
-| `zoo/dyt_emb` | the 2021 reference | worse | +2.61 |  |  | 0.673 | 0.529 | +1.19 [0.36, 1.71] |
-| `milestones/m2022_palm` | the 2020 baseline | mixed | -3.64 | -1.14 | +0.20 | 1.45 | 0.55 | -3.39 [-4.40, -2.36] |
-| `attention/mqa` | the 2021 reference | worse | +1.60 | +2.27 | +2.48 | 0.762 | 0.479 | -2.70 [-3.51, -1.21] |
-| `sparse/csa` | the 2021 reference | worse | +8.28 |  |  | 0.317 | 0.235 | +0.64 [-0.04, 1.11] |
-| `zoo/dyt_emb_a02` | the 2021 reference | worse | +9.14 |  |  | 0.256 | 0.021 | +4.61 [3.18, 5.38] |
-| `interactions/nope_power_qk` | the 2021 reference | worse | +9.59 | +4.90 |  | 0.317 | 0.0176 | +4.70 [3.12, 5.43] |
-| `interactions/nope_qk` | the 2021 reference | worse | +9.93 | +5.07 |  | 0.306 | 0.0139 | +4.83 [3.32, 5.68] |
-| `norms/postnorm` | the 2021 reference | worse | +18.55 | +26.51 |  | 0.0528 | 0 | +9.47 [6.94, 10.44] |
-| `positions/nope_power` | the 2020 baseline | worse | +89.06 |  |  | 0.00868 | 0 | +36.11 [33.33, 39.03] |
-| `positions/nope` | the 2020 baseline | worse | +100.61 | +84.72 |  | 0.00642 | 0 | +41.27 [38.25, 44.41] |
-| `zoo/dyt` | the 2021 reference | worse | +73.72 | +9.27 |  | 0.0242 | 0 | +38.36 [29.65, 41.84] |
-| `residuals/gr` | the 2021 reference | worse | +209.92 |  |  | 6.82e-05 | 0 | +112.36 [87.62, 122.98] |
-| `zoo/dyt_a02` | the 2021 reference | worse | +311.59 |  |  | 1.9e-05 | 0 | +163.08 [127.35, 178.42] |
-| `zoo/dyt_a01` | the 2021 reference | worse | +311.59 |  |  | 1.9e-05 | 0 | +163.08 [126.14, 177.98] |
-| `zoo/dyt_a005` | the 2021 reference | worse | +311.59 |  |  | 1.9e-05 | 0 | +163.08 [126.84, 179.46] |
+| `milestones/m2025_qwen3next` | the 2020 baseline | better | -14.70 | -12.47 | -11.50 | 15.6 | 1.2 | -8.49 [-9.23, -8.15] |
+| `milestones/m2026_hybrid` | the 2020 baseline | better | -15.56 | -13.25 | -12.18 | 32.6 | 1.35 | -8.53 [-9.38, -8.12] |
+| `milestones/m2024_dsv3` | the 2020 baseline | better | -11.19 | -9.66 | -8.74 | 9.75 | 2.27 | -8.39 [-9.10, -7.90] |
+| `milestones/m2026_frontier` | the 2020 baseline | better | -12.94 | -10.77 | -9.78 | 14.6 | 1.26 | -8.22 [-8.97, -7.65] |
+| `moe/moe_latent` | the 2021 reference | better | -4.15 | -5.44 | -6.25 | 4.71 | 7.84 | -5.67 [-7.02, -4.67] |
+| `moe/moe_dsv3` | the 2021 reference | better | -4.88 | -5.62 | -6.23 | 5.12 | 7.49 | -5.50 [-6.97, -4.33] |
+| `moe/moe_fine` | the 2021 reference | better | -4.26 | -4.51 | -5.10 | 4.47 | 5.93 | -4.21 [-5.68, -3.35] |
+| `stack5_d0` | hybrid + hc, value residual, key-value conv | better | -4.97 | -2.88 |  | 5.15 | 1.52 | -0.68 [-0.84, -0.38] |
+| `stack5_dl` | hybrid + hc, value residual, key-value conv | better | -4.90 | -2.91 |  | 5.12 | 1.12 | -0.67 [-0.86, -0.37] |
+| `factorial/r1v1k0f0p0s0` | the 2026 hybrid | better | -1.96 | -1.69 | -1.51 | 2.92 | 1.69 | -0.81 [-1.24, -0.19] |
+| `factorial_mhc` | the 2026 hybrid | better | -2.85 | -2.10 | -1.78 | 3.45 | 2 | -0.70 [-1.35, -0.04] |
+| `stack6` | hybrid + hc, value residual, key-value conv | better | -4.78 | -3.14 |  | 4.06 | 1.44 | -0.57 [-0.73, -0.34] |
+| `newlayers_cplm/nl_cplm_w4k` | hybrid + hc, value residual, key-value conv | better | -4.02 | -2.26 |  | 3.31 | 1.31 | -0.56 [-0.75, -0.31] |
+| `moe/moe_8x2` | the 2021 reference | better | -2.02 | -2.32 | -2.80 | 1.92 | 3 | -2.26 [-3.58, -1.10] |
+| `swa/swa_hv1k` | the 2026 frontier | better | -4.19 | -2.98 | -2.90 | 2.89 | 1.47 | -0.70 [-1.38, 0.12] |
+| `mixers/kda` | the 2021 reference | better | -3.73 | -3.39 | -3.39 | 2.17 | 1.44 | -4.69 [-5.98, -3.92] |
+| `positions/irope` | the 2020 baseline | better | -7.43 | -4.25 |  | 2.4 | 2.84 | -2.74 [-3.11, -2.34] |
+| `stack5` | hybrid + hc, value residual, key-value conv | better | -4.84 | -2.86 | -1.78 | 4.89 | 1.36 | -0.40 [-0.76, -0.02] |
+| `positions/rope_partial` | the 2020 baseline | better | -7.06 | -3.92 |  | 2.25 | 2.7 | -2.58 [-2.99, -2.19] |
+| `factorial/r1v1k1f0p0s0` | the 2026 hybrid | better | -2.61 | -2.09 | -1.88 | 3.51 | 1.47 | -0.47 [-1.07, 0.13] |
+| `positions/abf` | the 2020 baseline | better | -6.87 | -3.57 |  | 2.14 | 2.63 | -2.49 [-2.90, -2.10] |
+| `newlayers_cplm/nl_cplm` | hybrid + hc, value residual, key-value conv | better | -4.14 | -2.53 | -1.45 | 3.64 | 1.24 | -0.37 [-0.65, -0.04] |
+| `mixers/gdn2` | the 2021 reference | better | -4.71 | -3.15 |  | 2.03 | 1.88 | -2.91 [-3.84, -2.56] |
+| `positions/rope_10m_partial` | the 2020 baseline | better | -6.34 | -3.14 |  | 1.96 | 2.44 | -2.27 [-2.67, -1.87] |
+| `muon_2021` | the 2021 reference | better | -3.29 | -1.99 |  | 1.99 | 2.04 | -2.27 [-3.01, -2.00] |
+| `swa/swa_hvk` | the 2026 frontier | better | -3.37 |  |  | 2.18 | 1.37 | -0.51 [-0.72, -0.27] |
+| `interactions/gated_qk` | the 2021 reference | better | -3.57 | -2.60 |  | 2.06 | 2.11 | -1.95 [-2.78, -1.67] |
+| `factorial/r1v1k1f1p0s0` | the 2026 hybrid | better | -2.63 |  |  | 2.07 | 1.41 | -0.36 [-0.57, -0.19] |
+| `milestones/m2024_llama3` | the 2020 baseline | better | -5.20 | -3.32 | -2.27 | 1.96 | 1.86 | -4.71 [-5.71, -4.26] |
+| `factorial/r2v1k1f0p1s0` | the 2026 hybrid | better | -2.22 |  |  | 1.95 | 1.25 | -0.41 [-0.59, -0.23] |
+| `newlayers_opt/nl_normuon` | hybrid + hc, value residual, key-value conv | better | -2.31 |  |  | 1.95 | 1.15 | -0.33 [-0.44, -0.17] |
+| `ideas_opt/muon` | hybrid + hc, value residual, key-value conv | better | -2.18 | -1.78 |  | 2 | 1.15 | -0.32 [-0.45, -0.15] |
+| `audit/attnres_vk` | the 2026 hybrid | better | -1.99 | -1.44 | -0.77 | 2.47 | 1.22 | -0.41 [-1.10, 0.23] |
+| `mhc_init/loose_mix` | the 2021 reference | better | -2.78 |  |  | 1.91 | 1.85 | -1.99 [-2.81, -1.80] |
+| `mhc_init/write_alike` | the 2021 reference | better | -2.76 |  |  | 1.9 | 1.84 | -1.98 [-2.77, -1.77] |
+| `mhc_init/mhc` | the 2021 reference | better | -2.76 |  |  | 1.9 | 1.84 | -1.97 [-2.68, -1.75] |
+| `factorial/r1v0k1f0p1s0` | the 2026 hybrid | better | -1.99 |  |  | 1.84 | 1.38 | -0.28 [-0.44, -0.11] |
+| `positions/rope_noyarn` | the 2020 baseline | better | -4.96 | -2.27 |  | 1.62 | 1.99 | -1.69 [-2.05, -1.27] |
+| `ffn/relu2` | the 2021 reference | better | -0.26 | -0.87 | -1.07 | 1.26 | 1.8 | -1.48 [-2.76, -0.14] |
+| `mixers/gdn` | the 2021 reference | better | -2.62 | -2.08 | -2.47 | 1.52 | 1.08 | -4.16 [-5.47, -3.16] |
+| `factorial/r1v1k0f0p1s1` | the 2026 hybrid | better | -1.77 |  |  | 1.73 | 1.63 | -0.04 [-0.29, 0.12] |
+| `zoo/kda_1to1` | the 2021 reference | better | -2.90 | -2.63 |  | 1.73 | 1.41 | -3.32 [-3.99, -3.02] |
+| `interactions/kvconv_qk` | the 2021 reference | better | -2.25 | -1.58 |  | 1.66 | 1.73 | -1.22 [-2.01, -1.02] |
+| `residuals/gr` | the 2021 reference | better | -2.91 | -1.34 |  | 1.48 | 1.72 | -1.37 [-2.32, -1.15] |
+| `ffn/swiglu` | the 2021 reference | no measurable difference | -0.07 | -0.66 | -0.92 | 1.21 | 1.7 | -1.45 [-2.82, -0.26] |
+| `zoo/kda_sparse` | the 2021 reference | better | -3.21 | -3.06 |  | 1.71 | 0.879 | -4.79 [-5.52, -4.39] |
+| `factorial/r1v0k0f1p0s1` | the 2026 hybrid | better | -1.47 |  |  | 1.52 | 1.55 | +0.04 [-0.19, 0.23] |
+| `factorial/r2v0k0f0p1s1` | the 2026 hybrid | better | -1.23 |  |  | 1.52 | 1.48 | -0.02 [-0.22, 0.12] |
+| `factorial/r0v1k1f0p0s1` | the 2026 hybrid | better | -1.23 |  |  | 1.52 | 1.31 | -0.14 [-0.34, -0.01] |
+| `stacks/best` | the 2026 hybrid | better | -1.19 | -0.80 |  | 1.48 | 1.13 | -0.28 [-0.42, -0.15] |
+| `swa/lean_hv1k` | the 2026 frontier | better | -1.37 | -1.81 |  | 1.5 | 0.855 | -0.25 [-0.40, -0.09] |
+| `stacks/best_nope` | the 2026 hybrid | better | -1.09 | -0.58 |  | 1.42 | 1.11 | -0.27 [-0.42, -0.13] |
+| `mixers/rwkv7` | the 2021 reference | better | -2.90 | -1.62 | -2.07 | 1.72 | 1.26 | -2.58 [-4.07, -1.48] |
+| `residuals/attnres` | the 2021 reference | better | -1.59 | -1.20 | -1.18 | 1.52 | 1.41 | -0.69 [-2.77, 0.15] |
+| `mixers/mamba2` | the 2021 reference | better | -1.48 | -0.94 | -1.46 | 1.25 | 0.995 | -3.64 [-4.88, -2.69] |
+| `norms/qknorm` | the 2021 reference | better | -1.14 | -0.90 | -0.88 | 1.36 | 1.4 | -0.79 [-2.65, 0.19] |
+| `stacks2/ours` | the 2026 hybrid | no measurable difference | -0.54 |  |  | 1.36 | 1.49 | +0.10 [-0.11, 0.26] |
+| `milestones/m2023_llama2` | the 2020 baseline | better | -4.35 | -2.22 | -1.22 | 1.66 | 1.52 | -4.01 [-4.90, -3.35] |
+| `factorial/r2v0k1f1p0s0` | the 2026 hybrid | better | -0.82 |  |  | 1.33 | 1.14 | -0.16 [-0.34, -0.04] |
+| `stacks/kvconv` | the 2026 hybrid | no measurable difference | -0.54 | -0.56 |  | 1.33 | 1.08 | -0.21 [-0.37, -0.08] |
+| `stack3/s3_e1g1o1l1` | hybrid + hc, value residual, key-value conv | better | -1.17 | -0.19 |  | 1.19 | 1.13 | -0.11 [-0.18, 0.02] |
+| `attention/gated` | the 2021 reference | better | -2.14 | -1.38 | -1.54 | 1.49 | 1.37 | -0.79 [-2.51, 0.30] |
+| `zoo/swa_prope` | the 2021 reference | no measurable difference | -1.05 | -0.58 |  | 1.28 | 0.95 | -3.89 [-4.43, -3.67] |
+| `attention/mla` | the 2021 reference | no measurable difference | +0.55 | +0.87 | +0.21 | 1.04 | 1.03 | -4.07 [-5.13, -3.20] |
+| `ideas2/ar_gnorm` | audit/attnres_vk | better | -0.95 |  |  | 1.28 | 1.54 | +0.17 [0.06, 0.28] |
+| `factorial/r0v0k1f0p0s1` | the 2026 hybrid | no measurable difference | -0.48 |  |  | 1.28 | 1.25 | -0.02 [-0.21, 0.12] |
+| `stacks/vres` | the 2026 hybrid | no measurable difference | -0.48 | +0.07 |  | 1.21 | 1.07 | -0.18 [-0.33, -0.07] |
+| `zoo/gate_head` | the 2021 reference | no measurable difference | -0.91 | -0.55 |  | 1.25 | 1.3 | -1.04 [-1.75, -0.89] |
+| `stack3/s3_e1g1o0l0` | hybrid + hc, value residual, key-value conv | better | -0.93 |  |  | 1.25 | 1.36 | +0.07 [0.01, 0.17] |
+| `interactions/olmo2` | the 2021 reference | no measurable difference | -0.86 | -0.44 |  | 1.23 | 1.28 | -0.56 [-1.24, -0.44] |
+| `stack3/s3_e0g1o1l0` | hybrid + hc, value residual, key-value conv | better | -0.90 |  |  | 1.24 | 1.35 | +0.08 [0.02, 0.17] |
+| `factorial/r2v1k0f1p0s1` | the 2026 hybrid | no measurable difference | -0.48 |  |  | 1.22 | 1.32 | +0.10 [-0.08, 0.24] |
+| `stack3/s3_e0g1o0l1` | hybrid + hc, value residual, key-value conv | better | -0.83 |  |  | 1.22 | 1.35 | +0.09 [0.02, 0.22] |
+| `attention/kvconv` | the 2021 reference | no measurable difference | -1.01 | -0.67 | -0.74 | 1.3 | 1.23 | -0.36 [-2.25, 0.76] |
+| `residuals/vpgate` | the 2021 reference | no measurable difference | -0.47 | -0.60 |  | 1.21 | 1.22 | -0.40 [-1.08, -0.24] |
+| `ideas/gnorm` | hybrid + hc, value residual, key-value conv | better | -0.71 | -0.56 |  | 1.2 | 1.12 | -0.05 [-0.12, 0.08] |
+| `western/west_prope` | the 2026 frontier | no measurable difference | -0.29 |  |  | 1.19 | 1.06 | -0.15 [-0.29, -0.03] |
+| `baseline` | the 2021 reference | worse | +7.47 | +4.20 | +2.39 | 0.495 | 1.21 | -0.46 [-2.30, 1.11] |
+| `stack3/s3_e1g0o1l0` | hybrid + hc, value residual, key-value conv | better | -0.68 |  |  | 1.17 | 1.04 | -0.08 [-0.14, 0.04] |
+| `stack3/s3_e1g0o0l1` | hybrid + hc, value residual, key-value conv | better | -0.66 |  |  | 1.17 | 1.04 | -0.08 [-0.15, 0.04] |
+| `ideas2/emb_sqrt` | hybrid + hc, value residual, key-value conv | mixed | -0.73 | +0.71 |  | 0.962 | 1.04 | -0.08 [-0.14, 0.03] |
+| `stack3/s3_e1g0o1l1` | hybrid + hc, value residual, key-value conv | mixed | -0.73 | +0.66 |  | 0.97 | 1.04 | -0.08 [-0.14, 0.05] |
+| `attention/sinks` | the 2021 reference | no measurable difference | -0.31 | -0.43 |  | 1.16 | 1.19 | -0.38 [-0.95, -0.28] |
+| `ffn/geglu` | the 2021 reference | no measurable difference | -0.20 | -0.64 |  | 1.18 | 1.18 | -0.52 [-1.16, -0.41] |
+| `factorial/r0v1k1f1p1s1` | the 2026 hybrid | no measurable difference | -0.15 |  |  | 1.14 | 1.29 | +0.16 [-0.00, 0.32] |
+| `zoo/swa_nope` | the 2021 reference | no measurable difference | -0.30 | -0.25 |  | 1.14 | 0.886 | -3.66 [-4.13, -3.46] |
+| `embeddings/mtp` | the 2021 reference | no measurable difference | -0.40 | -0.05 |  | 1.12 | 1.09 | -0.32 [-1.01, -0.25] |
+| `ideas/emb_norm` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.53 |  |  | 1.13 | 1.05 | -0.06 [-0.12, 0.07] |
+| `norms/nobias` | the 2021 reference | no measurable difference | +0.19 | +0.15 | -0.21 | 1.04 | 1.14 | -0.31 [-1.67, 0.73] |
+| `interactions/attn_softcap` | the 2021 reference | no measurable difference | -0.21 | -0.25 |  | 1.13 | 1.14 | -0.30 [-0.83, -0.21] |
+| `milestones/m2021_neox` | the 2020 baseline | better | -6.68 | -3.36 | -2.08 | 1.86 | 1.18 | -0.36 [-1.54, 0.82] |
+| `zoo_moe/softmax` | the 2026 frontier | no measurable difference | +0.08 | -0.46 |  | 1.12 | 1.26 | +0.20 [0.04, 0.31] |
+| `stack4/s4_gvxd` | hybrid + hc, value residual, key-value conv | no measurable difference |  | -0.91 |  | 1.11 | 1.13 | -0.02 [-0.10, 0.08] |
+| `audit/hc2_vk` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.42 | +0.60 | +0.63 | 0.888 | 0.927 | -0.13 [-0.79, 0.61] |
+| `dense_last` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.42 | -0.34 |  | 1.11 | 0.76 | -0.06 [-0.13, 0.07] |
+| `newlayers_doc` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.51 | -0.17 |  | 1.09 | 1.01 | -0.06 [-0.14, 0.05] |
+| `attention/gqa4` | the 2021 reference | worse | +1.12 | +1.00 | +1.11 | 0.967 | 1.09 | -3.16 [-3.84, -1.87] |
+| `structure/deep_thin` | the 2021 reference | no measurable difference | -0.19 | -0.07 | -0.33 | 1.1 | 0.826 | +1.42 [-0.06, 2.63] |
+| `embeddings/engram` | the 2021 reference | no measurable difference | -0.12 | -0.06 |  | 1.09 | 1.07 | +0.06 [-0.60, 0.17] |
+| `residuals/hc` | the 2021 reference | better | -2.38 | -2.18 | -1.27 | 1.68 | 1.05 | +0.15 [-1.44, 1.13] |
+| `norms/softcap` | the 2021 reference | no measurable difference | -0.13 | +0.13 |  | 1.07 | 1.08 | -0.18 [-0.78, -0.13] |
+| `ideas_opt/zero_out` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.33 |  |  | 1.07 | 1.02 | -0.03 [-0.08, 0.10] |
+| `stacks/rope` | the 2026 hybrid | no measurable difference | +0.42 | +0.33 |  | 1.06 | 1.02 | -0.05 [-0.20, 0.04] |
+| `zoo/swa_1to1` | the 2021 reference | no measurable difference | -0.10 | +0.23 |  | 1.05 | 1.05 | -2.36 [-2.94, -2.25] |
+| `attention/head128` | the 2021 reference | no measurable difference | -0.10 | +0.16 |  | 1.06 | 1.12 | -0.66 [-1.22, -0.60] |
+| `zoo/swa_128` | the 2021 reference | no measurable difference | -0.08 | +0.84 |  | 0.98 | 0.853 | -3.58 [-4.13, -3.42] |
+| `ideas/onorm` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.30 |  |  | 1.06 | 1.03 | -0.03 [-0.08, 0.10] |
+| `newlayers/nl_mimetic` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.28 |  |  | 1.05 | 1.03 | -0.02 [-0.07, 0.11] |
+| `norms/rmsnorm` | the 2021 reference | no measurable difference | +0.04 | +0.09 | -0.15 | 1.05 | 1.06 | -0.13 [-1.60, 1.09] |
+| `zoo_moe/noshared` | the 2026 frontier | no measurable difference | +0.40 | +0.30 |  | 1 | 1.25 | +0.31 [0.13, 0.47] |
+| `ideas2/hc_single` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.25 |  |  | 1.04 | 1.02 | -0.02 [-0.07, 0.09] |
+| `ffn/situ` | the 2021 reference | no measurable difference | +0.23 | -0.40 |  | 1.1 | 1.05 | -0.14 [-0.79, -0.04] |
+| `newlayers/nl_xsa_learned` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.20 | -0.14 |  | 1.04 | 1.03 | -0.01 [-0.06, 0.11] |
+| `newlayers/nl_diff` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.25 | -0.19 |  | 1.04 | 1.04 | +0.00 [-0.05, 0.11] |
+| `zoo_moe/sqrtsoftplus` | the 2026 frontier | no measurable difference | +0.51 | +0.34 |  | 0.988 | 1.21 | +0.29 [0.09, 0.40] |
+| `zoo_moe/smebu` | the 2026 frontier | no measurable difference | +0.52 | +0.23 |  | 0.999 | 1.21 | +0.29 [0.10, 0.40] |
+| `newlayers_opt/nl_ema` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.16 |  |  | 1.02 | 1.01 | -0.01 [-0.07, 0.11] |
+| `norms/sandwich_depth` | the 2021 reference | no measurable difference | +0.12 | +0.33 |  | 1.02 | 1.02 | -0.02 [-0.62, 0.02] |
+| `factorial/r0v0k1f1p1s1` | the 2026 hybrid | no measurable difference | +0.40 |  |  | 1.02 | 1.23 | +0.25 [0.05, 0.42] |
+| `stack4/s4_v0x1d1` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.20 |  |  | 1.01 | 1.04 | +0.03 [-0.02, 0.16] |
+| `ideas/vres_learned` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.13 |  |  | 1.01 | 1.02 | -0.00 [-0.04, 0.12] |
+| `stack3/s3_e0g0o1l1` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.12 |  |  | 1.01 | 1.01 | +0.00 [-0.06, 0.14] |
+| `zoo/swa_sinks` | the 2021 reference | no measurable difference | +0.16 | +0.38 |  | 1.01 | 0.833 | -3.45 [-4.01, -3.29] |
+| `embeddings/value_res` | the 2021 reference | better | -2.11 | -0.84 | -1.01 | 1.43 | 1 | -0.00 [-1.57, 1.01] |
+| `ideas/ghead128` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.08 |  |  | 0.999 | 0.962 | -0.04 [-0.10, 0.10] |
+| `newlayers_aux` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.08 |  |  | 0.999 | 1.01 | +0.01 [-0.05, 0.13] |
+| `sparse_native/dsa_c` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.13 | -0.01 |  | 0.996 | 1.17 | +0.12 [0.07, 0.25] |
+| `norms/sandwich` | the 2021 reference | no measurable difference | +0.34 | +0.37 |  | 0.989 | 0.985 | +0.05 [-0.54, 0.15] |
+| `interactions/qknorm_fixed` | the 2021 reference | no measurable difference | +0.27 | +0.55 |  | 0.977 | 0.983 | +0.06 [-0.51, 0.14] |
+| `western/west_mla` | the 2026 frontier | worse | +0.68 |  |  | 0.982 | 1.13 | +0.24 [0.07, 0.36] |
+| `newlayers/nl_hyga` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.02 |  |  | 0.98 | 1.03 | +0.03 [-0.03, 0.16] |
+| `ideas/engram` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.00 |  |  | 0.979 | 1.16 | +0.15 [0.08, 0.27] |
+| `newlayers_opt/nl_cwd` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.01 |  |  | 0.975 | 1 | +0.02 [-0.05, 0.14] |
+| `factorial/r0v0k0f1p1s0` | the 2026 hybrid | worse | +0.67 |  |  | 0.973 | 0.988 | +0.02 [-0.13, 0.12] |
+| `attention/dsa` |  | no measurable difference | +0.12 | +0.34 |  | 0.973 |  |  |
+| `dense0` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.04 | +0.07 |  | 0.971 | 1 | +0.03 [-0.03, 0.16] |
+| `indexshare/is2_c` | hybrid + hc, value residual, key-value conv | no measurable difference |  | +0.05 |  | 0.972 | 1.13 | +0.12 [0.02, 0.25] |
+| `ideas/seg` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.04 |  |  | 0.97 | 1.01 | +0.02 [-0.03, 0.16] |
+| `sparse_native/msa_c` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.11 | -0.03 |  | 0.971 | 1.28 | +0.25 [0.16, 0.40] |
+| `canon/canon_c` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.07 |  |  | 0.961 | 1.05 | +0.07 [0.01, 0.19] |
+| `sparse_native/qsa_c` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.11 | -0.02 |  | 0.969 | 1.25 | +0.23 [0.15, 0.39] |
+| `sparse/qsa` |  | no measurable difference | +0.25 |  |  | 0.959 |  |  |
+| `factorial/r0v1k0f1p1s0` | the 2026 hybrid | worse | +0.77 |  |  | 0.954 | 0.982 | +0.03 [-0.12, 0.17] |
+| `indexshare/is4x_c` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.09 | +0.12 |  | 0.949 | 1 | +0.03 [-0.04, 0.14] |
+| `ideas2/lr_floor` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.12 |  |  | 0.949 | 0.995 | +0.04 [-0.03, 0.16] |
+| `ideas/kvshare` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.18 |  |  | 0.938 | 0.99 | +0.03 [-0.02, 0.15] |
+| `newlayers/nl_paired` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.18 |  |  | 0.934 | 1.05 | +0.12 [0.05, 0.24] |
+| `sparse/msa` |  | no measurable difference | +0.20 |  |  | 0.931 |  |  |
+| `indexshare/is4_c` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.13 | +0.61 |  | 0.869 | 1.11 | +0.15 [0.07, 0.28] |
+| `attention/swa` | the 2021 reference | worse | +1.50 | +1.68 | +0.88 | 0.811 | 1.07 | -2.78 [-3.84, -1.85] |
+| `indexshare_ref/ref_is4` | the 2021 reference | no measurable difference | +0.72 | +0.66 |  | 0.912 | 0.985 | -1.07 [-1.62, -0.93] |
+| `western/west_mla_nope` | the 2026 frontier | worse | +1.29 |  |  | 0.892 | 1.08 | +0.33 [0.15, 0.45] |
+| `indexshare_ref/ref_is4x` | the 2021 reference | no measurable difference | +0.91 | +0.31 |  | 0.931 | 0.955 | -1.01 [-1.50, -0.91] |
+| `newlayers/nl_xsa` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.41 |  |  | 0.882 | 0.995 | +0.09 [0.04, 0.23] |
+| `audit/moe128_vk` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.47 |  |  | 0.881 | 0.95 | +0.05 [-0.01, 0.17] |
+| `canon/ar_canon_ac` | audit/attnres_vk | worse | +0.59 |  |  | 0.878 | 1.13 | +0.23 [0.10, 0.35] |
+| `positions/rope_500k` | the 2020 baseline | better | -7.71 | -4.28 | -2.84 | 2.22 | 0.816 | +0.47 [-0.98, 1.28] |
+| `canon/canon_ac` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.43 |  |  | 0.877 | 1.04 | +0.14 [0.06, 0.27] |
+| `structure/parallel` | the 2021 reference | no measurable difference | +0.96 | +1.43 |  | 0.827 | 0.831 | +0.39 [-0.16, 0.49] |
+| `newlayers/nl_msar` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.53 |  |  | 0.849 | 2.16 | +1.45 [0.92, 1.94] |
+| `zoo/swa_sparse` | the 2021 reference | worse | +1.44 | +0.78 |  | 0.849 | 0.614 | -3.81 [-4.28, -3.59] |
+| `gdn2_hybrid/gdn2` | the 2026 hybrid | worse | +1.50 | +1.41 |  | 0.784 | 0.908 | +0.13 [-0.02, 0.25] |
+| `ideas2/canon_a` | hybrid + hc, value residual, key-value conv | worse | +0.78 |  |  | 0.807 | 1.1 | +0.26 [0.15, 0.44] |
+| `stack4/s4_v1x1d1` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.37 | -0.61 |  | 0.875 | 0.978 | +0.13 [0.06, 0.25] |
+| `newlayers/nl_ve` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.35 | -0.05 |  | 0.794 | 0.963 | +0.10 [0.04, 0.21] |
+| `stack4/s4_v1x1d0` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.37 |  |  | 0.79 | 1.01 | +0.15 [0.09, 0.27] |
+| `newlayers/nl_null` | hybrid + hc, value residual, key-value conv | no measurable difference | +0.17 |  |  | 0.788 | 0.942 | +0.14 [0.06, 0.27] |
+| `swa/lean` | the 2026 frontier | worse | +2.64 |  |  | 0.752 | 0.63 | +0.23 [0.06, 0.34] |
+| `newlayers/nl_kveq` | hybrid + hc, value residual, key-value conv | worse | +1.16 |  |  | 0.743 | 0.94 | +0.18 [0.09, 0.30] |
+| `stack4/s4_v1x0d1` | hybrid + hc, value residual, key-value conv | no measurable difference | -0.17 |  |  | 0.741 | 0.976 | +0.19 [0.10, 0.30] |
+| `zoo/swa_2048` | the 2021 reference | worse | +1.75 | +2.32 |  | 0.698 | 0.719 | -2.54 [-3.00, -2.33] |
+| `newlayers/nl_kveq_plain` | hybrid + hc, value residual, key-value conv | worse | +1.28 |  |  | 0.723 | 0.933 | +0.20 [0.13, 0.36] |
+| `newlayers/nl_null_lean` | hybrid + hc, value residual, key-value conv | worse | +1.05 |  |  | 0.708 | 0.961 | +0.24 [0.16, 0.37] |
+| `embeddings/untied` | the 2021 reference | worse | +2.33 | +1.14 |  | 0.75 | 0.604 | +1.06 [0.50, 1.17] |
+| `gdn2_hybrid/gdn2_hvk` | hybrid + hc, value residual, key-value conv | worse | +1.59 | +1.91 |  | 0.567 | 0.86 | +0.28 [0.11, 0.48] |
+| `zoo/dyt_emb` | the 2021 reference | worse | +3.06 |  |  | 0.592 | 0.533 | +0.97 [-0.14, 1.39] |
+| `muon_2020` | the 2020 baseline | worse | +4.89 |  |  | 0.511 | 0.347 | +1.80 [1.33, 2.65] |
+| `milestones/m2022_palm` | the 2020 baseline | mixed | -4.29 | -1.14 | +0.20 | 1.47 | 0.554 | -3.98 [-4.74, -2.92] |
+| `attention/mqa` | the 2021 reference | worse | +1.61 | +2.52 | +2.48 | 0.737 | 0.424 | -2.52 [-3.64, -1.62] |
+| `sparse/csa` |  | worse | +8.29 |  |  | 0.283 |  |  |
+| `zoo/dyt_emb_a02` | the 2021 reference | worse | +9.61 |  |  | 0.214 | 0.0466 | +4.35 [2.81, 5.19] |
+| `interactions/nope_power_qk` | the 2021 reference | worse | +10.07 | +5.16 |  | 0.275 | 0.0193 | +5.20 [3.42, 6.16] |
+| `interactions/nope_qk` | the 2021 reference | worse | +10.41 | +5.33 |  | 0.265 | 0.0148 | +5.37 [3.77, 6.35] |
+| `norms/postnorm` | the 2021 reference | worse | +19.07 | +26.81 |  | 0.042 | 0 | +10.20 [7.49, 11.80] |
+| `positions/nope_power` | the 2020 baseline | worse | +88.56 |  |  | 0.00756 | 0 | +37.73 [35.81, 40.28] |
+| `positions/nope` | the 2020 baseline | worse | +100.09 | +84.72 |  | 0.00559 | 0 | +42.53 [40.88, 45.63] |
+| `zoo/dyt` | the 2021 reference | worse | +74.47 | +9.54 |  | 0.0194 | 0 | +37.78 [30.03, 44.17] |
+| `zoo/dyt_a02` | the 2021 reference | worse | +313.38 |  |  | 1.38e-05 | 0 | +161.29 [130.82, 188.81] |
+| `zoo/dyt_a01` | the 2021 reference | worse | +313.38 |  |  | 1.38e-05 | 0 | +161.29 [129.53, 188.81] |
+| `zoo/dyt_a005` | the 2021 reference | worse | +313.38 |  |  | 1.38e-05 | 0 | +161.29 [130.38, 187.36] |
