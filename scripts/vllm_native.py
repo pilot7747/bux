@@ -5,7 +5,8 @@ prompt's gathered keys (``fp8_fp4_mqa_logits``) and of decoded tokens' paged key
 (``cp_gather_indexer_k_quant_cache``), and its top-k of a prompt's and of decoded
 tokens' logits. Each is compared with PyTorch on the same FP8 keys and timed beside
 the plugin's Triton path (`bux_vllm.kernels`), at the indexer shapes of the zoo and
-the timeline.
+the timeline. The plugin's kernels that prepare a step for them
+(`bux_vllm.caching`) are compared with its PyTorch path bit for bit.
 
 Run it in vLLM's environment, with a CUDA GPU::
 
@@ -243,9 +244,8 @@ def check_decode(
     for r, (k, s) in enumerate(keys):
         want = reference(q[r].float(), w[r : r + 1], k.float() * s[:, None])[0]
         n = lengths[r]
-        error = max(
-            error, (logits[r, :n] - want).abs().max().item() / want.abs().max().item()
-        )
+        most = max(want.abs().max().item(), 1e-30)  # a ReLU'd lone key may score 0
+        error = max(error, (logits[r, :n] - want).abs().max().item() / most)
         torch_top = want.topk(min(top_k, n)).indices.int()[None]
         ok = (
             ok
@@ -732,6 +732,56 @@ def time_qwen4(
     )
 
 
+def check_caching(g: int = 3, dims: int = 64, n: int = 300) -> bool:
+    """The plugin's kernels that prepare a step (`bux_vllm.caching`) against its
+    PyTorch path, bit for bit: the keys and values (some past FP8's range, the
+    values a strided view) and FP8 indexer keys written into an FP8 and a bfloat16
+    cache, padding's slot writing nothing; the FP8 queries and weights of a
+    strided view, padded; and the packed picks."""
+    from bux_vllm import caching, dsa, picks
+
+    blocks, cuda, bf16 = 9, "cuda", torch.bfloat16
+    at = torch.randperm((blocks - 1) * PAGE, device=cuda)[:n] + PAGE  # past block 0
+    slots = torch.cat([at, at.new_full((5,), -1)])
+    kv = torch.randn(n + 5, g, 128, device=cuda, dtype=bf16) * 200
+    keys = torch.randn(n + 5, dims, device=cuda, dtype=bf16)
+    keys = keys * torch.rand(n + 5, 1, device=cuda, dtype=bf16) * 10
+    same = {}
+    for name, dtype in (("fp8", torch.uint8), ("bfloat16", bf16)):
+        extra = dsa.slots(dims, 128, dtype.itemsize)
+        cache = torch.zeros(blocks, g + extra, PAGE, 128, dtype=dtype, device=cuda)
+        want, got = cache.clone(), cache.clone()
+        rows = kv[:n]
+        if name == "fp8":
+            rows = rows.float().clamp(-448, 448).to(dsa.FP8).view(torch.uint8)
+        picks.write(want[:, :g], at, rows)
+        dsa.Region(want, g, dims).write(at, keys[:n])
+        view = got[:, :g].view(dsa.FP8) if name == "fp8" else got[:, :g]
+        caching.write(view, slots, kv[..., :64], kv[..., 64:], keys, g)
+        same[name] = torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    wide = torch.randn(n, 4 * dims + 7, device=cuda, dtype=bf16)
+    q, w = wide[:, : 4 * dims].view(n, 4, dims), torch.randn(n, 4, device=cuda)
+    for heads in (4, 8):
+        mine, theirs = (
+            caching.queries(q, w.to(bf16), heads),
+            dsa.queries(q.cpu(), w.to(bf16).cpu(), heads),
+        )
+        bits = torch.equal(mine[0].view(torch.uint8).cpu(), theirs[0].view(torch.uint8))
+        same[f"queries of {heads}"] = bits and torch.equal(mine[1].cpu(), theirs[1])
+    picked = torch.randint(0, 9000, (n, 2048), device=cuda, dtype=torch.int32)
+    short = torch.arange(2048, device=cuda) >= torch.randint(
+        0, 2048, (n, 1), device=cuda
+    )
+    picked = picked.masked_fill(short, -1)
+    packed, requests = caching.packed(picked, True)
+    count = (picked >= 0).sum(-1, keepdim=True, dtype=torch.int32)
+    order = torch.arange(n, device=cuda, dtype=torch.int32)
+    same["packed"] = torch.equal(packed, torch.cat([picked, count], -1))
+    same["packed"] = same["packed"] and torch.equal(requests, order)
+    print(f"caching: bit for bit {same}")
+    return all(same.values())
+
+
 def attempt(name: str, check: Callable[[], bool | None]) -> bool:
     """Run `check`, printing what it raises; whether it passed."""
     try:
@@ -776,6 +826,7 @@ def main() -> int:
         )
     attempt("triton", lambda: time_triton(4, 64, 2048, 16384, 64, 20000, 32768))
     results.append(attempt("repeats", check_repeats))
+    results.append(attempt("caching", check_caching))
     for decoding in (False, True):
         results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
         results.append(attempt("plugin qsa", lambda d=decoding: check_qsa(d)))

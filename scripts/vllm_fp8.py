@@ -274,18 +274,30 @@ def emulate(model: Any, kv: bool) -> None:
 def _quantized(model: Any, name: str) -> bool:
     """Whether vLLM quantizes the linear layer `name` of an export's model: not a
     head's or an embedding's, a router, a shared experts' gate, a sparse MLA's
-    ``kv_b``, or one of an indexer's, an engram's or a residual algebra's, which
-    the plugin keeps in the model's dtype."""
-    kept = ("Head", "TokenEmbedding", "Indexer", "Engram")
+    ``kv_b``, or one of an engram's, a residual algebra's or an indexer's, which
+    the plugin keeps in the model's dtype, but a ``gqa`` indexer's of a head dim of
+    a multiple of 16 (`_indexer_quantized`)."""
+    kept = ("Head", "TokenEmbedding", "Engram")
     parts = name.split(".")
     owners = [model.get_submodule(".".join(parts[:i])) for i in range(len(parts))]
     if any(
         type(o).__name__ in kept or "residual" in type(o).__module__ for o in owners
     ):
         return False
+    if any(type(o).__name__ == "Indexer" for o in owners):
+        return _indexer_quantized(owners)
     if parts[-1] == "kv_b" and getattr(owners[-1], "indexer", None) is not None:
         return False
     return parts[-1] not in ("router", "shared_gate")
+
+
+def _indexer_quantized(owners: list) -> bool:
+    """Whether vLLM quantizes a projection of the indexer among `owners`: a
+    ``gqa`` layer's (an ``Attention``), its head dim a multiple of 16, which the
+    plugin merges into one GEMM (one scale for the three, there)."""
+    at = next(i for i, o in enumerate(owners) if type(o).__name__ == "Indexer")
+    gqa = at > 0 and type(owners[at - 1]).__name__ == "Attention"
+    return gqa and owners[at].head_dim % 16 == 0
 
 
 def _scale(x: Any) -> Any:
