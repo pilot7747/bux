@@ -714,10 +714,13 @@ latent, which doubles the layer's cache.
   groups of 4 query heads or more, without sinks or a softcap. Other layers attend
   by the plugin's Triton kernel, and MLA's latents by PyTorch.
 - **Shared picks.** A layer that reads its `index` port (GLM-5.2's IndexShare)
-  attends over the picks it reads by the same kernel, where the kernel takes the
-  layer and it has no window of its own: its cache takes blocks of 64 tokens too,
-  and keeps no indexer keys. The picks are read whole, as the writer may not have
-  its valid ones first.
+  runs no indexer and writes no indexer keys. Where its writer's indexer runs on
+  these kernels, the kernel takes the layer, and it has no window of its own, it
+  attends over the picks by the same kernel. Its cache then takes blocks of 64
+  tokens too, and keeps as many head slots as the writer's indexer keys, unwritten,
+  so that its pages are the writer's size: vLLM pads every page of a model to the
+  largest, and splits a padded page into blocks of 64 in no head-major layout. The
+  picks are read whole, as the writer may not have its valid ones first.
 - **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
   values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
   layer that reads its `index` port. The attention kernel reads them as they are,

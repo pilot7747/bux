@@ -2961,7 +2961,9 @@ OWN_CACHES = {
     **dict.fromkeys(("dsa", "dsa-conv", "msa", "qsa"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-share", "msa-share"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-native", "dsa-hybrid", "qsa-native"), "gqa with an indexer"),
-    "dsa-share-native": "gqa with an indexer",
+    **dict.fromkeys(
+        ("dsa-share-native", "dsa-share-native-plain"), "gqa with an indexer"
+    ),
     "msa-native": "gqa with an indexer",
     "relbias": "gqa with a relative bias",
     **dict.fromkeys(("mla-dsa", "mla-share"), "mla with an indexer"),

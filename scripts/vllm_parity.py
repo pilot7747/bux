@@ -561,6 +561,15 @@ CASES = {
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(index=@topk, v=@v1)]"
     " [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(index=$topk, v=$v1)]"
     " [rmsnorm ffn] [rmsnorm attn(index=$topk!, v=$v1!)] [rmsnorm ffn] rmsnorm head",
+    # The same without KDA, whose kernels are not float32-exact: one indexer's picks
+    # read by two later layers, the conv on keys and values, the v port.
+    "dsa-share-native-plain": HEAD
+    + FFN
+    + "attn = gqa(num_heads=8, num_kv_heads=2, kv_conv_size=4, qk_norm=rmsnorm,"
+    f" gated=true, {NATIVE_INDEXER})\n"
+    + "model = embed [rmsnorm attn(index=@topk, v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk, v=$v1)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk!, v=$v1!)] [rmsnorm ffn] rmsnorm head",
     # MSA's picks, of blocks and per kv head's group, shared likewise.
     "msa-share": HEAD
     + FFN
