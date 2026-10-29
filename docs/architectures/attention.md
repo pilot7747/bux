@@ -105,6 +105,11 @@ these values as any others. Without RoPE, and with a QK RMSNorm, every key is it
 value times the norm's gain, so vLLM can cache one vector a token for the layer
 ([Values from the keys](../export/vllm.md#values-from-the-keys)).
 
+At small scale it costs quality. On a KDA hybrid of 680M parameters at a width of
+512, its global layers' values from their keys raised the held-out bits per byte by
+1.2% (503M tokens, 3 seeds, B300s, 2026-10-29). That held with the value residual
+and in its place.
+
 ## `mla`: multi-head latent attention
 
 Multi-head latent attention (DeepSeek-V2/V3) shrinks the keys and values each token
