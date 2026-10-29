@@ -103,8 +103,9 @@ to everything the model computes from the phase's start on:
 - every eval made at the phase's first step or later, the last one too, even at the
   run's own `seq_len`; the evals before it compute without them;
 - a run resumed from a checkpoint before or inside the phase;
-- an export of a checkpoint from the phase's start on, whose model carries the
-  scaling ([Exporting](../export/index.md)).
+- an export of a checkpoint from the step after the phase's start on, whose model
+  carries the scaling ([Exporting](../export/index.md)). The checkpoint of the
+  start step holds weights that trained before the phase.
 
 RoPE has no parameters, so the switch keeps every weight as it is: the steps and
 the evals compile again with the new frequencies. `bux check` shows the switch on
