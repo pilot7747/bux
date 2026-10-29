@@ -31,8 +31,10 @@ from bux.architecture import Model
 from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
+from bux.architecture.experts import moe as bux_moe
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
+from bux.architecture.registry import Taps
 from bux.export import check
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
@@ -553,6 +555,12 @@ ROUTERS = {
     " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5, expert=e)",
     "unnormalized sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
     " shared_expert_sink=true, normalize_top_k=false, expert=e)",
+    "zero experts": "moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
+    "zero experts, longcat": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=e)",
+    "zero experts, sinks": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " num_shared_experts=2, shared_expert_sink=true, router=sigmoid, expert=e)",
 }
 
 
@@ -569,7 +577,7 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     moe = MoE(c, 64, rngs=nnx.Rngs(0))
     router = routing.Router(c.model_dump(mode="json"))
     if moe.router_bias is not None and router.bias is not None:
-        bias = 0.1 * jax.random.normal(jax.random.key(1), (c.num_experts,))
+        bias = 0.1 * jax.random.normal(jax.random.key(1), moe.router_bias[...].shape)
         moe.router_bias[...] = bias
         router.bias.data = torch.from_numpy(np.array(bias))
     x = jax.random.normal(jax.random.key(2), (1, 32, 64))
@@ -581,6 +589,74 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     got_sinks = router.route(logits, c.top_k)[2].numpy()
     want = np.zeros((32, 0)) if sinks is None else np.asarray(sinks)[0]
     np.testing.assert_allclose(got_sinks, want, rtol=1e-6)
+
+
+def test_zero_experts_split_as_bux_runs_them() -> None:
+    """The zero experts' output (`zero_split`) is bux's, and the picks the fused MoE
+    keeps of `given_logits` (`pick_given`), or `zero_split`'s for `apart`, weigh the
+    routed experts as bux's do."""
+    c = cfg.MoEConfig.model_validate(
+        {
+            "num_experts": 4,
+            "top_k": 3,
+            "num_zero_experts": 2,
+            "router": "sigmoid",
+            "expert": {
+                "type": "gated_mlp",
+                "intermediate_size": 8,
+                "activation": "swish",
+            },
+        }
+    )
+    moe = MoE(c, 16, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(2), (1, 32, 16))
+    idx, weights, _ = moe._route(x)
+    assert (np.asarray(idx) >= 4).any()
+    as_torch = (torch.from_numpy(np.array(a)[0]) for a in (x, weights, idx))
+    zero, w, picks = routing.zero_split(*as_torch, 4)
+    want = bux_moe.zero_experts(x, idx, weights, 4)[0]
+    np.testing.assert_allclose(zero.numpy(), np.asarray(want), rtol=1e-6)
+    dense = bux_moe.dense_weights(idx, weights, 4)[0]
+    got = bux_moe.dense_weights(jnp.asarray(picks.numpy()), jnp.asarray(w.numpy()), 4)
+    np.testing.assert_allclose(np.asarray(got), np.asarray(dense), rtol=1e-6)
+    w, i = (torch.from_numpy(np.array(a)[0]) for a in (weights, idx))
+    given_w, given_ids = routing.pick_given(
+        torch.zeros(32, 16), routing.given_logits(w, i, 4), 3, True
+    )
+    assert given_ids.shape == (32, 3) and (given_ids < 4).all()
+    given = bux_moe.dense_weights(jnp.asarray(given_ids), jnp.asarray(given_w), 4)
+    np.testing.assert_allclose(np.asarray(given), np.asarray(dense), rtol=1e-6)
+
+
+def test_zero_experts_route_in_one_graph() -> None:
+    """The routing with zero experts traces whole, as torch.compile takes the
+    model's forward, where vLLM's ZeroExpertRouter's assertion fails."""
+    c = {
+        "num_experts": 8,
+        "num_zero_experts": 4,
+        "top_k": 3,
+        "router": "sigmoid",
+        "router_logit_scale": 1.0,
+        "num_groups": 1,
+        "normalize_top_k": True,
+        "routed_scaling_factor": 2.5,
+        "load_balancing": "aux_free",
+    }
+    router = routing.Router(c)
+
+    def routed(z: torch.Tensor, logits: torch.Tensor) -> tuple:
+        weights, idx, _ = router.route(logits, 3)
+        zero = routing.zero_split(z, weights, idx, 8)[0]
+        return zero, routing.pick_given(
+            z, routing.given_logits(weights, idx, 8), 3, True
+        )
+
+    z, logits = torch.randn(5, 16), torch.randn(5, 12)
+    traced = torch.compile(routed, fullgraph=True, backend="eager")
+    for a, b in zip(
+        jax.tree.leaves(traced(z, logits)), jax.tree.leaves(routed(z, logits))
+    ):
+        assert torch.equal(a, b)
 
 
 ROPES = {
@@ -1073,6 +1149,84 @@ def test_hyga_s_gate_is_bux_s() -> None:
     gate = torch.sigmoid(logits + t(attn.gate_bias[...])[:, None])
     cross = torch.sigmoid(t(attn.cross_gate(out.reshape(1, 8, -1))[0]))[..., None]
     np.testing.assert_allclose((gate * cross).numpy(), np.asarray(want), atol=1e-6)
+
+
+@pytest.mark.parametrize("gate", [6, None], ids=["gated", "plain"])
+@pytest.mark.parametrize(("kv_heads", "tp"), [(2, 1), (2, 2), (1, 2)])
+def test_value_embeddings_add_to_each_ranks_values_as_bux(
+    gate: int | None, kv_heads: int, tp: int
+) -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=kv_heads, value_embed_gate=gate)
+    port = ir.Port(name="ve", tap="ve1", mode="read")
+    attn = BuxAttention(c, 64, (port,), rngs=nnx.Rngs(0))
+    w = None
+    if attn.ve_gate is not None:
+        kernel = jax.random.normal(jax.random.key(1), attn.ve_gate.kernel[...].shape)
+        attn.ve_gate.kernel[...] = kernel
+        w = torch.from_numpy(np.array(kernel)).T.contiguous()
+    x = jax.random.normal(jax.random.key(2), (1, 8, 64))
+    v = jax.random.normal(jax.random.key(3), (1, 8, kv_heads, 16))
+    e = jax.random.normal(jax.random.key(4), (1, 8, kv_heads * 16))
+    want = np.asarray(attn._add_value_embedding(x, v, e)[0])
+    xt, et = (torch.from_numpy(np.array(a)[0]) for a in (x, e))
+    for rank in range(tp):
+        first, g = kv.kv_heads(kv_heads, tp, rank)
+        mine = torch.from_numpy(np.array(v)[0, :, first : first + g].reshape(8, -1))
+        got = kv.add_value_embedding(xt, mine, et, w, (first, g))
+        np.testing.assert_allclose(
+            got.numpy(), want[:, first : first + g].reshape(8, -1), rtol=1e-5, atol=1e-6
+        )
+
+
+def test_values_from_the_keys_are_normalized_as_bux_and_convolved_alone() -> None:
+    qk = cfg.NormalizationConfig(type="rmsnorm", eps=1e-5)
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, qk_norm=qk, k_eq_v=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    k = jax.random.normal(jax.random.key(1), (1, 8, 32))
+    _, want = attn._keys_as_values(k, None, Taps())
+    norm = common.Norm(kv.value_norm(c.model_dump(mode="json")["qk_norm"]), 16)
+    assert not list(norm.parameters())
+    got = norm(torch.from_numpy(np.array(k)[0]).view(8, 2, 16))
+    np.testing.assert_allclose(got.numpy(), np.asarray(want[0]), rtol=1e-5, atol=1e-6)
+    conv = c.model_copy(update={"kv_conv_size": 4}).model_dump(mode="json")
+    assert kv.conv_channels(conv, 64, 1) == 2 * 16
+    assert kv.conv_channels(conv | {"k_eq_v": False}, 64, 2) == 16 + 16
+
+
+KEYED = {
+    "nope": ({}, (), True),
+    "zero-centered gain": ({"qk_norm": {"zero_centered": True}}, (), True),
+    "writes v": ({}, (["v", "v1", "write"],), True),
+    "rope": ({"rope": cfg.RoPEConfig()}, (), False),
+    "reads v": ({}, (["v", "v1", "read"],), False),
+    "writes kv": ({}, (["kv", "kv", "write"],), False),
+    "layernorm": ({"qk_norm": {"type": "layernorm"}}, (), False),
+}
+
+
+@pytest.mark.parametrize(("change", "ports", "keyed"), KEYED.values(), ids=KEYED)
+def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
+    change: dict, ports: tuple, keyed: bool
+) -> None:
+    """bux's keys are its values times the key norm's gain wherever the plugin
+    caches the values alone, and puts the gain on the queries instead."""
+    qk = {"type": "rmsnorm", "eps": 1e-5} | change.pop("qk_norm", {})
+    c = cfg.GQAConfig.model_validate(
+        {"num_heads": 4, "num_kv_heads": 2, "k_eq_v": True, "qk_norm": qk} | change
+    )
+    assert kv.keys_from_values(c.model_dump(mode="json"), list(ports)) == keyed
+    if not keyed:
+        return
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.k_norm is not None and attn.k_norm.scale is not None
+    attn.k_norm.scale[...] = jax.random.normal(jax.random.key(2), (16,))
+    k, v = attn._keys_as_values(
+        jax.random.normal(jax.random.key(1), (1, 8, 32)), None, Taps()
+    )
+    gain = attn.k_norm.scale[...] + (1 if attn.k_norm.zero_centered else 0)
+    np.testing.assert_allclose(
+        np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
+    )
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:

@@ -1620,9 +1620,10 @@ class _Lowering:
                 "nothing can follow the LM head",
                 "to go on after a head, read a tap: @h norm head $h ...",
             )
-        on_streams = isinstance(config, cfg.MergeConfig) or (
-            self.copies and isinstance(config, _ON_COPIES)
-        )
+        # A value embedding leaves the stream as it is, widened or not.
+        on_streams = isinstance(
+            config, (cfg.MergeConfig, cfg.ValueEmbeddingConfig)
+        ) or (self.copies and isinstance(config, _ON_COPIES))
         if width == "streams" and not on_streams:
             # The layer needs one stream: read the widened one back into one first.
             merge = ir.Layer(config=cfg.MergeConfig(), width="streams")

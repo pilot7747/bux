@@ -31,6 +31,7 @@
   "center_bias",
   "expert",
   "expert_norm",
+  "ffn_experts_per_token",
   "latent_input_norm",
   "latent_output_norm",
   "latent_size",
@@ -39,6 +40,7 @@
   "num_experts",
   "num_groups",
   "num_shared_experts",
+  "num_zero_experts",
   "random_logits",
   "routed_scaling_factor",
   "router",
@@ -66,6 +68,7 @@
   "gated",
   "head_dim",
   "indexer",
+  "k_eq_v",
   "kv_conv_size",
   "log_scale",
   "log_scale_floor",
@@ -86,6 +89,7 @@
   "softcap",
   "type",
   "v_head_dim",
+  "value_embed_gate",
   "value_residual"
  ],
  "MLAConfig": [
@@ -282,6 +286,11 @@
   "max_positions",
   "norm",
   "scale_by_sqrt_dim",
+  "type"
+ ],
+ "ValueEmbeddingConfig": [
+  "features",
+  "std",
   "type"
  ],
  "LMHeadConfig": [

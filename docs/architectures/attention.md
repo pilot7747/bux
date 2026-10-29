@@ -58,6 +58,8 @@ model = embed block^12 norm head(tied=true)
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
 | `exclusive` | `false` | each head's output less its part along the token's own value: `true` or `learned` ([below](#exclusive-self-attention-xsa)) (XSA) |
+| `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
+| `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
 | `differential` | `false` | two query heads for each output head, the second's map subtracted from the first's ([below](#differential-attention-diff-v2)) (DIFF V2) |
 
 GPT-2 small is MHA with biases and one fused projection
@@ -86,6 +88,23 @@ A fused projection's split points between q, k and v do not fall on head
 boundaries, so under tensor parallelism it stays whole, and every device computes
 it ([Tensor parallelism](../parallelism/tensor.md)).
 :::
+
+### Values from the keys
+
+Gemma 4's global layers make their values from the key projection
+(`attention_k_eq_v`), and have no value projection:
+
+```bux
+glob = gqa(num_heads=16, num_kv_heads=4, head_dim=128, qk_norm=rmsnorm, k_eq_v=true)
+```
+
+Each head's projected key $k$, after the conv with `kv_conv_size`, is the value
+$v = k / \mathrm{rms}(k)$: an RMSNorm without a gain, at the eps of `qk_norm` (1e-6
+without one), and not rotated. The keys go on through `qk_norm` and RoPE. The
+values' head is the keys', so `v_head_dim` stays unset. A `v` port mixes and pushes
+these values as any others. Without RoPE, and with a QK RMSNorm, every key is its
+value times the norm's gain, so vLLM can cache one vector a token for the layer
+([Values from the keys](../export/vllm.md#values-from-the-keys)).
 
 ## `mla`: multi-head latent attention
 
@@ -590,6 +609,8 @@ A config lists its ports; using a port the layer does not have is a compile erro
 |-------|------|-------------------|-------------------|
 | `gqa` | `v` | pushes the value heads | mixes the tap's values into its own (value residual) |
 | `gqa` | `kv` | pushes the keys and values | uses them instead of projecting its own (cross-layer KV sharing, YOCO, CLA) |
+| `gqa` | `ve` | - | adds a `value_embed` table's rows to its values (value embeddings) |
+| `value_embed` | `ve` | pushes the input tokens' rows of its table | - |
 | `gqa`, `mla`, `csa` | `index` | pushes the keys the indexer kept for each query | attends to them, and runs no indexer (IndexCache) |
 | `csa` | `kv` | pushes the compressed latents, with the indexer's keys | uses them instead of compressing its own; an indexer it runs scores those keys |
 | `csa` | `candidates` | pushes a pool of coarse blocks of compressed positions | its indexer keeps keys only inside the pool |
@@ -615,6 +636,41 @@ A reading layer computes $a v + b v_1$, with $a = b = 0.5$ to start.
 | `fixed` | $a = b = 0.5$, not learned | ResFormer's code (Identity-ResFormer) |
 | `learned` | $a$ and $b$ learned | Learnable-ResFormer |
 | `convex` | $a$ learned, $b = 1 - a$ | |
+
+### Value embeddings
+
+modded-nanogpt adds a table of a row per token to some layers' values. A
+`value_embed` layer holds the table and pushes the input tokens' rows to its `ve`
+port; a `gqa` layer that reads the port adds them to its values. The table leaves
+the stream as it is, so it goes bare, on a widened stream too, or inside the branch:
+
+```bux
+ve    = value_embed(features=128)  # num_kv_heads * head_dim of the readers
+attn  = gqa(num_heads=8, num_kv_heads=2, qk_norm=rmsnorm)
+model = embed ve(ve=@e1) [norm attn(ve=$e1!)] [norm ffn]
+        [norm ve(ve=@e2) attn(ve=$e2!)] [norm ffn] norm head
+```
+
+Each layer adds the rows $e$ by a gate of its own per kv head, as modded-nanogpt's
+current record does:
+
+$$v + 2\,\sigma\big(W\,[x_{:n}, e_{:n}]\big)\, e$$
+
+from the first $n$ channels of the layer's input $x$ and of $e$ (`value_embed_gate`,
+6). $W$ starts at 0, so the gate starts at 1. `value_embed_gate=none` adds $e$
+ungated. Several layers may read one table, as modded-nanogpt's earlier records
+shared theirs between early and late layers.
+
+| `value_embed` setting | Default | What it does |
+|-----------------------|---------|--------------|
+| `features` | required | the row's width: the readers' `num_kv_heads * v_head_dim` |
+| `std` | `0.01` | the rows' normal init, where the model sets no `init` |
+
+The rows go into the layer's own values first, then the value residual mixes them
+with the `v` port's ([Value residuals](#value-residuals)), and the `v` port pushes
+them with the rows in. A layer that reads `kv` has no values of its own, so it
+cannot read `ve`. The table splits over the vocabulary as the embedding's does, Muon
+leaves it to the other optimizer, and weight decay takes it, as modded-nanogpt's.
 
 ### Shared keys and values
 

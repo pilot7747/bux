@@ -102,6 +102,13 @@ SPARSE_LATENT = (
     " top_k=12))\n"
 )
 
+#: The hybrid's global layer, as the timeline's candidate has it, and a value
+#: embedding of its 2 kv heads of 32.
+GLOBAL = (
+    "glob = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\nve = value_embed(features=64)\n"
+)
+
 #: Hymba's blocks: attention without a window (F) and with one, which writes its
 #: keys and values to the tap kv (W), reads them (S) or takes them off (R); and one
 #: without a window that writes them (G).
@@ -220,6 +227,29 @@ CASES = {
     + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
     " load_balancing=aux_free, expert=gated_mlp(intermediate_size=64,"
     " activation=situ, up_softcap=0.5))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    # Zero experts: on the timeline's experts (a shared one, sigmoid, aux-free),
+    # LongCat-Flash's (softmax, unnormalized, scaled, no bias), and beside an expert
+    # norm, which routes apart.
+    "moe-zero": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, num_shared_experts=1,"
+    " router=sigmoid, routed_scaling_factor=2.5, load_balancing=aux_free,"
+    " expert=dense)\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-zero-longcat": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-zero-norm": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " load_balancing=aux_free, expert_norm=rmsnorm, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
@@ -544,6 +574,37 @@ CASES = {
     " rope=rope())\n"
     + "ln = rms(qk_norm=layernorm(bias=true))\n"
     + "model = embed [rmsnorm rms] [rmsnorm ffn] [rmsnorm ln] [rmsnorm ffn]"
+    " rmsnorm head",
+    # Value embeddings on the hybrid's global layer (QK-norm, a gate, the conv on
+    # keys and values, no positions): a table a layer, gated, beside the value
+    # residual; then one table two layers read, ungated, under hc.
+    "value-embed": HEAD
+    + FFN
+    + GLOBAL
+    + "model = embed ve(ve=@t) [rmsnorm glob(v=@v1, ve=$t!)] [rmsnorm ffn]"
+    " [rmsnorm ve(ve=@u) glob(v=$v1!, ve=$u!)] [rmsnorm ffn] rmsnorm head",
+    "value-embed-shared": HEAD
+    + "residual = hc(expansion=2)\n"
+    + FFN
+    + GLOBAL
+    + "plain = glob(value_embed_gate=none)\n"
+    + "model = embed ve(ve=@t) [rmsnorm plain(ve=$t)] [rmsnorm ffn]"
+    " [rmsnorm plain(ve=$t!)] [rmsnorm ffn] rmsnorm head",
+    # Gemma 4's values from the keys: with RoPE, a window and a fused projection,
+    # beside the value residual; then on the hybrid's global layer (QK-norm, a gate,
+    # the conv on keys and values, no positions).
+    "k-eq-v": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm,"
+    " rope=rope())\n"
+    + "local = attn(sliding_window_size=8, fused_qkv=true)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
+    " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
+    "k-eq-v-nope": HEAD
+    + FFN
+    + "glob = gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm,"
+    " gated=true, kv_conv_size=4)\n"
+    + "model = embed [rmsnorm glob] [rmsnorm ffn] [rmsnorm glob] [rmsnorm ffn]"
     " rmsnorm head",
     "kv-conv": HEAD
     + FFN

@@ -371,20 +371,24 @@ class Attention(SoftmaxAttention):
         # The randomly initialized layers; reordering them changes a seed's init.
         fused = projects_kv and config.fused_qkv
         split = projects_kv and not config.fused_qkv
+        self.k_eq_v = config.k_eq_v  # values from the key projection
+        own_v = g * dv if not config.k_eq_v else 0
         # Fused, the split points of q, k and v do not fall on shard boundaries.
         self.qkv = (
-            proj(width, hq * dk + g * (dk + dv), ("embed", None), "q")
+            proj(width, hq * dk + g * dk + own_v, ("embed", None), "q")
             if fused
             else None
         )
         queries = ("embed", ("heads", hq))
         self.q = None if fused else proj(width, hq * dk, queries, "q")
         self.k = proj(width, g * dk, ("embed", kv_heads), "kv") if split else None
-        self.v = proj(width, g * dv, ("embed", kv_heads), "kv") if split else None
+        self.v = (
+            proj(width, own_v, ("embed", kv_heads), "kv") if split and own_v else None
+        )
         self.o = proj(h * dv, width, (heads, "embed"), "o", config.output_bias)
         size = config.kv_conv_size if projects_kv else None
         self.k_conv = conv(g * dk, size) if size else None
-        self.v_conv = conv(g * dv, size) if size else None
+        self.v_conv = conv(own_v, size) if size and own_v else None
         super().__init__(config, width, h, g, dk, dv, config.bias, ports, rngs)
 
         qk_norm, whole = config.qk_norm, config.qk_norm_all_heads
@@ -393,6 +397,7 @@ class Attention(SoftmaxAttention):
         self.k_norm = (
             Norm(qk_norm, g * dk if whole else dk) if qk_norm and projects_kv else None
         )
+        self.v_norm = _value_norm(config) if config.k_eq_v and projects_kv else None
         self.rope = config.rope
         self.power_scale = config.power_scale
         self.power_scale_length = config.power_scale_length
@@ -400,6 +405,7 @@ class Attention(SoftmaxAttention):
         shape = (2,) if config.value_residual == "learned" else ()
         trained = reads(ports, "v") and config.value_residual != "fixed"
         self.v_mix = nnx.Param(jnp.full(shape, 0.5, jnp.float32)) if trained else None
+        self.ve_gate = _value_embed_gate(config, ports, projects_kv, rngs)
         self._exclusion(config, projects_kv)
         self._init_differential(config, width, rngs)
 
@@ -448,7 +454,7 @@ class Attention(SoftmaxAttention):
         """
         docs = segments(taps)
         x, projected = self._projections(x)
-        q, k, v = self._heads(projected, docs, taps)
+        q, k, v = self._heads(x, projected, docs, taps)
         self._observe(q, k, docs, taps)
         out = self._difference(x, self._attend(x, q, k, v, docs))
         return self._output(x, self._exclude(out, v))
@@ -477,20 +483,28 @@ class Attention(SoftmaxAttention):
         return exclusive(out, v, strength)
 
     def _heads(
-        self, projected: list[Float[Array, "b t _"]], docs: Segments | None, taps: Taps
+        self,
+        x: Float[Array, "b t d"],
+        projected: list[Float[Array, "b t _"]],
+        docs: Segments | None,
+        taps: Taps,
     ) -> tuple[
         Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
     ]:
-        """Return the queries, keys and values of the `projected` input, with the v
-        port's values mixed in; the keys and values from the kv port if the layer
-        reads it."""
+        """Return the queries, keys and values of the `projected` input `x`, with the
+        ve port's rows added to the values and then the v port's values mixed in; the
+        keys and values from the kv port if the layer reads it."""
         pos = None if docs is None else docs.positions
         q, *kv = projected
         q = self._queries(q, pos)
-        if kv:
+        if self.v_norm is not None:
+            k, v = self._keys_as_values(kv[0], pos, taps)
+        elif kv:
             k, v = self._keys_and_values(*kv, pos, taps)
         else:
             k, v = read(taps, self.ports, "kv")
+        if reads(self.ports, "ve"):
+            v = self._add_value_embedding(x, v, read(taps, self.ports, "ve"))
         if reads(self.ports, "v"):
             v = self._mix_values(v, read(taps, self.ports, "v"))
         write(taps, self.ports, "v", v)
@@ -507,7 +521,7 @@ class Attention(SoftmaxAttention):
             q, k = self.query_heads * self.head_dim, self.kv_heads * self.head_dim
             x, [qkv] = project_input(x, self.qkv)
             qkv = checkpoint_name(qkv, "qkv")
-            return x, jnp.split(qkv, [q, q + k], axis=-1)
+            return x, jnp.split(qkv, [q] if self.k_eq_v else [q, q + k], axis=-1)
         projections = [p for p in (self.q, self.k, self.v) if p is not None]
         x, projected = project_input(x, *projections)
         return x, [checkpoint_name(p, "qkv") for p in projected]
@@ -541,6 +555,19 @@ class Attention(SoftmaxAttention):
         v = v.reshape(b, s, self.kv_heads, self.v_head_dim)
         return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
 
+    def _keys_as_values(
+        self, k: Float[Array, "b s _"], pos: Int[Array, "b s"] | None, taps: Taps
+    ) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dk"]]:
+        """Return keys, with QK-norm and RoPE, and values, each head's projected key
+        RMS-normalized without a gain, both after the conv (``k_eq_v``, Gemma 4)."""
+        assert self.v_norm is not None
+        b, s, _ = k.shape
+        if self.k_conv is not None:
+            k = k + self.k_conv(k, taps)
+        v = self.v_norm(k.reshape(b, s, self.kv_heads, self.head_dim))
+        k = self._split_normed(k, self.kv_heads, self.k_norm, pos, "kv_heads")
+        return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
+
     def _split_normed(
         self,
         x: Float[Array, "b t _"],
@@ -559,6 +586,28 @@ class Attention(SoftmaxAttention):
             x, norm = norm(x), None
         x = x.reshape(b, t, heads, self.head_dim)
         return norm_and_rotate(x, norm, self.rope, pos, name)
+
+    def _add_value_embedding(
+        self,
+        x: Float[Array, "b t d"],
+        v: Float[Array, "b s g dv"],
+        e: Float[Array, "b s _"],
+    ) -> Float[Array, "b s g dv"]:
+        """Return the values plus the ve port's rows `e`, by a gate per kv head of the
+        first channels of `x` and `e`: v + 2 sigmoid(W [x[:n], e[:n]]) e."""
+        b, s, g, dv = v.shape
+        if e.shape[-1] != g * dv:
+            raise ValueError(
+                f"gqa: a value embedding of {e.shape[-1]} features into {g} kv heads "
+                f"of {dv}: give value_embed features={g * dv}"
+            )
+        e = e.astype(v.dtype)
+        rows = e.reshape(b, s, g, dv)
+        if self.ve_gate is None:
+            return v + rows
+        n = self.ve_gate.in_features // 2
+        gate = self.ve_gate(jnp.concatenate([x[..., :n], e[..., :n]], -1))
+        return v + 2 * jax.nn.sigmoid(gate)[..., None].astype(v.dtype) * rows
 
     def _mix_values(
         self, v: Float[Array, "b s g dv"], v1: Float[Array, "b s g dv"]
@@ -606,6 +655,40 @@ def exclusive(
 def _by_head(x: Float[Array, "b t h i"], w: nnx.Param) -> Float[Array, "b t h o"]:
     """Return each head's `x` times its own matrix of `w`, h by i by o."""
     return jnp.einsum("bthi,hio->btho", x, w[...].astype(x.dtype))
+
+
+def _value_embed_gate(
+    config: cfg.GQAConfig, ports: Sequence[ir.Port], projects_kv: bool, rngs: nnx.Rngs
+) -> nnx.Linear | None:
+    """Make the gate of the ve port's rows, from 2n channels to a value per kv head
+    and starting at 0, for a layer that reads the port; None without the port or the
+    gate.
+
+    Raises:
+        ValueError: The layer reads the ve port and the kv port: it has no values of
+            its own to add the rows to.
+    """
+    if not reads(ports, "ve"):
+        return None
+    if not projects_kv:
+        raise ValueError(
+            "gqa: the ve port adds to the layer's own values, which a layer that "
+            "reads kv does not have"
+        )
+    n = config.value_embed_gate
+    if n is None:
+        return None
+    names = (None, ("kv_heads", config.num_kv_heads))
+    zeros = nnx.initializers.zeros
+    return linear(2 * n, config.num_kv_heads, names, False, rngs, init=zeros)
+
+
+def _value_norm(config: cfg.GQAConfig) -> Norm:
+    """Return the norm of values made from keys (``k_eq_v``): Gemma 4's RMSNorm
+    without a gain, at the eps of the layer's QK-norm, or the norms' default."""
+    eps = config.qk_norm.eps if config.qk_norm is not None else None
+    norm = cfg.NormalizationConfig(type="rmsnorm", affine=False)
+    return Norm(norm if eps is None else norm.model_copy(update={"eps": eps}), 1)
 
 
 def require_xla(feature: str) -> None:
@@ -1070,7 +1153,7 @@ class SparseAttention(Sparse, Attention):
         """
         docs = segments(taps)
         x, projected = self._projections(x)
-        heads = self._heads(projected, docs, taps)
+        heads = self._heads(x, projected, docs, taps)
         out = self._attend_tokens(x, x, heads, docs, taps)
         return self._output(x, self._exclude(out, heads[2]))
 

@@ -152,6 +152,10 @@ MOES = {
     "expert_norm, Muse's": (
         "expert_norm=rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)"
     ),
+    "zero experts": "num_zero_experts=4",
+    "zero experts, sigmoid": (
+        "num_zero_experts=4, router=sigmoid, routed_scaling_factor=2.5, latent_size=32"
+    ),
     "training settings": (
         "aux_loss_coef=0.1, aux_loss_scope=sequence, bias_update_rate=0.5,"
         " random_logits=true"
@@ -198,6 +202,12 @@ COMBINED = {
         "router=sigmoid, router_logit_scale=0.5, latent_size=32,"
         " latent_input_norm=rmsnorm(zero_centered=true), load_balancing=aux_free,"
         " expert_norm=rmsnorm(zero_centered=true, scale_input=true)"
+    ),
+    # LongCat-Flash's zero experts, on the timeline's experts.
+    "zero experts": (
+        "num_zero_experts=4, num_shared_experts=1, router=sigmoid,"
+        " routed_scaling_factor=2.5, load_balancing=aux_free, aux_loss_coef=1e-4,"
+        " aux_loss_scope=sequence"
     ),
     "inkling": (
         "num_shared_experts=2, shared_expert_sink=true, router=sigmoid,"
@@ -258,6 +268,14 @@ def test_the_load_balancing_bias_picks_the_experts(balancing: str) -> None:
     check.compare(arch, model, experts="eager").check()
 
 
+def test_zero_experts_are_picked_beside_the_routed_ones() -> None:
+    """The combination's routers pick zero experts and routed ones, which the
+    export runs alike."""
+    arch = compile(experts(COMBINED["zero experts"]))
+    picks = np.concatenate(_routes(with_router_bias(arch), arch))
+    assert (picks >= 8).any() and (picks < 8).any()
+
+
 def test_equal_scores_pick_the_experts_bux_picks() -> None:
     """A router of zeros scores every expert alike: bux picks the first ones, groups
     first, and so does the export."""
@@ -287,7 +305,7 @@ IMPLEMENTATIONS = ["grouped_mm", "batched_mm"]
 
 
 @pytest.mark.parametrize("impl", IMPLEMENTATIONS)
-@pytest.mark.parametrize("name", ["deepseek", "gpt-oss", "muse"])
+@pytest.mark.parametrize("name", ["deepseek", "gpt-oss", "muse", "zero experts"])
 def test_transformers_kernels_run_the_experts(impl: str, name: str) -> None:
     arch = compile(experts(COMBINED[name], COMBINED_EXPERT.get(name, EXPERT)))
     check.compare(arch, with_router_bias(arch), experts=impl).check()
