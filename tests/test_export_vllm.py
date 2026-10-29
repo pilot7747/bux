@@ -347,9 +347,9 @@ def test_vllm_s_sparse_gqa_attention_takes_plain_bfloat16_groups() -> None:
 
 def test_msa_takes_minimax_s_settings_alone() -> None:
     """vLLM's MiniMax-M3 kernels take MSA of blocks of 128, an unweighted index head
-    a kv head, plain dots, heads of a power of two of dims, a power of two of kv
-    heads on a rank and fewer than 64 blocks a query, in bfloat16; their picks of
-    blocks are bux's keys of them."""
+    a kv head, plain dots, heads of a power of two of dims and fewer than 64 blocks
+    a query, in bfloat16, any count of kv heads padded to a power of two for their
+    index kernels; their picks of blocks are bux's keys of them."""
     from bux_vllm import msa, picks
 
     def spec(**c: Any) -> picks.Sparse:
@@ -372,13 +372,20 @@ def test_msa_takes_minimax_s_settings_alone() -> None:
         assert not msa.takes(spec(relu=True), ix, 4, 128, torch.bfloat16)
         assert not msa.takes(spec(window=512), ix, 4, 128, torch.bfloat16)
         assert not msa.takes(spec(top_k=128 * 64), ix, 4, 128, torch.bfloat16)
-        six = ix | {"num_heads": 6}
-        assert not msa.takes(spec(kv_heads=6), six, 6, 128, torch.bfloat16)
+        six = ix | {"num_heads": 6}  # padded to 8 for the index kernels
+        assert msa.takes(spec(kv_heads=6), six, 6, 128, torch.bfloat16)
+    padded = msa.padded(torch.ones(3, 13, 64))
+    assert padded.shape == (3, 16, 64) and not padded[:, 13:].any()
+    assert msa.padded(torch.ones(3, 4, 64)).shape == (3, 4, 64)
     blocks = torch.tensor([[[2, -1]], [[0, 1]]], dtype=torch.int32)  # (g, Q, k)
     keys, valid = msa.as_picks(blocks, torch.tensor([300]))
     assert keys.shape == (1, 2, 256)
     assert keys[0, 0, :2].tolist() == [256, 257] and not valid[0, 0, 128:].any()
     assert valid[0, 0, :45].all() and not valid[0, 0, 45:].any()  # 256..300 seen
+    held = torch.ones(2)  # an FP8 cache's scales, read in place, as a CUDA graph can
+    k, v = msa._scales(torch.zeros(1, dtype=torch.float8_e4m3fn), held)
+    assert k.data_ptr() == held.data_ptr() and v.data_ptr() == held[1:].data_ptr()
+    assert msa._scales(torch.zeros(1, dtype=torch.bfloat16), held) == (None, None)
     assert valid[0, 1].all()
 
 
@@ -2465,6 +2472,12 @@ def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:
             for target in node.targets:
                 elts = target.elts if isinstance(target, ast.Tuple) else [target]
                 has |= {e.attr for e in elts if isinstance(e, ast.Attribute)}
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr == "register_buffer":  # self.register_buffer("name", ...)
+            name = node.args[0]
+            assert isinstance(name, ast.Constant)
+            has.add(str(name.value))
     outside = [n for n in tree.body if n is not paged]  # its own reads a config
     reads = {
         n.attr
