@@ -368,17 +368,23 @@ class Attention(SoftmaxAttention):
         # The randomly initialized layers; reordering them changes a seed's init.
         fused = projects_kv and config.fused_qkv
         split = projects_kv and not config.fused_qkv
+        self.k_eq_v = config.k_eq_v  # values from the key projection
+        own_v = g * dv if not config.k_eq_v else 0
         # Fused, the split points of q, k and v do not fall on shard boundaries.
         self.qkv = (
-            proj(width, h * dk + g * (dk + dv), ("embed", None), "q") if fused else None
+            proj(width, h * dk + g * dk + own_v, ("embed", None), "q")
+            if fused
+            else None
         )
         self.q = None if fused else proj(width, h * dk, ("embed", heads), "q")
         self.k = proj(width, g * dk, ("embed", kv_heads), "kv") if split else None
-        self.v = proj(width, g * dv, ("embed", kv_heads), "kv") if split else None
+        self.v = (
+            proj(width, own_v, ("embed", kv_heads), "kv") if split and own_v else None
+        )
         self.o = proj(h * dv, width, (heads, "embed"), "o", config.output_bias)
         size = config.kv_conv_size if projects_kv else None
         self.k_conv = conv(g * dk, size) if size else None
-        self.v_conv = conv(g * dv, size) if size else None
+        self.v_conv = conv(own_v, size) if size and own_v else None
         super().__init__(config, width, h, g, dk, dv, config.bias, ports, rngs)
 
         qk_norm, whole = config.qk_norm, config.qk_norm_all_heads
@@ -387,6 +393,7 @@ class Attention(SoftmaxAttention):
         self.k_norm = (
             Norm(qk_norm, g * dk if whole else dk) if qk_norm and projects_kv else None
         )
+        self.v_norm = _value_norm(config) if config.k_eq_v and projects_kv else None
         self.rope = config.rope
         self.power_scale = config.power_scale
         self.power_scale_length = config.power_scale_length
@@ -456,7 +463,9 @@ class Attention(SoftmaxAttention):
         pos = None if docs is None else docs.positions
         q, *kv = projected
         q = self._queries(q, pos)
-        if kv:
+        if self.v_norm is not None:
+            k, v = self._keys_as_values(kv[0], pos, taps)
+        elif kv:
             k, v = self._keys_and_values(*kv, pos, taps)
         else:
             k, v = read(taps, self.ports, "kv")
@@ -478,7 +487,7 @@ class Attention(SoftmaxAttention):
             q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
             x, [qkv] = project_input(x, self.qkv)
             qkv = checkpoint_name(qkv, "qkv")
-            return x, jnp.split(qkv, [q, q + k], axis=-1)
+            return x, jnp.split(qkv, [q] if self.k_eq_v else [q, q + k], axis=-1)
         projections = [p for p in (self.q, self.k, self.v) if p is not None]
         x, projected = project_input(x, *projections)
         return x, [checkpoint_name(p, "qkv") for p in projected]
@@ -510,6 +519,19 @@ class Attention(SoftmaxAttention):
             k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
         k = self._split_normed(k, self.kv_heads, self.k_norm, pos, "kv_heads")
         v = v.reshape(b, s, self.kv_heads, self.v_head_dim)
+        return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
+
+    def _keys_as_values(
+        self, k: Float[Array, "b s _"], pos: Int[Array, "b s"] | None, taps: Taps
+    ) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dk"]]:
+        """Return keys, with QK-norm and RoPE, and values, each head's projected key
+        RMS-normalized without a gain, both after the conv (``k_eq_v``, Gemma 4)."""
+        assert self.v_norm is not None
+        b, s, _ = k.shape
+        if self.k_conv is not None:
+            k = k + self.k_conv(k, taps)
+        v = self.v_norm(k.reshape(b, s, self.kv_heads, self.head_dim))
+        k = self._split_normed(k, self.kv_heads, self.k_norm, pos, "kv_heads")
         return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
 
     def _split_normed(
@@ -625,6 +647,14 @@ def _value_embed_gate(
     names = (None, ("kv_heads", config.num_kv_heads))
     zeros = nnx.initializers.zeros
     return linear(2 * n, config.num_kv_heads, names, False, rngs, init=zeros)
+
+
+def _value_norm(config: cfg.GQAConfig) -> Norm:
+    """Return the norm of values made from keys (``k_eq_v``): Gemma 4's RMSNorm
+    without a gain, at the eps of the layer's QK-norm, or the norms' default."""
+    eps = config.qk_norm.eps if config.qk_norm is not None else None
+    norm = cfg.NormalizationConfig(type="rmsnorm", affine=False)
+    return Norm(norm if eps is None else norm.model_copy(update={"eps": eps}), 1)
 
 
 def require_xla(feature: str) -> None:

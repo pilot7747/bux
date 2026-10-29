@@ -59,6 +59,7 @@ model = embed block^12 norm head(tied=true)
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
 | `exclusive` | `false` | each head's output less its part along the token's own value: `true` or `learned` ([below](#exclusive-self-attention-xsa)) (XSA) |
 | `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
+| `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):
@@ -86,6 +87,28 @@ A fused projection's split points between q, k and v do not fall on head
 boundaries, so under tensor parallelism it stays whole, and every device computes
 it ([Tensor parallelism](../parallelism/tensor.md)).
 :::
+
+### Values from the keys
+
+Gemma 4's global layers make their values from the key projection
+(`attention_k_eq_v`), and have no value projection:
+
+```bux
+glob = gqa(num_heads=16, num_kv_heads=4, head_dim=128, qk_norm=rmsnorm, k_eq_v=true)
+```
+
+Each head's projected key $k$, after the conv with `kv_conv_size`, is the value
+$v = k / \mathrm{rms}(k)$: an RMSNorm without a gain, at the eps of `qk_norm` (1e-6
+without one), and not rotated. The keys go on through `qk_norm` and RoPE. The
+values' head is the keys', so `v_head_dim` stays unset. A `v` port mixes and pushes
+these values as any others. Without RoPE, and with a QK RMSNorm, every key is its
+value times the norm's gain, so vLLM can cache one vector a token for the layer
+([Values from the keys](../export/vllm.md#values-from-the-keys)).
+
+At small scale it costs quality. On a KDA hybrid of 680M parameters at a width of
+512, its global layers' values from their keys raised the held-out bits per byte by
+1.2% (503M tokens, 3 seeds, B300s, 2026-10-29). That held with the value residual
+and in its place.
 
 ## `mla`: multi-head latent attention
 

@@ -14,6 +14,8 @@ runs (`sources`), as vLLM's cross-layer KV sharing needs it.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -152,6 +154,33 @@ def add_value_embedding(
     return v + (2 * torch.sigmoid(gate)).repeat_interleave(dv, -1) * rows
 
 
+def keys_from_values(c: dict, ports: list) -> bool:
+    """Whether every key of the ``gqa`` layer `c` is its value times its key norm's
+    gain, so that one cached vector a token serves as both, the gain on the queries
+    (`bux_vllm.keyed`): values from the keys (``k_eq_v``), the keys' norm an RMSNorm
+    of each head, without a bias, at the values' eps, no RoPE, and no port that
+    mixes other values in (``v`` and ``ve`` read) or shares the cache (``kv``); and
+    asked for, by ``BUX_VLLM_K_EQ_V_CACHE=keys``. By default the cache keeps keys
+    and values apart, as vLLM's Gemma 4 does, on the backend vLLM picks."""
+    qk = c["qk_norm"]
+    norm = qk is not None and qk["type"] == "rmsnorm" and not qk["bias"]
+    plain = norm and not qk["scale_input"] and not c["qk_norm_all_heads"]
+    others = any(reads(ports, n) for n in ("v", "ve", "kv", "index")) or writes(
+        ports, "kv"
+    )
+    own = not (c["indexer"] or c["relative_bias"] or c["rope"] or others)
+    keyed = os.environ.get("BUX_VLLM_K_EQ_V_CACHE", "both") == "keys"
+    return bool(c["k_eq_v"] and plain and own and keyed)
+
+
+def value_norm(qk: dict | None) -> dict:
+    """The config of the norm of values made from the keys (``k_eq_v``): Gemma 4's
+    RMSNorm without a gain, at the eps of the layer's QK-norm `qk`, or 1e-6."""
+    eps = 1e-6 if qk is None else qk["eps"]
+    flags = ("affine", "bias", "zero_centered", "scale_input")
+    return {"type": "rmsnorm", "eps": eps} | dict.fromkeys(flags, False)
+
+
 def kv_heads(kv: int, tp: int, rank: int) -> tuple[int, int]:
     """The first kv head of `kv` a rank of `tp` keeps, and how many: a share each,
     or one head copied on each of ``tp // kv`` ranks where there are fewer heads
@@ -169,9 +198,10 @@ def head_dims(c: dict, width: int) -> tuple[int, int]:
 
 def conv_channels(c: dict, width: int, tp: int) -> int:
     """The channels of the conv on keys and values a rank of `tp` keeps: its kv
-    heads' keys, then their values."""
+    heads' keys, then their values; the keys alone for values made from them
+    (``k_eq_v``)."""
     dk, dv = head_dims(c, width)
-    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + dv)
+    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + (0 if c.get("k_eq_v") else dv))
 
 
 def conv_rows(taps: torch.Tensor, dims: int, first: int, n: int) -> torch.Tensor:
