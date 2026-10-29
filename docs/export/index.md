@@ -172,7 +172,7 @@ naming the layer or the setting.
 
 | Layers | What exports |
 |--------|--------------|
-| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | every setting and activation, but a head's copy pointer (`pointer`), which the export refuses |
+| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | every setting and activation; a head's copy pointer (`pointer`) is in the export's weights, which vLLM's plugin serves, and transformers' modeling refuses it |
 | `moe` | every setting inference reads: the routers, group-limited routing, the load-balancing bias (`aux_free`, `smebu`), shared experts, LatentMoE, the expert norm, and experts of either MLP type. The routed experts run on transformers' experts implementations |
 | `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm per head or across all heads, biases, fused or separate projections, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, and the indexer; the `v`, `kv` and `index` ports. Dropout applies only in training |
 | `indexer` | every setting inference reads: DSA's top-k keys, QSA's mean-pooled blocks, MSA's max-pooled blocks and per-group picks, plain or ReLU'd dot products, weighted or summed. Its loss applies only in training |

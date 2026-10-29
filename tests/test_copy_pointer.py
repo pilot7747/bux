@@ -5,6 +5,8 @@ it to the loss, and runs without it as before."""
 import math
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -14,8 +16,9 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux.architecture import Model
-from bux.architecture.copy import Pointer, _mixture_sums, mixture_nll
+from bux.architecture.copy import Pointer, _mixture_sums, log_probs, mixture_nll
 from bux.architecture.logits import Projection, Scores
+from bux.export.hf import basic as hf_basic
 from bux.export.huggingface import save
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
@@ -255,9 +258,50 @@ def test_the_pointer_s_window_and_token_are_settings():
     pointed(window="4")
 
 
-def test_an_export_refuses_a_pointer(tmp_path):
+def test_an_export_holds_the_pointer_which_transformers_refuses(tmp_path):
+    """vLLM's plugin serves the pointer from the export's weights; transformers'
+    modeling, whose generation would need the pointer's key cache, refuses it."""
+    from safetensors import safe_open
+
+    save(pointed_arch(), pointed(), tmp_path)
+    with safe_open(tmp_path / "model.safetensors", "pt") as f:
+        saved = f.keys()  # a safetensors file, no dict
+        names = [k for k in saved if ".pointer." in k]
+    assert sorted(n.split(".pointer.")[1] for n in names) == [
+        "gain",
+        "k.weight",
+        "q.weight",
+        "sink",
+    ]
+    c = next(layer for layer in pointed_arch().layers() if layer.config.type == "head")
+    config = SimpleNamespace(vocab_size=64)
     with pytest.raises(NotImplementedError, match="head: pointer not exported yet"):
-        save(pointed_arch(), None, tmp_path)
+        hf_basic.Head(
+            c.config.model_dump(mode="json"),
+            32,
+            cast(Any, SimpleNamespace(config=config)),
+        )
+
+
+def test_dense_log_probs_are_the_mixture_the_loss_scores():
+    """`log_probs`, what a server samples, gives each target the mixture's
+    log-likelihood that the loss takes, and sums to 1 over the vocabulary."""
+    model = pointed()
+    tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, 8)
+    [head, *_] = model.heads(tokens)
+    assert head.pointer is not None
+    dense = log_probs(head)
+    targets = jnp.pad(tokens[:, 1:], ((0, 0), (0, 1)))
+    log_c, log_s = head.pointer.logs(targets)
+    nll, _ = mixture_nll(
+        head.projection(head.hidden), targets, head.pointer.copy, log_c, log_s
+    )
+    picked = jnp.take_along_axis(dense, targets[..., None], -1)[..., 0]
+    np.testing.assert_allclose(
+        np.asarray(-picked[0, :-1]), np.asarray(nll[0, :-1]), rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(np.asarray(jnp.exp(dense).sum(-1)), 1.0, rtol=1e-5)
+    assert jnp.isneginf(dense[..., 63]).all()
 
 
 def test_a_run_without_a_pointer_trains_as_before():

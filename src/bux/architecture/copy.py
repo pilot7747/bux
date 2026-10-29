@@ -242,6 +242,47 @@ def _mixture_grads(
     return sums, grads, (d_log_c, d_log_s)
 
 
+def log_probs(head: "HeadOutput") -> Float[Array, "b t vocab"]:
+    """Return the log of the mixture over the vocabulary at every position of a head
+    with a copy pointer, -inf at <copy>, which is no token: what a server samples
+    from, in float32. It makes the pointer's attention whole, t by t, for short rows
+    (the vLLM plugin's parity check).
+
+    Raises:
+        ValueError: If the head has no copy pointer.
+    """
+    pointer = head.pointer
+    if pointer is None:
+        raise ValueError("a head without a copy pointer: take its logits")
+    logits = head.projection(head.hidden).astype(jnp.float32)
+    _, t, vocab = logits.shape
+    scores = (
+        jnp.einsum(
+            "bic,bjc->bij",
+            pointer.query,
+            pointer.key,
+            preferred_element_type=jnp.float32,
+        )
+        * pointer.query.shape[-1] ** -0.5
+    )
+    behind = jnp.arange(t)[:, None] - jnp.arange(t)
+    valid = (behind > 0) & (behind <= pointer.window)
+    valid = valid & (pointer.docs[:, :, None] == pointer.docs[:, None, :])
+    every = logadd(masked_lse(scores, valid), pointer.sink)
+    share = jnp.where(valid, jnp.exp(scores - every[..., None]), 0)
+    tokens = jax.nn.one_hot(pointer.tokens, vocab, dtype=jnp.float32)
+    log_copy = jnp.log(jnp.einsum("bij,bjv->biv", share, tokens))
+    log_sink = pointer.sink - every
+    rows = jnp.arange(vocab)
+    others = jnp.where(rows == pointer.copy, -jnp.inf, logits)
+    lse_lm = jax.nn.logsumexp(others, -1, keepdims=True)
+    gate = jnp.sum(jnp.where(rows == pointer.copy, logits, 0), -1, keepdims=True)
+    lse = jnp.logaddexp(lse_lm, gate)
+    kept = jnp.logaddexp(lse_lm - lse, gate - lse + log_sink[..., None])
+    out = jnp.logaddexp(others - lse_lm + kept, gate - lse + log_copy)
+    return jnp.where(rows == pointer.copy, -jnp.inf, out)
+
+
 def mixture_nll(
     logits: Float[Array, "*n vocab"],
     targets: Int[Array, "*n"],

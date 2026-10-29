@@ -26,7 +26,6 @@ import numpy as np
 import torch
 from safetensors.torch import save_file
 
-from bux import config as cfg
 from bux.architecture import Model
 from bux.export import codegen, hf
 from bux.export.hf.common import KEEP_FLOAT32
@@ -36,22 +35,6 @@ from bux.lang import ir
 
 #: The files of `bux.export.hf` a repo does not take.
 _NOT_COPIED = {"__init__.py"}
-
-
-def _check_pointer(arch: ir.Architecture) -> None:
-    """Raise for a head's copy pointer, before anything is written.
-
-    Raises:
-        NotImplementedError: A head has a copy pointer, whose mixture generation
-            would sample from by a cache of the pointer's keys, not exported yet.
-    """
-    for layer in arch.layers():
-        c = layer.config
-        if isinstance(c, cfg.LMHeadConfig) and c.pointer is not None:
-            raise NotImplementedError(
-                "head: pointer not exported yet (a copy pointer's mixture, which "
-                "generation would sample by a cache of the pointer's keys)"
-            )
 
 
 def save(
@@ -83,7 +66,6 @@ def save(
     Raises:
         NotImplementedError: A layer, or a setting of one, is not exported yet.
     """
-    _check_pointer(arch)
     p = plan(arch)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)

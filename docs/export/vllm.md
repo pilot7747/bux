@@ -126,8 +126,9 @@ costs. On a B300, serve with `fp8` ([Schemes on a B300](#schemes-on-a-b300)).
   `lightning`, `rwkv7` and `short_conv`, their low-rank ones included. vLLM's own
   `gdn` layer quantizes its projections too, and so does its Mamba-2, where tensor
   parallelism splits its groups.
-- **Kept in the model's dtype:** the embeddings and the heads, the routers (which
-  the plugin computes in float32), the shared experts' gate, the norms and convs,
+- **Kept in the model's dtype:** the embeddings and the heads, a head's copy
+  pointer, the routers (which the plugin computes in float32), the shared experts'
+  gate, the norms and convs,
   the residual algebras, the indexers, `engram`, `mamba` (vLLM's Mamba layer takes
   no quantization), and the KV cache (`--kv-cache-dtype` sets that). So are the
   weights the plugin reads itself: a sparse `mla`'s `kv_b`, which its sparse
@@ -331,7 +332,7 @@ in every run.
 
 | Layers | In vLLM |
 |--------|---------|
-| `embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping. Not yet: a copy pointer (`pointer`) |
+| `embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping; a copy pointer ([Copy pointer](#copy-pointer)). Not yet: a pointer's `window`, or a pointer with speculative decoding |
 | `rmsnorm`, `layernorm`, `dyt`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `conv` | by vLLM's short-conv kernels, its last inputs in vLLM's Mamba cache, as the conv on keys and values; the whole stream on every rank |
 | `short_conv` | LFM2's, `C * conv(B u)`, by the same kernels and state, its channels split over ranks, with or without biases |
@@ -354,6 +355,34 @@ vLLM's own KDA layer gives every value head a q and a k head of its own. bux's
 a layer of its own: q and k are projected and convolved at their own heads, as bux
 computes them, and repeated out to the value heads only for the kernels. Its weights
 and its state per sequence are bux's.
+
+## Copy pointer
+
+A first head with a copy pointer (`head(pointer=copy_pointer())`, CPLM) samples
+from its mixture, as bux's loss scores it
+([Copy pointer](../architectures/layers.md#copy-pointer)):
+
+- **Cache:** the head keeps a paged cache of its own, a row a token: the pointer's
+  key, 128 channels, then the token as three base-256 digits, which any dtype holds
+  exactly. It is in the model's dtype, or bytes under an FP8 KV cache, the keys in
+  FP8 (e4m3) at a scale of 1, which RMS-normed keys fit. vLLM pages it as the
+  model's attention caches, so prefix caching hits as often.
+- **The op:** each step, ``vllm::bux_copy_pointer`` writes the step's rows, then,
+  for each request's last token of the step, the one vLLM samples, attends to the
+  request's tokens before it and the sink. In a 16-bit model one Triton launch runs
+  every request, a program each: a pass over its blocks for the softmax's max and
+  sum, and one that adds each position's share into its token's entry of the
+  request's row of a buffer of `max_num_seqs` rows. A float32 model takes PyTorch's
+  path. vLLM splits its graphs around the op, and a step of decoded tokens alone is
+  one CUDA graph.
+- **The logits** that vLLM samples are the log of the mixture, the head's
+  soft-capped logits mixed with the pointer's row, in float32; the `<copy>` row's
+  are $-\infty$. Log-probabilities vLLM returns are the mixture's.
+- **Weights:** the pointer's projections stay in the model's dtype, whole on every
+  rank, under FP8 weights too. Each rank computes the pointer.
+
+transformers' modeling refuses a head with a pointer: generating would need the
+pointer's cache, which its cache classes do not keep.
 
 ## DPLR delta rules
 
@@ -734,6 +763,7 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
 | `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
 | `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
+| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own | - | - | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |

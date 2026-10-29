@@ -46,6 +46,7 @@ from bux_vllm import (
     common,
     compressed,
     config,
+    copying,
     delta,
     dplr,
     feeds,
@@ -2452,6 +2453,7 @@ def engine_config(where: Path, quant: Any, cache_dtype: str = "auto") -> Any:
         compilation_config=SimpleNamespace(static_forward_context={}, splitting_ops=[]),
         quant_config=quant,
         num_speculative_tokens=0,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
     )
 
 
@@ -2477,7 +2479,7 @@ def kept(model: Any, path: str) -> bool:
     dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's, and
     a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name == "shared_gate":
+    if name == "shared_gate" or owner.endswith(".pointer"):  # a copy pointer's too
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 
@@ -2720,3 +2722,55 @@ def test_the_fp8_emulation_rounds_what_vllm_quantizes(tmp_path: Path) -> None:
         ]
         assert all(torch.equal(a, x) for a, x in zip(again, w if w.dim() == 3 else [w]))
         assert not torch.equal(p, before[name]), name
+
+
+@pytest.mark.parametrize("fp8", [None, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+def test_a_pointer_s_rows_keep_its_keys_and_tokens(fp8: torch.dtype | None) -> None:
+    keys = torch.randn(5, 128)
+    tokens = torch.tensor([0, 255, 256, 50303, 2**24 - 1])
+    dtype = torch.uint8 if fp8 is not None else torch.bfloat16
+    rows = copying.encode(keys, tokens, dtype, fp8)
+    assert rows.shape == (5, 1, copying.row_width(128)) and rows.dtype == dtype
+    got_keys, got_tokens = copying.decode(rows[:, 0], 128, fp8)
+    assert got_tokens.tolist() == tokens.tolist()
+    want = keys.to(fp8 or torch.bfloat16).float()
+    np.testing.assert_array_equal(got_keys.numpy(), want.numpy())
+
+
+def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture() -> None:
+    """Each position as a request's last token: the pointer over the request's
+    earlier tokens in the paged cache, mixed with the head's softmax, is bux's
+    mixture (`bux.architecture.copy.log_probs`) at that position."""
+    from bux.architecture import copy as bux_copy
+
+    source = (
+        "d_model = 32\nvocab_size = 64\n"
+        "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
+        "model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim=16))"
+    )
+    model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
+    tokens = jax.random.randint(jax.random.key(0), (1, 12), 0, 6)
+    [head] = model.heads(tokens)
+    pointer = head.pointer
+    assert pointer is not None
+    want = np.asarray(bux_copy.log_probs(head)[0])
+    q, k, sink = (
+        torch.from_numpy(np.array(a[0], np.float32))
+        for a in (pointer.query, pointer.key, pointer.sink)
+    )
+    logits = torch.from_numpy(np.array(head.projection(head.hidden)[0], np.float32))
+    size, blocks = 4, 3
+    cache = torch.zeros(8, 1, size, copying.row_width(16))
+    table = torch.tensor([[5, 2, 7]])  # the request's blocks, out of order
+    slots = table[0, torch.arange(12) // size] * size + torch.arange(12) % size
+    rows = copying.encode(k, torch.from_numpy(np.array(tokens[0])), torch.float32, None)
+    cache.view(-1, rows.shape[-1])[slots] = rows[:, 0]
+    assert blocks * size == 12
+    for i in range(12):
+        p_copy, a_sink = copying.pointed(
+            q[i : i + 1], sink[i : i + 1], cache, table, torch.tensor([i]), 64, None
+        )
+        got = copying.mixed(logits[i : i + 1], p_copy, a_sink, 63)[0].numpy()
+        finite = np.isfinite(want[i])
+        assert (np.isfinite(got) == finite).all()
+        np.testing.assert_allclose(got[finite], want[i][finite], rtol=1e-5, atol=1e-5)

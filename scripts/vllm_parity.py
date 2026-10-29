@@ -172,6 +172,9 @@ CASES = {
     + "capped = mlp(intermediate_size=256, activation=relu2, up_softcap=2)\n"
     + "model = embed(norm=rmsnorm) [rmsnorm attn] [rmsnorm ffn] [rmsnorm laguna]"
     " [rmsnorm capped] rmsnorm head",
+    # CPLM's copy pointer on the head: its mixture with the softmax is what vLLM
+    # samples, the pointer's keys and tokens in a paged cache of the head's own.
+    "cplm": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer(dim=64))",
     "moe": HEAD
     + ATTN
     + EXPERT
@@ -852,7 +855,8 @@ class Agreement:
         and the `picks` of its steps, from position `starts` on."""
         steps = want[starts:]
         gap = steps.max(-1) - steps[np.arange(len(picks)), picks]
-        self.error = max(self.error, float(np.abs(got - want).max()))
+        off = np.where(got == want, 0, np.abs(got - want))  # -inf at <copy>, both
+        self.error = max(self.error, float(off.max()))
         self.gap = max(self.gap, float(gap.max()))
         self.same &= bool((steps.argmax(-1) == picks).all())
         self.seen = True
@@ -863,10 +867,16 @@ class Agreement:
 
 
 def _logprobs(model: Any, tokens: list[int]) -> np.ndarray:
-    """bux's log-probabilities of every position of `tokens`, in float32."""
+    """bux's log-probabilities of every position of `tokens`, in float32: of its copy
+    pointer's mixture, for a first head with one (`bux.architecture.copy`)."""
     import jax
     import jax.numpy as jnp
 
+    from bux.architecture import copy
+
+    [first, *_] = model.heads(jnp.asarray([tokens]))
+    if first.pointer is not None:
+        return np.asarray(copy.log_probs(first)[0])
     logits = model(jnp.asarray([tokens]))[0].astype(jnp.float32)
     return np.asarray(jax.nn.log_softmax(logits, -1))
 

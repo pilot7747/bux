@@ -67,6 +67,8 @@ def states(c: dict, layer_ports: list | None = None) -> list[str]:
     attention layer of its own, over its writer's cache, and keeps nothing else."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
+    if c["type"] == "head":  # a copy pointer's keys and tokens
+        return ["full_attention"] if c.get("pointer") else []
     if c["type"] in ("conv", "short_conv"):
         return ["conv"]
     if c["type"] not in STATES:

@@ -261,7 +261,9 @@ model = embed block^layers norm @h out $h nextn(norm=norm) block norm out
 The pointer's scores are float32, a chunk of 512 queries at a time against every
 key of the row, made again in the backward: at rows of 16k they cost about one
 attention head of 128 over the whole row. Positions split over `seq` are not
-taken, and neither a transformers nor a vLLM export takes the pointer yet.
+taken. An export holds the pointer, which vLLM's plugin serves
+([Copy pointer](../export/vllm.md#copy-pointer)); transformers' modeling refuses
+it.
 
 modded-nanogpt's pointer looks back over two blocks of 2048 tokens in training and
 8192 in evals, its kernel's band; bux's sees the whole document unless `window`
