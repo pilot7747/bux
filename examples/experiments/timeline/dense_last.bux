@@ -1,0 +1,30 @@
+# The dense layer moved to the end: dense0.bux (the factorial's candidate with every
+# layer's FFN routed) with the last layer's FFN the candidate's dense SwiGLU, so that
+# it has one dense layer, as the candidate does, at the other end. A probe, from no
+# model: does a dense layer help where the routing is the most specialized, and does
+# the gradient spike there too, as the candidate's dense first layer makes it do? The
+# MTP module keeps its layer of experts. Everything else is dense0's and the
+# candidate's, so it pairs with both by seed.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# factorial.bux's vres(g_k, fr_experts), every FFN routed but the last layer's.
+g_k = fr_global(kv_conv_size=4)
+
+# The groups of four after the first, layers // 4 - 1 of them, the last with the dense
+# FFN. A repeat cannot run 0 times, as the others would at d512: each rung has its own.
+group = fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1))
+last  = fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1), fr_dense)
+tail  = d512: last | d768: group last | d1024: group^2 last | d1280: group^3 last
+
+dense_last = embed
+             fr_layer(hy_delta) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+             tail
+             fr_norm @h fr_out hy_mtp
+model      = dense_last
+
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), as the candidate's.
+optimizer.lr = 2e-3
