@@ -122,6 +122,7 @@ mypy-init-return = true
 "tests/**" = ["ANN"]
 # Triton reads a kernel's annotations as its arguments' kinds: its pointers have none.
 "src/bux_vllm/kernels.py" = ["ANN001", "ANN202"]
+"src/bux_vllm/doc_copy.py" = ["ANN001", "ANN202"]
 "src/bux_vllm/streams.py" = ["ANN001", "ANN202"]
 
 [tool.ty.terminal]

@@ -48,6 +48,7 @@ from bux_vllm import (
     common,
     compressed,
     config,
+    copying,
     delta,
     dplr,
     feeds,
@@ -1143,6 +1144,56 @@ def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
     np.testing.assert_allclose(
         np.asarray(k), np.asarray(v * gain), rtol=1e-5, atol=1e-6
     )
+
+
+@pytest.mark.parametrize("lengths", [(1, 2, 3, 4, 6), (2, 8)], ids=["short", "gaps"])
+def test_doc_copy_scans_each_tokens_sequence_as_bux_matches(lengths: tuple) -> None:
+    """The plugin's scan of each token's sequence so far, for a step of two prompt
+    chunks (the second after its cached tokens) and a decoded token, finds bux's
+    candidates and buckets of each whole sequence."""
+    from bux.architecture.layers.doc_copy import candidates
+
+    tokens = jax.random.randint(jax.random.key(0), (3, 30), 0, 3)
+    seqs = jnp.ones_like(tokens), jnp.broadcast_to(jnp.arange(30), (3, 30))
+    want = [np.asarray(w) for w in candidates(tokens, *seqs, lengths, 3)]
+    history = torch.from_numpy(np.array(tokens)).int()
+    # Row 0's tokens 0-11 whole, row 1's 20-29 after 20 cached, row 2's token 29.
+    rows = torch.tensor([0] * 12 + [1] * 10 + [2])
+    pos = torch.cat([torch.arange(12), torch.arange(20, 30), torch.tensor([29])])
+    got = copying.scan(history, rows, pos, list(lengths), 3)
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_array_equal(g.numpy(), w[rows.numpy(), pos.numpy()])
+
+
+def test_doc_copy_vectors_are_buxs() -> None:
+    source = (
+        HEAD
+        + "model = embed doc_copy(copy=@c) [rmsnorm] doc_copy(gain=1, copy=$c!) head"
+    )
+    m = Model(compile(source), rngs=nnx.Rngs(0))
+    from bux.architecture import DocCopy, Taps
+
+    first = next(x for _, x in nnx.iter_graph(m) if isinstance(x, DocCopy))
+    first.scale[...] = jax.random.normal(jax.random.key(1), first.scale.shape)
+    first.bucket_embed[...] = jax.random.normal(
+        jax.random.key(2), first.bucket_embed.shape
+    )
+    tokens = jax.random.randint(jax.random.key(3), (1, 24), 0, 3)
+    want = np.asarray(first.vector(Taps(tokens=tokens)))[0]
+    history = torch.from_numpy(np.array(tokens)).int()
+    c, b = copying.scan(
+        history,
+        torch.zeros(24, dtype=torch.long),
+        torch.arange(24),
+        list(first.lengths),
+        3,
+    )
+    table = torch.from_numpy(np.asarray(first.embedding.tokens.embedding[...]))
+    scale, embed = (
+        torch.from_numpy(np.asarray(p[...])) for p in (first.scale, first.bucket_embed)
+    )
+    got = copying.vector(table[c], b, scale, embed)
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:

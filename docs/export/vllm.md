@@ -344,6 +344,7 @@ in every run.
 | `mamba`, `mamba2`, `gdn` | by vLLM's own layers (`mamba` as Jamba's, without speculative decoding), with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and without a short conv or an output gate by bux's own rule ([DPLR delta rules](#dplr-delta-rules)). Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate; by bux's own rule ([DPLR delta rules](#dplr-delta-rules)) without a conv or an output gate, with a `v_head_dim` other than `head_dim`, or a lower bound under -5. Not yet: speculative decoding |
 | `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, with a conv or none, `lightning`'s decay by the layer's depth among the token mixers and its RMSNorm of all heads, its statistics summed over the ranks, and `rwkv7`'s `v` port (the value residual). Not yet: `gla` without a conv in a 16-bit model, or speculative decoding |
+| `doc_copy` | every setting and its `copy` port, on a single or a widened stream: the candidates found before the model runs, from vLLM's tokens of each request ([The document-local copy feature](#the-document-local-copy-feature)). Not yet: speculative decoding, more than 16 lengths, layers of different lengths or counts, or vLLM's V1 model runner |
 | `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
@@ -388,6 +389,26 @@ tokens where the others' hold 2096.
 
 A layer that reads the `v` port (a value residual) mixes the first layer's values
 into its own, which its keys do not share, so it caches both.
+
+## The document-local copy feature
+
+`doc_copy`'s candidates depend on the step's tokens and their requests' earlier
+tokens alone, so vLLM's model runner (V2, its default) finds them before the model
+runs, in the plugin's runner state, as it gives an engram its ids. A request is one
+document.
+
+- **The scan.** A Triton kernel takes a program per token of the step. It scans the
+  token's request, in vLLM's token ids of its requests, a block of earlier positions
+  at a time: each one's common suffix with the token's, up to the longest length.
+  For each length it keeps the latest that matches and how many do, and picks the
+  longest. Prompts, cached prefixes and decoded tokens read the same tokens, with no
+  host sync and no loop over requests.
+- **The vector.** The model reads each token's candidate and bucket from a buffer
+  of a fixed shape, which CUDA graphs replay. The candidates' rows come from the
+  first embedding, split by vocabulary, and the bucket tables stay in the model's
+  dtype, unquantized.
+- **Cost.** A decoded token reads its request's tokens once: about 4 bytes a token
+  of context, from vLLM's token ids in host memory, which the GPU reads in place.
 
 ## DPLR delta rules
 
@@ -812,6 +833,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |
 | `vpgate` | `vpgate`'s residual algebra | 9.5e-6 | 0.072 (0.13) | - |
 | `engram` | Engram's memory between two blocks, a tied head | 1.4e-5 | 0.097 (0.11) | 0.074 |
+| `doc-copy` | the document-local copy feature at its two sites, over 16 tokens | - | - | - |
+| `doc-copy-hybrid` | the same on the hybrid's shape under `hc`, contexts of up to 3 tokens | - | - | - |
 
 Every float32 run decoded bux's greedy tokens exactly. In bfloat16 an MoE's and a
 sparse layer's errors are large, and so are bux's own: where two experts' or two

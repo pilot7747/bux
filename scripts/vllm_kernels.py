@@ -11,7 +11,8 @@ window, sinks, a softcap, indexer keys that pad their rows), dtype
 (float32, bfloat16) and layout (one request's prefill, a decoding step of several
 requests), it compares the picks, which must be equal in float32, and the outputs,
 which must agree within 1e-4 in float32 and 2e-2 in bfloat16 (where a near tie may
-pick another key). It exits nonzero if any differ.
+pick another key). doc_copy's scan of each token's sequence (`bux_vllm.doc_copy`)
+must find PyTorch's candidates and buckets exactly. It exits nonzero if any differ.
 """
 
 from __future__ import annotations
@@ -225,6 +226,33 @@ def compare_csa_picks(relu: bool, dtype: torch.dtype, decoding: bool) -> bool:
     return same or dtype != torch.float32
 
 
+def compare_doc_copy(vocab: int, length: int) -> bool:
+    """doc_copy's scan by its Triton kernel (`bux_vllm.doc_copy`) against PyTorch's
+    (`bux_vllm.copying`): a prompt chunk after cached tokens, a whole prompt and
+    decoded tokens, over sequences of `length` tokens of `vocab`; equal candidates
+    and buckets."""
+    from bux_vllm import copying, doc_copy  # vLLM's, on a GPU alone
+
+    lengths, dev = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32), "cuda"
+    history = torch.randint(0, vocab, (4, length), device=dev, dtype=torch.int32)
+    rows = torch.tensor([0] * 300 + [1] * 50 + [2, 3], device=dev)
+    pos = torch.cat([
+        torch.arange(length - 300, length), torch.arange(50),
+        torch.tensor([length - 1, length // 2]),
+    ]).to(dev)  # fmt: skip
+    want = copying.scan(history, rows, pos, list(lengths), 3)
+    inputs = doc_copy.DocCopyInputs.__new__(doc_copy.DocCopyInputs)
+    inputs.lengths, inputs.counts = lengths, 3
+    inputs.doc_lengths = torch.tensor(lengths, dtype=torch.int32, device=dev)
+    got = torch.zeros(2, len(pos), dtype=torch.int32, device=dev)
+    inputs._scan(history, rows.int(), pos.int(), got)
+    ok = all(torch.equal(g.long(), w) for g, w in zip(got, want, strict=True))
+    print(
+        f"doc_copy scan, {vocab} tokens, sequences of {length}: {'ok' if ok else 'DIFFERS'}"
+    )
+    return ok
+
+
 def main() -> int:
     """Compare every setting, dtype and layout; 1 if any differ."""
     results = [
@@ -245,6 +273,7 @@ def main() -> int:
         for dtype in TOLERANCE
         for decoding in (False, True)
     ]
+    results += [compare_doc_copy(v, n) for v in (3, 50) for n in (600, 4096)]
     print("all agree" if all(results) else "MISMATCH")
     return 0 if all(results) else 1
 

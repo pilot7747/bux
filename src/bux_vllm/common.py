@@ -121,6 +121,8 @@ class Ctx:
             as vLLM's model runner gives them to a model that asks (engram's).
         ngram_context: Each sequence's last ids before the step, (R, C), -1 for
             none, likewise.
+        doc_copy: Each token's ``doc_copy`` candidate and bucket, (2, T), as the
+            model runner's state found them (`bux_vllm.doc_copy`).
     """
 
     def __init__(
@@ -139,6 +141,7 @@ class Ctx:
         self.input_ids: torch.Tensor | None = None
         self.query_start_loc: torch.Tensor | None = None
         self.ngram_context: torch.Tensor | None = None
+        self.doc_copy: torch.Tensor | None = None
         self._calls: dict[str, int] = {}
 
     def push(self, name: str, x: Any) -> Any:

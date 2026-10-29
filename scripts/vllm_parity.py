@@ -563,6 +563,25 @@ CASES = {
     " gated=true, kv_conv_size=4)\n"
     + "model = embed [rmsnorm glob] [rmsnorm ffn] [rmsnorm glob] [rmsnorm ffn]"
     " rmsnorm head",
+    # The document-local copy feature at PR 378's two sites, over 16 tokens so that
+    # the prompts and their decoding repeat; then on the hybrid's shape (KDA, gated
+    # global layers without positions, the conv on keys and values, the v port, hc,
+    # MTP after the head), its contexts of up to 3 tokens.
+    "doc-copy": "d_model = 128\nvocab_size = 16\n"
+    + ATTN
+    + FFN
+    + BLOCK
+    + "model = embed doc_copy(copy=@c) block^2 doc_copy(gain=1, copy=$c!) rmsnorm head",
+    "doc-copy-hybrid": "d_model = 128\nvocab_size = 16\nresidual = hc(expansion=2)\n"
+    + FFN
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "glob = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\nshared out = head\n"
+    + "mtp = $h nextn(norm=rmsnorm) [rmsnorm glob] [rmsnorm ffn] rmsnorm out\n"
+    + "model = embed doc_copy(lengths=[1, 2, 3], copy=@c) [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm glob(v=@v1)] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm glob(v=$v1!)] [rmsnorm ffn] merge doc_copy(gain=1, copy=$c!) rmsnorm"
+    " @h out mtp",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
