@@ -481,3 +481,7 @@ loss = loss(z=1e-4, prefix=prefix(weight=0.25, hold=1/3, decay=1/3))
 It takes the first head alone, beside any heads after it, and a document's own
 targets, as the loss does. It costs the first head's loss a second pass over the
 vocabulary, by `methods.loss`.
+
+On a KDA hybrid of 680M parameters at a width of 512, the record's setting left the
+held-out bits per byte where they were: -0.09% on average, -0.10%, +0.13% and -0.29%
+by seed (503M tokens, 3 seeds, B300s, 2026-10-29).
