@@ -3,8 +3,8 @@ tensor parallelism, attending by vLLM's attention layer and its paged KV cache, 
 its ``v`` port (the value residual, `bux_vllm.kv`), its conv on keys and values
 (`bux_vllm.conv`) and its indexer, which picks the keys each query attends to
 (`bux_vllm.sparse`). Its projections take the engine's quantization config
-(`bux_vllm.common.quantization`); its norms, conv and indexer stay in the model's
-dtype."""
+(`bux_vllm.common.quantization`), its indexer's too, merged into one; its norms and
+conv stay in the model's dtype."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.attention import Attention as PagedAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -206,7 +207,8 @@ class Attention(Layer):
         ix = None if self.reads_index else c["indexer"]
         if ix is not None:
             rotated_dims = rotated(self.dk, c["rope"])
-            self.indexer = Indexer(ix, width, c["rope"], rotated_dims)
+            merged = merged_indexer(ix, width, site)
+            self.indexer = Indexer(ix, width, c["rope"], rotated_dims, None, merged)
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         groups = (self.kv_first, self.g)
         spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
@@ -377,9 +379,6 @@ class Attention(Layer):
         for name in ("gate_up", "output_gate_down", "output_gate_up"):
             if (weight := getattr(self, name)) is not None:
                 out[name] = (weight, ())
-        if self.indexer is not None:
-            params = self.indexer.named_parameters()
-            out |= {f"indexer.{name}": (p, ()) for name, p in params}
         if self.rel_table is not None:
             out["rel_table"] = (self.rel_table, ())
         return out
@@ -387,6 +386,8 @@ class Attention(Layer):
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
         if name in ("k_conv.weight", "v_conv.weight") and self.conv_weight is not None:
             return self._load_conv(self.conv_weight, name[0], tensor)
+        if name.startswith("indexer.") and self.indexer is not None:
+            return self.indexer.load(name.removeprefix("indexer."), tensor)
         if self.k_eq_v and self.qkv is not None and name.split(".")[0] in ("k", "qkv"):
             return self._load_keys_as_values(name, tensor)
         return super().load(name, tensor)
@@ -503,9 +504,7 @@ class Attention(Layer):
         `call`-th call's caches (`bux_vllm.sparse.attend`)."""
         index = None
         if self.indexer is not None:
-            at = ctx.positions
-            ix = self.indexer
-            index = (ix.queries(x, at), ix.head_weights(x), ix.keys(x, at))
+            index = self.indexer.project(x, ctx.positions)
         out = q.new_empty(q.shape[0], self.h, self.dv)
         values = v.view(-1, self.g, self.dv)
         cache = self.caches[call]
@@ -605,6 +604,24 @@ class Attention(Layer):
             logits = tensor_model_parallel_all_reduce(padded)
         first = self.heads_first
         return torch.sigmoid(logits[:, first : first + self.h])[..., None]
+
+
+def merged_indexer(ix: dict, width: int, site: Site) -> MergedColumnParallelLinear:
+    """The projection of a ``gqa`` layer's indexer, `ix`, from its input: its
+    queries', keys' and head weights' in one GEMM (`bux_vllm.indexer.Indexer.sizes`),
+    the same on every rank, with the engine's quantization config where its parts
+    are multiples of 16, as vLLM's FP8 GEMMs take them."""
+    sizes = Indexer.sizes(ix)
+    quant = site.quant if all(n % 16 == 0 for n in sizes) else None
+    return MergedColumnParallelLinear(
+        width,
+        sizes,
+        bias=False,
+        quant_config=quant,
+        prefix=f"{site.path}.indexer.merged",
+        return_bias=False,
+        disable_tp=True,
+    )
 
 
 class AllHeads(Norm):
