@@ -93,6 +93,11 @@ read it first, and the block under way's those of the branch that reads it. They
 start at 0, as do the queries and the mixer's projection, so a branch starts by
 reading the mean of its sources, a quarter of it in each of the 4 streams.
 
+It costs more than it gave at small scale. On a KDA hybrid of 680M parameters at a
+width of 512, in place of `hc`, it raised the held-out bits per byte by 0.5% and took
+2.1 times as long a step (503M tokens, 3 seeds, B300s, 2026-10-29). Its vLLM export
+at a width of 3328 served 58% fewer agentic sessions an hour per GPU in FP8.
+
 ### Single-pass mHC
 
 `mhc(single_pass=true)` is the variant from DeepSeek-V4.1. Each branch reads with the

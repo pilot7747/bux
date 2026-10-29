@@ -121,14 +121,16 @@ costs. On a B300, serve with `fp8` ([Schemes on a B300](#schemes-on-a-b300)).
 
 - **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
   routed and shared experts. That is attention's q, k, v, gate and output
-  projections (`gqa`, `mla`, `csa`), the MLPs and `linear`, LatentMoE's
+  projections (`gqa`, `mla`, `csa`), a `gqa` indexer's projections of its queries,
+  keys and head weights (one GEMM, one scale, where its head dim is a multiple of
+  16), the MLPs and `linear`, LatentMoE's
   projections, and the projections of `kda`, `gdn2`, `deltanet`, `gla`,
   `lightning`, `rwkv7` and `short_conv`, their low-rank ones included. vLLM's own
   `gdn` layer quantizes its projections too, and so does its Mamba-2, where tensor
   parallelism splits its groups.
 - **Kept in the model's dtype:** the embeddings (`value_embed`'s too) and the heads, the routers (which
   the plugin computes in float32), the shared experts' gate, the norms and convs,
-  the residual algebras, the indexers, `engram`, `mamba` (vLLM's Mamba layer takes
+  the residual algebras, the indexers of `mla` and `csa`, `engram`, `mamba` (vLLM's Mamba layer takes
   no quantization), and the KV cache (`--kv-cache-dtype` sets that). So are the
   weights the plugin reads itself: a sparse `mla`'s `kv_b`, which its sparse
   attention reads, `csa`'s grouped low-rank output, and HyGA's matrices of each
@@ -593,11 +595,17 @@ plugin's own kernels above. So does a sparse `mla` layer's indexer, unless
 `BUX_VLLM_SPARSE_KERNELS=native`: its FP8 keys would take a head slot as wide as a
 latent, which doubles the layer's cache.
 
+- **Projections.** A `gqa` layer's indexer projects its queries, keys and head
+  weights from the layer's input by one GEMM, which takes `--quantization` as the
+  layer's other projections do.
 - **Keys.** Each token's indexer key is cached in FP8 (e4m3) with a float32 scale,
   in head slots of the call's cache after its kv heads: each block's keys, then
   their scales, as DeepGEMM's paged kernel reads them. They page with the keys and
   values, one cache a call, so prefix caching hits as in a dense model. The cache
-  takes blocks of 64 tokens, which vLLM sets (or splits larger blocks into).
+  takes blocks of 64 tokens, which vLLM sets (or splits larger blocks into). One
+  Triton kernel writes a step's keys, values and indexer keys into the cache, and
+  another quantizes the indexer's queries, each in one launch and bit for bit as
+  PyTorch would.
 - **Scores.** A prompt chunk's queries score the keys of its request, as vLLM
   gathers them, by DeepGEMM's MQA logits (`fp8_fp4_mqa_logits`); decoded tokens
   score theirs in place, by its paged MQA logits. Queries are FP8 too, with a scale
@@ -610,12 +618,14 @@ latent, which doubles the layer's cache.
   complete blocks as DSA's keys. A query also keeps its own block while that is
   unfinished.
 - **Picks.** vLLM's top-k kernels keep each query's best `top_k` of the keys (or
-  blocks) it sees, as DeepSeek-V3.2's do.
+  blocks) it sees, as DeepSeek-V3.2's do. A prompt chunk's scores are float32, as
+  DeepGEMM's MQA logits give them: vLLM 0.32 has no bfloat16 scores or fused
+  scores and top-k for a prompt's dense indexer.
 - **Attention.** vLLM's own sparse GQA attention, the kernel it runs Qwen4's QSA
-  on, attends over the picks, reading the paged keys and values in place: in a
-  bfloat16 model, at heads of a power of two of dims, in groups of 4 query heads or
-  more, without sinks or a softcap. Other layers attend by the plugin's Triton
-  kernel, and MLA's latents by PyTorch.
+  on, attends over the picks, reading the paged keys and values in place, into
+  the op's output: in a bfloat16 model, at heads of a power of two of dims, in
+  groups of 4 query heads or more, without sinks or a softcap. Other layers attend
+  by the plugin's Triton kernel, and MLA's latents by PyTorch.
 - **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
   values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
   layer that reads its `index` port. The attention kernel reads them as they are,
@@ -638,6 +648,17 @@ heads of 64 over 11 kv heads), vLLM's kernel takes 13 ms for the 16k prompt and
 width serves 2793 sessions an hour on one B300 within a TPOT of 30 ms in bfloat16,
 and 2952 with FP8 weights and an FP8 KV cache, against 1692 on the plugin's own
 kernels, at a TTFT of 0.46 s against 0.74 s.
+
+At long context DSA decodes faster than dense attention. On one B300 (2026-10-29,
+vLLM 0.32.0, FP8 weights and an FP8 KV cache), a hybrid of 56 layers, KDA and
+MoE with DSA in its 14 global attention layers, at a `d_model` of 3584 (56 query
+heads of 64 over 14 kv heads, an indexer of 4 heads of 64 keeping 2048 keys),
+decodes one sequence at 174.8k tokens in 8.36 ms a token, and the same hybrid
+with dense attention in 8.83 ms. A decoding step's GPU time is 8.37 ms against 8.98 ms. The
+DSA layers' scores take 0.09 ms of it, their picks 0.22 ms and their attention
+0.10 ms, where the dense layers' attention takes 0.76 ms. Writing their caches and
+preparing their queries and picks take 0.09 ms, where writing the dense layers'
+caches takes 0.07 ms.
 
 ### MSA on vLLM's kernels
 
@@ -782,7 +803,9 @@ The rows of XSA, HyGA, value embeddings, values from the keys, differential
 attention and multi-stream attention residuals (`xsa`, `hyga`, `diff`, `msar`,
 their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `k-eq-v-nope`) and of zero experts (`moe-zero`, `moe-zero-longcat`,
-`moe-zero-norm`) were measured the same way on 2026-10-29.
+`moe-zero-norm`) were measured the same way on 2026-10-29, and so were the sparse
+`gqa` and `mla` rows (all but `csa`'s), with each `gqa` indexer's projections in
+one GEMM.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -821,12 +844,12 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 7.6e-6 | 2.4 (2.0) | 2.4 |
 | `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 4.1 |
 | `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 6.7e-6 | 3.9 (4.2) | 3.9 |
-| `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 5.7e-6 | 3.5 (3.3) | 3.6 |
-| `msa-share` | MSA's picks shared through the `index` port | 8.6e-6 | 4.7 (4.7) | 4.7 |
+| `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 7.2e-6 | 3.5 (3.3) | 3.6 |
+| `msa-share` | MSA's picks shared through the `index` port | 6.7e-6 | 4.7 (4.7) | 4.7 |
 | `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 7.6e-6 | 0.63 (3.1) | - |
 | `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 2.0 |
 | `dsa-native` | DSA on vLLM's DSA kernels: an indexer of 4 heads of 64, its top 16, one layer that reads its picks | - | 3.8 (4.9) | 3.8 |
-| `dsa-hybrid` | the same on the hybrid's global layer (QK-norm, a gate, the conv on keys and values), beside KDA | - | 0.39 (0.65) | 0.41 |
+| `dsa-hybrid` | the same on the hybrid's global layer (QK-norm, a gate, the conv on keys and values), beside KDA | - | 0.66 (0.53) | 0.41 |
 | `qsa-native` | QSA on vLLM's DSA kernels: blocks of 4, 4 heads of 64, partial RoPE | - | 3.1 (5.1) | 3.1 |
 | `msa-native` | MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head | - | 0.088 (0.094) | 0.067 |
 | `mla-dsa-native` | sparse MLA with its indexer on vLLM's DSA kernels (`BUX_VLLM_SPARSE_KERNELS=native`) | - | 3.1 (3.5) | - |
