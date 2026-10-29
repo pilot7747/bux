@@ -1206,15 +1206,18 @@ KEYED = {
 
 @pytest.mark.parametrize(("change", "ports", "keyed"), KEYED.values(), ids=KEYED)
 def test_one_vector_a_token_is_cached_where_keys_are_values_times_a_gain(
-    change: dict, ports: tuple, keyed: bool
+    change: dict, ports: tuple, keyed: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """bux's keys are its values times the key norm's gain wherever the plugin
-    caches the values alone, and puts the gain on the queries instead."""
+    caches the values alone, asked to, and puts the gain on the queries instead."""
     qk = {"type": "rmsnorm", "eps": 1e-5} | change.pop("qk_norm", {})
     c = cfg.GQAConfig.model_validate(
         {"num_heads": 4, "num_kv_heads": 2, "k_eq_v": True, "qk_norm": qk} | change
     )
-    assert kv.keys_from_values(c.model_dump(mode="json"), list(ports)) == keyed
+    dumped = c.model_dump(mode="json")
+    assert not kv.keys_from_values(dumped, list(ports))  # keys and values, unasked
+    monkeypatch.setenv("BUX_VLLM_K_EQ_V_CACHE", "keys")
+    assert kv.keys_from_values(dumped, list(ports)) == keyed
     if not keyed:
         return
     attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
