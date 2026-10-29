@@ -370,6 +370,7 @@
   "candidate_block_size",
   "candidate_top_k",
   "head_dim",
+  "loss_over",
   "loss_weight",
   "norm",
   "num_heads",
