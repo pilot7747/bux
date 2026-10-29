@@ -8,8 +8,14 @@ the projections to and from it. Under ``expert_norm`` each expert's output is
 normalized before the router weighs it: each of a token's picks runs as a row of its
 own, which vLLM's fused MoE leaves unsummed (`bux_vllm.routing.apart`). Under tensor
 parallelism each rank keeps every expert's share of the hidden units, as vLLM splits
-them, and the projections whole. The routed experts, the shared experts and the
-latent's projections take the engine's quantization config
+them, and the projections whole. With zero experts (``num_zero_experts``) the layer
+routes once, beside the fused MoE in the compiled graph: the zero experts' output
+adds each token times its zero picks' weights, and the fused MoE takes the routed
+experts' picks and weights as given (`bux_vllm.routing.given_logits`), a zero
+pick as a phantom expert that its expert map skips (`bux_vllm.routing.phantom_map`),
+so that a token costs the GEMMs of its FFN experts alone. The routed
+experts, the shared experts and the latent's projections take the engine's
+quantization config
 (`bux_vllm.common.quantization`); the router, which the layer computes itself in
 float32, and the shared experts' gate of one output stay in the model's dtype, as
 vLLM keeps Qwen's.
@@ -25,7 +31,16 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from .basic import MLP
 from .common import Ctx, Layer, Norm, Site, unsupported
-from .routing import Router, apart, expert_shards, pick_rows
+from .routing import (
+    Router,
+    apart,
+    expert_shards,
+    given_logits,
+    phantom_map,
+    pick_given,
+    pick_rows,
+    zero_split,
+)
 
 #: vLLM's MoE activations, by a bux expert's type and activation, without a limit
 #: or an offset.
@@ -84,8 +99,14 @@ class MoE(Layer):
     shared experts as one MLP, gated by a sigmoid under ``shared_expert_gate``, or
     each one's share of the hidden units weighted by its score under
     ``shared_expert_sink``; with ``expert_norm``, each routed expert's output
-    normalized before its weight (`apart`). Training's settings (the balance loss,
-    the bias's update, random logits) change nothing here."""
+    normalized before its weight (`apart`); and zero experts (`zero_split`).
+    Training's settings (the balance loss, the bias's update, random logits) change
+    nothing here.
+
+    vLLM's own zero experts, LongCat-Flash's ``ZeroExpertRouter``, keep their output
+    aside inside the fused MoE's op, which torch.compile's trace never runs: vLLM
+    0.32 fails to compile them ("assert zero_expert_output is not None"). So the
+    layer routes by bux's rule itself and hands the fused MoE its picks."""
 
     bux_types = ("moe",)
     once = True
@@ -102,7 +123,9 @@ class MoE(Layer):
         self.latent_input_norm = _norm(c["latent_input_norm"], latent)
         self.latent_output_norm = _norm(c["latent_output_norm"], latent)
         self.router = Router(c)
-        scored = n + (c["num_shared_experts"] if c["shared_expert_sink"] else 0)
+        self.zero = c["num_zero_experts"]
+        sinks = c["num_shared_experts"] if c["shared_expert_sink"] else 0
+        scored = n + self.zero + sinks
         weight = torch.empty(scored, width)
         self.router_weight = nn.Parameter(weight, requires_grad=False)
         self.router_proj_bias = (
@@ -110,21 +133,24 @@ class MoE(Layer):
             if c["router_bias"]
             else None
         )
+        phantom = 1 if self.zero else 0  # the expert the zero experts' picks become
         self.experts = FusedMoEFactory(
-            num_experts=n,
+            num_experts=n + phantom,
             top_k=1 if apart_ else c["top_k"],
             hidden_size=latent,
             intermediate_size=expert["intermediate_size"],
             renormalize=c["normalize_top_k"],
             quant_config=site.quant,
             prefix=f"{site.path}.experts",
-            custom_routing_function=pick_rows if apart_ else self.router,
+            **self._routing(apart_),
             **experts_activation(expert),
             has_bias=expert["bias"],
             router_logits_dtype=torch.float32,
             # vLLM's names of the shards, which a non-gated MoE has no up of
             ckpt_names=("gate_proj", "down_proj", "up_proj" if self.gated else None),
         )
+        if self.zero:
+            self._skip_phantom()
         self.shared = None
         if c["num_shared_experts"]:
             shared = c["shared_expert"] or expert
@@ -138,6 +164,31 @@ class MoE(Layer):
         )
         sinks = _sink_of(c) if c["shared_expert_sink"] else None
         self.register_buffer("sink_of", sinks, persistent=False)
+
+    def _skip_phantom(self) -> None:
+        """Give the fused MoE the expert map of `phantom_map`, as expert parallelism
+        gives it its own, so that its Triton kernels skip the zero experts' picks:
+        moe_align_block_size counts them to the phantom, whose blocks write zeros and
+        multiply nothing, or drops them (``ignore_invalid_experts``), and moe_sum
+        leaves them out.
+
+        Raises:
+            NotImplementedError: Under expert parallelism, whose own map the phantom
+                would need a place in.
+        """
+        routed = self.experts.routed_experts
+        if routed.use_ep:
+            raise NotImplementedError("moe: zero experts under expert parallelism")
+        # On the default device vLLM builds the model on, as the experts' own map.
+        routed.register_buffer("_expert_map", phantom_map(self.num_experts), False)
+
+    def _routing(self, apart_: bool) -> dict:
+        """How vLLM's fused MoE routes: by bux's rule (`Router`), by one-hot rows
+        (`pick_rows`) for `apart`, or by the picks the layer gives it with zero
+        experts (`pick_given`)."""
+        if apart_:
+            return {"custom_routing_function": pick_rows}
+        return {"custom_routing_function": pick_given if self.zero else self.router}
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out = {"router.weight": (self.router_weight, ())}
@@ -170,6 +221,8 @@ class MoE(Layer):
         if bias and stem == "w2" and rank != 0:  # the ranks' outputs sum: one adds it
             shards = [(shard, torch.zeros_like(t)) for shard, t in shards]
         for shard, stacked in shards:
+            if self.zero:  # the phantom expert's, which nothing reads: zeros
+                stacked = torch.cat([stacked, torch.zeros_like(stacked[:1])])
             for e in range(stacked.shape[0]):
                 where = f"experts.{e}.{shard}.{'bias' if bias else 'weight'}"
                 # The parameter's loader: vLLM's online quantization wraps it
@@ -203,11 +256,19 @@ class MoE(Layer):
         z = x if self.to_latent is None else self.to_latent(x)
         if self.latent_input_norm is not None:
             z = self.latent_input_norm(z)
-        if self.expert_norm is None:
+        if self.expert_norm is None and not self.zero:
             y = self.experts(z, logits)
+        elif self.expert_norm is None:
+            weights, idx, _ = self.router.route(logits, self.top_k)
+            zero = zero_split(z, weights, idx, self.num_experts)[0]
+            given = given_logits(weights, idx, self.num_experts)
+            y = self.experts(z, given) + zero
         else:
             weights, idx, _ = self.router.route(logits, self.top_k)
-            y = apart(self.experts, self.expert_norm, z, weights, idx, self.num_experts)
+            zero, weights, idx = zero_split(z, weights, idx, self.num_experts)
+            width = self.num_experts + (1 if self.zero else 0)  # the phantom too
+            y = apart(self.experts, self.expert_norm, z, weights, idx, width)
+            y = y + zero if self.zero else y
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         return y if self.from_latent is None else self.from_latent(y)
