@@ -35,7 +35,7 @@ fields and documents them on hover, as it does for layers
 | `data` | {bux}`text`, {bux}`chat`, {bux}`tokens`, {bux}`synthetic`, or a mixture of them, `0.7 * a + 0.3 * b` | required | the rows training reads ([Data sources](../data/sources.md)) |
 | `tokenizer` | {bux}`tokenizer`, or `none` | `none` | the tokenizer of `text` and `chat` documents; required with them |
 | `packing` | {bux}`concat`, {bux}`greedy` or {bux}`best_fit` | `best_fit` | how documents become rows ([Packing](../data/packing.md)) |
-| `optimizer` | {bux}`adamw` or {bux}`muon` | required | the update rule ([Optimizers](optimizers.md)) |
+| `optimizer` | {bux}`adamw`, {bux}`muon` or {bux}`normuon` | required | the update rule ([Optimizers](optimizers.md)) |
 | `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
 | `seq_len` | an integer, at least 2 | required | tokens per row |
 | `batch` | a positive integer | required | rows per step, over all devices |
@@ -45,6 +45,7 @@ fields and documents them on hover, as it does for layers
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number above 0, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
+| `ema` | {bux}`ema`, or `none` | `none` | the weights a run ends on, a blend of an average of its last steps ([The tail EMA](optimizers.md#the-tail-ema)) |
 | `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves a run resumes from ([Checkpoints](running.md#checkpoints)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps (10 by default), and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
@@ -124,7 +125,7 @@ its own type:
 
 ```console
 $ bux check examples/experiments/smoke.bux 'optimizer = cosine'
-error: 'optimizer' must be adamw(...) or muon(...), found a cosine config
+error: 'optimizer' must be adamw(...), muon(...) or normuon(...), found a cosine config
  --> <command line>:1:13
   |
 1 | optimizer = cosine

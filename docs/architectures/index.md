@@ -71,7 +71,7 @@ width it started at.
 
 A setting that is not a layer parametrizes one: {bux}`rope` and its scalings go in an
 attention's `rope=`, and {bux}`indexer` in its `indexer=`. The top-level
-`residual =` picks a residual algebra (`hc`, `mhc`, `gr`, `attnres`, `vpgate`), which
+`residual =` picks a residual algebra (`hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`), which
 changes what every `[f]` means ([Residual algebras](../language/residual-algebras.md)).
 The top-level `init =` says how the weight matrices start
 ([Initialization](initialization.md)).

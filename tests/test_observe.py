@@ -198,6 +198,21 @@ def test_moe_observes_its_routing_and_every_head_its_loss(steps):
     assert "lm_loss/t+2" in seen.steps[1] and "z_loss/t+2" in at
 
 
+def test_zero_experts_observe_the_ffn_experts_a_token_goes_through(steps):
+    """LongCat-Flash's zero experts, trained scanned: each layer observes its mean
+    FFN experts a token, at most its top_k, and its bias moves, by layer."""
+    zero = MOE.replace(
+        "aux_loss_coef=0.01",
+        "num_zero_experts=2, router=sigmoid, load_balancing=aux_free, "
+        "aux_loss_coef=0.01, bias_update_rate=0.1",
+    )
+    at = steps(zero, 2, observe="observe(every=1)", methods=SCAN).steps[2]
+    ffn = layered(at, "router/ffn_experts")
+    assert ffn.keys() == {"moe.00", "moe.01"}
+    assert all(0 <= v <= 2 for v in ffn.values())
+    assert all(v > 0 for v in layered(at, "router/bias_std").values())
+
+
 def test_layers_are_named_alike_unrolled_and_scanned():
     keys = []
     for repeat in ("unroll", "scan"):

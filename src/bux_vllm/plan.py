@@ -273,3 +273,47 @@ def live(calls: list[Call]) -> list[Call]:
         if call.layer["config"]["type"] == "head":
             return calls[: i + 1]
     raise ValueError("a model needs a head for its logits")
+
+
+def msar_packs(arch: Node, p: Plan) -> list[int]:
+    """The msar calls each pack of their convs' states holds (`bux_vllm.msar`), in
+    the order the calls run: the branches' calls before the first head, `quota` a
+    pack; none without msar."""
+    residual = arch.get("residual") or {}
+    if residual.get("type") != "msar":
+        return []
+    calls = len(live(p.calls))
+    n = sum(1 for b in p.branches if b.calls < calls)
+    q = quota(arch, _recurrent(live(p.calls)))
+    return [min(q, n - i) for i in range(0, n, q)]
+
+
+def msar_shapes(arch: Node, p: Plan) -> set[tuple[int, int]]:
+    """The channels and taps of each pack of msar's convs' states
+    (`bux_vllm.msar`): d a call, on every rank."""
+    packs = msar_packs(arch, p)
+    size = max(arch["residual"]["kernel_sizes"], default=1) if packs else 1
+    return {(n * arch["d_model"], size) for n in packs}
+
+
+def quota(arch: Node, recurrent: dict | None) -> int:
+    """How many msar calls' states share a pack: as many as fill a recurrent layer's
+    state of a value head's dims by a key head's for each value head, in float32 on
+    one rank, at their last values of d channels in 16 bits; all in one pack
+    without a recurrent layer, whose state sets every Mamba page."""
+    d, sizes = arch["d_model"], arch["residual"]["kernel_sizes"]
+    keep = max(sizes, default=1) - 1
+    if recurrent is None or not keep:
+        return 1 << 30
+    dk = recurrent.get("head_dim") or 1
+    dv = recurrent.get("v_head_dim") or dk
+    hv = recurrent.get("num_v_heads") or recurrent.get("num_heads") or 1
+    return max(1, 4 * hv * dk * dv // (2 * keep * d))
+
+
+def _recurrent(calls: list[Call]) -> dict | None:
+    """The config of the first linear-attention layer among `calls`, if any."""
+    kinds = ("kda", "gdn", "gdn2", "deltanet", "gla", "lightning", "rwkv7")
+    return next(
+        (c.layer["config"] for c in calls if c.layer["config"]["type"] in kinds), None
+    )

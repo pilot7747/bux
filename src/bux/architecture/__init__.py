@@ -138,6 +138,7 @@ from bux.architecture.residual import (
     HyperConnections,
     ManifoldHyperConnections,
     Merge,
+    MultiStreamAttentionResidual,
     ResidualGate,
 )
 
@@ -175,6 +176,7 @@ __all__ = [
     "Merge",
     "MoE",
     "Model",
+    "MultiStreamAttentionResidual",
     "NextN",
     "Norm",
     "ResidualGate",

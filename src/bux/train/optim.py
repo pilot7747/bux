@@ -363,19 +363,58 @@ def weight_decay_mask(model: nnx.Module) -> Callable[[PyTree], PyTree[bool]]:
     return lambda params: jax.tree_util.tree_map_with_path(decays, params)
 
 
+def decayed_weights(
+    rate: float, mask: Callable[[PyTree], PyTree[bool]], cautious: bool
+) -> optax.GradientTransformation:
+    """Add `rate` times the weights to the updates, which a learning rate then
+    scales: decoupled weight decay, of the parameters `mask` keeps.
+
+    Args:
+        rate: The decay, times the learning rate.
+        mask: Which parameters decay (`weight_decay_mask`).
+        cautious: Decay only the entries where the update and the weight have the
+            same sign, or either is 0: cautious weight decay (Chen et al., 2025, eq.
+            in Algorithm 1, ``I(u x >= 0)``), so that decay never pulls against the
+            step.
+    """
+    if not cautious:
+        return optax.add_decayed_weights(rate, mask=mask)
+
+    def update(
+        updates: PyTree[Float[Array, "*_"]],
+        state: optax.EmptyState,
+        params: PyTree[Float[Array, "*_"]] | None = None,
+    ) -> tuple[PyTree[Float[Array, "*_"]], optax.EmptyState]:
+        assert params is not None, "weight decay reads the weights"
+
+        def decayed(u: Float[Array, "*s"], x: Float[Array, "*s"]) -> Float[Array, "*s"]:
+            return u + rate * jnp.where(u * x >= 0, x, 0).astype(u.dtype)
+
+        return jax.tree.map(decayed, updates, params), state
+
+    cautious_decay = optax.GradientTransformation(
+        lambda params: optax.EmptyState(),
+        update,  # ty: ignore[invalid-argument-type]
+    )
+    return optax.masked(cautious_decay, mask)
+
+
 @optimizers.register("adamw")
 def adamw(
     c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module
 ) -> optax.GradientTransformation:
     """AdamW by optax, its weight decay on the matrices outside the paths modules
-    name in ``no_weight_decay`` (`weight_decay_mask`)."""
-    return optax.adamw(
-        lr_schedule(c.lr, multiplier),
-        b1=c.b1,
-        b2=c.b2,
-        eps=c.eps,
-        weight_decay=c.weight_decay,
-        mask=weight_decay_mask(model),
+    name in ``no_weight_decay`` (`weight_decay_mask`), cautious under
+    ``cautious_weight_decay`` (`decayed_weights`)."""
+    lr, mask = lr_schedule(c.lr, multiplier), weight_decay_mask(model)
+    if not c.cautious_weight_decay:
+        return optax.adamw(
+            lr, b1=c.b1, b2=c.b2, eps=c.eps, weight_decay=c.weight_decay, mask=mask
+        )
+    return optax.chain(  # optax.adamw's chain, its decay cautious
+        optax.scale_by_adam(b1=c.b1, b2=c.b2, eps=c.eps),
+        decayed_weights(c.weight_decay, mask, cautious=True),
+        optax.scale_by_learning_rate(lr),
     )
 
 
@@ -409,7 +448,81 @@ def muon(
     """Muon for the matrices inside the blocks (`muon_matrices`), and AdamW (its
     ``adam``) for the rest: Nesterov momentum, orthogonalized by Newton-Schulz by
     the run's ``methods.orthogonalize``, scaled to ``consistent_rms``, with decoupled
-    weight decay."""
+    weight decay, cautious under ``cautious_weight_decay`` (`decayed_weights`)."""
+    return _muon(config, multiplier, model)
+
+
+@optimizers.register("normuon")
+def normuon(
+    config: tcfg.NorMuonConfig, multiplier: Schedule, model: nnx.Module
+) -> optax.GradientTransformation:
+    """NorMuon (Li et al., 2025): `muon`, its orthogonalized updates normalized by
+    neuron (`neuron_normalized`) before they are scaled."""
+    normalized = neuron_normalized(muon_matrices(model), config.b2, config.eps)
+    return _muon(config, multiplier, model, normalized)
+
+
+def neuron_normalized(
+    dims: dict[tuple, MuonDimensionNumbers], b2: float, eps: float
+) -> optax.GradientTransformation:
+    """Divide each output unit's entries of an update, a matrix or a stack of them
+    as `dims` says by path, by the root of a running average of their mean square
+    over the unit's inputs, then scale each matrix back to its norm before: NorMuon's
+    step, as its official code takes it (an average of decay `b2`, without a bias
+    correction, its root plus `eps`). Its state is the averages, one a unit, in
+    float32."""
+
+    def axes(path: tuple) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        d = dims[path_keys(path)]
+        reduction = _as_tuple(d.reduction_axis)
+        return reduction, reduction + _as_tuple(d.output_axis)
+
+    def init(params: PyTree[Float[Array, "*_"]]) -> PyTree[Float[Array, "*_"]]:
+        def zeros(path: tuple, x: Float[Array, "*s"]) -> Float[Array, "*r"]:
+            reduction = axes(path)[0]
+            shape = [1 if i in reduction else n for i, n in enumerate(x.shape)]
+            return jnp.zeros(shape, jnp.float32)
+
+        return jax.tree_util.tree_map_with_path(zeros, params)
+
+    def update(
+        updates: PyTree[Float[Array, "*_"]],
+        state: PyTree[Float[Array, "*_"]],
+        params: PyTree[Float[Array, "*_"]] | None = None,
+    ) -> tuple[PyTree[Float[Array, "*_"]], PyTree[Float[Array, "*_"]]]:
+        def average(
+            path: tuple, o: Float[Array, "*s"], v: Float[Array, "*r"]
+        ) -> Float[Array, "*r"]:
+            x = o.astype(jnp.float32)
+            return b2 * v + (1 - b2) * jnp.mean(x * x, axes(path)[0], keepdims=True)
+
+        def normalize(
+            path: tuple, o: Float[Array, "*s"], v: Float[Array, "*r"]
+        ) -> Float[Array, "*s"]:
+            x, matrix = o.astype(jnp.float32), axes(path)[1]
+            y = x / (jnp.sqrt(v) + eps)
+            norm = jnp.sqrt(jnp.sum(x * x, matrix, keepdims=True))
+            y = y * norm / (jnp.sqrt(jnp.sum(y * y, matrix, keepdims=True)) + eps)
+            return y.astype(o.dtype)
+
+        state = jax.tree_util.tree_map_with_path(average, updates, state)
+        return jax.tree_util.tree_map_with_path(normalize, updates, state), state
+
+    return optax.GradientTransformation(init, update)
+
+
+def _as_tuple(axis: int | Sequence[int]) -> tuple[int, ...]:
+    return (axis,) if isinstance(axis, int) else tuple(axis)
+
+
+def _muon(
+    config: tcfg.MuonConfig,
+    multiplier: Schedule,
+    model: nnx.Module,
+    normalized: optax.GradientTransformation | None = None,
+) -> optax.GradientTransformation:
+    """`muon`, `normalized` taking its orthogonalized updates before their scale; its
+    chain as before without one, so that a checkpoint's state keeps its paths."""
     dims = muon_matrices(model)
 
     def labels(params: PyTree[Float[Array, "*_"]]) -> PyTree[str]:
@@ -429,13 +542,17 @@ def muon(
         config.ns_algorithm,
         config.ns_restarts,
     )
+    decay = decayed_weights(
+        config.weight_decay, weight_decay_mask(model), config.cautious_weight_decay
+    )
     rule = optax.chain(
         momentum(config.momentum, config.nesterov),
         orthogonalized(ns, dims, model, dtype=config.ns_dtype),
+        *([] if normalized is None else [normalized]),
         scale_by_shape(
             weight_dimension_numbers=shapes, consistent_rms=config.consistent_rms
         ),
-        optax.add_decayed_weights(config.weight_decay, mask=weight_decay_mask(model)),
+        decay,
         optax.scale_by_learning_rate(lr_schedule(config.lr, multiplier)),
     )
     adam = config.adam or tcfg.AdamWConfig(lr=config.lr)
