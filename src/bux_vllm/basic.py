@@ -28,7 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from . import copying
-from .common import ACTIVATIONS, Ctx, Layer, Norm, Site, unsupported
+from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
 
 
 class Embedding(Layer):
@@ -154,10 +154,11 @@ class Pointer(Layer):
     """A head's copy pointer: its query and key projections, the query's gain, the
     sink's key, its paged cache (`bux_vllm.pointer.PointerCache`), and the buffers
     of each request's p_copy and a_sink, which its forward fills and `mixed` reads.
+    With a ``window`` each query looks that many positions back at most, as bux's.
 
     Raises:
-        NotImplementedError: A ``window``, which the cache's op does not cap yet, or
-            speculative decoding, which samples more than one row a request.
+        NotImplementedError: Speculative decoding, which samples more than one row a
+            request.
     """
 
     p_copy: torch.Tensor
@@ -167,7 +168,6 @@ class Pointer(Layer):
         super().__init__()
         from .pointer import PointerCache
 
-        unsupported(c, "window")
         if site.vllm_config.num_speculative_tokens:
             raise NotImplementedError("head: a copy pointer with speculative decoding")
         dim, self.dim = c["dim"], c["dim"]
@@ -176,7 +176,8 @@ class Pointer(Layer):
         self.k = ReplicatedLinear(width, dim, bias=False, return_bias=False)
         self.gain = nn.Parameter(torch.ones(()), requires_grad=False)
         self.sink = nn.Parameter(torch.zeros(dim), requires_grad=False)
-        self.cache = PointerCache(dim, site.vllm_config, site.caches[0])
+        window = copying.WHOLE if c["window"] is None else c["window"]
+        self.cache = PointerCache(dim, site.vllm_config, site.caches[0], window)
         rows = site.vllm_config.scheduler_config.max_num_seqs
         copy = torch.zeros(rows, vocab, dtype=torch.float32)
         self.register_buffer("p_copy", copy, persistent=False)
@@ -213,8 +214,9 @@ class Pointer(Layer):
             q = _rms_normed(self.q(hidden)) * self.gain.to(hidden.dtype)
             sink = (q.float() @ self.sink.float()) * self.dim**-0.5
             rows, fp8 = self.cache.rows, self.cache.fp8
+            vocab, window = logits.shape[1], self.cache.window
             p_copy, a_sink = copying.prompted(
-                q, sink, rows, stash.steps, first, logits.shape[1], fp8
+                q, sink, rows, stash.steps, first, vocab, fp8, window
             )
         elif (at := _row_in(self.cache.graphed, hidden)) is not None:
             p_copy, a_sink = copying.rows_of(self.p_copy[at:], self.a_sink[at:], n)

@@ -26,6 +26,8 @@ from . import picks
 
 #: The base-256 digits of a token in a row of the cache: ids below 2^24.
 DIGITS = 3
+#: A window that sees the whole request, as bux's pointer without one.
+WHOLE = 2**30
 
 
 @dataclass
@@ -100,13 +102,14 @@ def decode(
     return keys, torch.as_tensor(tokens)
 
 
-def gathered(cache: torch.Tensor, table: torch.Tensor, length: int) -> torch.Tensor:
-    """The rows of each request's first `length` positions, (R, length, row), from
-    the paged `cache`, ``[blocks, 1, block_size, row]``, by its block `table`."""
+def gathered(
+    cache: torch.Tensor, table: torch.Tensor, at: torch.Tensor
+) -> torch.Tensor:
+    """The rows of each request's positions `at`, (R, L), (R, L, row), from the
+    paged `cache`, ``[blocks, 1, block_size, row]``, by its block `table`."""
     size = cache.shape[2]
-    at = torch.arange(length, device=cache.device)
-    columns = (at // size).clamp(max=table.shape[1] - 1)
-    blocks = table[:, columns].long().clamp(0, cache.shape[0] - 1)
+    columns = (at // size).clamp(0, table.shape[1] - 1)
+    blocks = table.gather(1, columns).long().clamp(0, cache.shape[0] - 1)
     return cache[blocks, 0, at % size]
 
 
@@ -149,11 +152,13 @@ def pointed(
     vocab: int,
     fp8: torch.dtype | None,
     length: int,
+    window: int = WHOLE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The pointer's distribution over the vocabulary, and its sink's share, for
     each request's query: its attention to the request's positions before the
-    query's, and to the sink, in float32. It reads the first `length` positions of
-    every request, a count fixed on the host, so that a CUDA graph captures it.
+    query's, within `window` of it, and to the sink, in float32. It reads as many
+    positions of every request as the window or `length` holds, a count fixed on
+    the host, so that a CUDA graph captures it.
 
     Args:
         q: The queries, (R, c): RMS-normed, times the gain.
@@ -165,14 +170,18 @@ def pointed(
         fp8: The FP8 dtype of an FP8 cache's keys; None for the model's dtype.
         length: The positions it reads of each request, `max_model_len`: as many
             as any query has before it.
+        window: How far back a query looks, in positions.
 
     Returns:
         p_copy, (R, vocab), and a_sink, (R,).
     """
     r, dim = q.shape
-    keys, tokens = decode(gathered(cache, table, length), dim, fp8)
+    span = min(length, window)  # the positions each query may see, the last ones
+    first = (position[:, None] - span).clamp(min=0)
+    at = first + torch.arange(span, device=q.device)
+    keys, tokens = decode(gathered(cache, table, at), dim, fp8)
     scores = torch.einsum("rc,rlc->rl", q.float(), keys) * dim**-0.5
-    seen = torch.arange(length, device=q.device) < position[:, None]
+    seen = at < position[:, None]
     scores = scores.masked_fill(~seen, -torch.inf)
     every = torch.cat([scores, sink.float()[:, None]], -1).softmax(-1)
     copy = torch.zeros(r, vocab, dtype=torch.float32, device=q.device)
@@ -240,11 +249,13 @@ def prompted(
     first: int,
     vocab: int,
     fp8: torch.dtype | None,
+    window: int = WHOLE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The pointer's p_copy, (n, vocab), and a_sink, (n,), at the step's tokens
     `first`, ..., `first` + n - 1, of queries `q`, (n, c), and sinks `sink`, (n,):
-    each attends to its request's tokens before it, the step's and those of its
-    earlier steps or cached prefix, in float32, `CHUNK` scores at a time. It reads
+    each attends to its request's tokens before it within `window`, the step's and
+    those of its earlier steps or cached prefix, in float32, `CHUNK` scores at a
+    time. It reads
     the step's lengths on the host: vLLM asks for prompt rows outside its graphs.
     Rows past the step's requests, padding, point at nothing."""
     n, dim = q.shape
@@ -257,15 +268,16 @@ def prompted(
         stop = min(n, ends[r] - first)  # the request's rows among these
         start = lens[r] - (ends[r] - first - i)  # row i's position
         table = steps.block_table_tensor[r : r + 1]
-        length = max(start + stop - i - 1, 1)  # the keys before its last row
-        keys, tokens = decode(gathered(cache, table, length), dim, fp8)
+        lo = max(start - window, 0)  # the first key its first row may see
+        keyed = torch.arange(lo, max(start + stop - i - 1, lo + 1), device=q.device)
+        keys, tokens = decode(gathered(cache, table, keyed[None]), dim, fp8)
         keys, tokens = keys[0], tokens[0].clamp(0, vocab - 1)
-        chunk = max(1, CHUNK // max(length, vocab))
+        chunk = max(1, CHUNK // max(len(keyed), vocab))
         for a in range(i, stop, chunk):
             b = min(stop, a + chunk)
             at = torch.arange(start + a - i, start + b - i, device=q.device)
             scores = q[a:b].float() @ keys.T * dim**-0.5
-            seen = torch.arange(length, device=q.device) < at[:, None]
+            seen = (keyed < at[:, None]) & (keyed >= at[:, None] - window)
             scores = scores.masked_fill(~seen, -torch.inf)
             every = torch.cat([scores, sink[a:b].float()[:, None]], -1).softmax(-1)
             p_copy[a:b].scatter_add_(-1, tokens.expand(b - a, -1), every[:, :-1])

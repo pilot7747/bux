@@ -337,7 +337,7 @@ in every run.
 
 | Layers | In vLLM |
 |--------|---------|
-| `embed`, `value_embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping; a copy pointer ([Copy pointer](#copy-pointer)). `value_embed` looks up the step's token ids, and a reader takes its kv heads' columns of the rows. Not yet: a pointer's `window`, or a pointer with speculative decoding |
+| `embed`, `value_embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping; a copy pointer and its `window` ([Copy pointer](#copy-pointer)). `value_embed` looks up the step's token ids, and a reader takes its kv heads' columns of the rows. Not yet: a pointer with speculative decoding |
 | `rmsnorm`, `layernorm`, `dyt`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `conv` | by vLLM's short-conv kernels, its last inputs in vLLM's Mamba cache, as the conv on keys and values; the whole stream on every rank |
 | `short_conv` | LFM2's, `C * conv(B u)`, by the same kernels and state, its channels split over ranks, with or without biases |
@@ -375,11 +375,12 @@ from its mixture, as bux's loss scores it
   model's attention caches, so prefix caching hits as often.
 - **The op:** each step, ``vllm::bux_copy_pointer`` writes the step's rows, then,
   for each request's last token of the step, the one vLLM samples, attends to the
-  request's tokens before it and the sink. In a 16-bit model one Triton launch runs
-  every request, a program each: a pass over its blocks for the softmax's max and
-  sum, and one that adds each position's share into its token's entry of the
-  request's row of a buffer of `max_num_seqs` rows. A float32 model takes PyTorch's
-  path. vLLM splits its graphs around the op, and a step of decoded tokens alone is
+  request's tokens before it, within its `window` if it has one, as bux's, and the
+  sink. A window caps the work of a step: it reads that many keys of a request at
+  most. In a 16-bit model one Triton launch runs every request, a program each: a
+  pass over its blocks for the softmax's max and sum, and one that adds each
+  position's share into its token's entry of the request's row of a buffer of
+  `max_num_seqs` rows. A float32 model takes PyTorch's path. vLLM splits its graphs around the op, and a step of decoded tokens alone is
   one CUDA graph.
 - **The logits** that vLLM samples are the log of the mixture, the head's
   soft-capped logits mixed with the pointer's row, in float32; the `<copy>` row's
@@ -864,9 +865,9 @@ attention and multi-stream attention residuals (`xsa`, `hyga`, `diff`, `msar`,
 their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `k-eq-v-nope`) and of zero experts (`moe-zero`, `moe-zero-longcat`,
 `moe-zero-norm`) and of the document-local copy feature (`doc-copy`,
-`doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`) were measured the same way on 2026-10-29, and so were the sparse
-`gqa` and `mla` rows (all but `csa`'s), with each `gqa` indexer's projections in
-one GEMM.
+`doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`, `cplm-window`)
+were measured the same way on 2026-10-29, and so were the sparse `gqa` and `mla`
+rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -924,6 +925,7 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
 | `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own, at the rows vLLM samples and the prompts' | - | - | - |
 | `cplm-128` | the same pointer at its default width of 128 | - | - | - |
+| `cplm-window` | the pointer of `cplm-128` within a window of 12 positions, shorter than 3 of the 4 prompts | - | - | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |

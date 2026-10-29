@@ -3089,18 +3089,22 @@ def test_a_pointer_s_rows_keep_its_keys_and_tokens(fp8: torch.dtype | None) -> N
     np.testing.assert_array_equal(got_keys.numpy(), want.numpy())
 
 
+@pytest.mark.parametrize("window", [None, 3])
 @pytest.mark.parametrize("dim", [16, 24], ids=["dim 16", "dim 24"])
-def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
+def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(
+    dim: int, window: int | None
+) -> None:
     """Each position as a request's last token: the pointer over the request's
     earlier tokens in the paged cache, mixed with the head's softmax, is bux's
     mixture (`bux.architecture.copy.log_probs`) at that position, at a key width
-    of a power of two and of none."""
+    of a power of two and of none, and within a window of 3 too."""
     from bux.architecture import copy as bux_copy
 
     source = (
         "d_model = 32\nvocab_size = 64\n"
         "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
-        f"model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim={dim}))"
+        "model = embed [rmsnorm attn] rmsnorm"
+        f" head(pointer=copy_pointer(dim={dim}, window={window or 'none'}))"
     )
     model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
     tokens = jax.random.randint(jax.random.key(0), (1, 12), 0, 6)
@@ -3122,7 +3126,15 @@ def test_the_pointer_over_a_paged_cache_samples_bux_s_mixture(dim: int) -> None:
     assert blocks * size == 12
     for i in range(12):
         p_copy, a_sink = copying.pointed(
-            q[i : i + 1], sink[i : i + 1], cache, table, torch.tensor([i]), 64, None, 12
+            q[i : i + 1],
+            sink[i : i + 1],
+            cache,
+            table,
+            torch.tensor([i]),
+            64,
+            None,
+            12,
+            window or copying.WHOLE,
         )
         got = copying.mixed(logits[i : i + 1], p_copy, a_sink, 63)[0].numpy()
         finite = np.isfinite(want[i])
@@ -3217,20 +3229,23 @@ def test_slices_of_the_head_input_are_found_and_gathered_rows_are_not() -> None:
         assert rows.at(x[:, :4]) == 0  # rows of the same stride
 
 
+@pytest.mark.parametrize("window", [None, 3])
 def test_prompt_rows_mix_as_bux_s_mixture_at_every_position(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, window: int | None
 ) -> None:
     """vLLM's prompt logprobs over two steps: a prompt and a first chunk of another,
     then its second chunk over the keys the first wrote, and padding. Each slice of
     the head's input, within a request or across two as vLLM's runners take them,
-    points at every position as bux's mixture does, a few rows at a time."""
+    points at every position as bux's mixture does, a few rows at a time, within a
+    window of 3 too."""
     from bux.architecture import copy as bux_copy
 
     monkeypatch.setattr(copying, "CHUNK", 2 * 64)  # two rows a chunk
     source = (
         "d_model = 32\nvocab_size = 64\n"
         "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
-        "model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim=24))"
+        "model = embed [rmsnorm attn] rmsnorm"
+        f" head(pointer=copy_pointer(dim=24, window={window or 'none'}))"
     )
     model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
     tokens = jax.random.randint(jax.random.key(2), (2, 10), 0, 6)
@@ -3275,7 +3290,9 @@ def test_prompt_rows_mix_as_bux_s_mixture_at_every_position(
             q_, sink_ = q.reshape(20, -1)[picked], sink.reshape(20)[picked]
             q_ = torch.cat([q_, q_.new_zeros(pad, 24)])
             sink_ = torch.cat([sink_, sink_.new_zeros(pad)])
-            p_copy, a_sink = copying.prompted(q_, sink_, cache, steps, first, 64, None)
+            p_copy, a_sink = copying.prompted(
+                q_, sink_, cache, steps, first, 64, None, window or copying.WHOLE
+            )
             assert torch.equal(p_copy[len(picked) :], p_copy.new_zeros(pad, 64))
             got = copying.mixed(
                 logits.reshape(20, -1)[picked],

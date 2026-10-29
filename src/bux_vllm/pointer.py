@@ -99,11 +99,12 @@ class PointerCache(nn.Module, AttentionLayerBase):
         dim: The pointer's key channels.
         vllm_config: vLLM's config of the engine.
         prefix: vLLM's name of the cache, unique in the model.
+        window: How far back a query looks, in positions.
     """
 
-    def __init__(self, dim: int, vllm_config: Any, prefix: str):
+    def __init__(self, dim: int, vllm_config: Any, prefix: str, window: int):
         super().__init__()
-        self.dim, self.prefix = dim, prefix
+        self.dim, self.prefix, self.window = dim, prefix, window
         self.longest = vllm_config.model_config.max_model_len  # positions a query sees
         self.dtype, self.fp8 = sparse.cache_dtype(vllm_config, "a copy pointer", True)
         self.kv_cache = torch.tensor([])
@@ -179,6 +180,7 @@ def copy_pointer(
             p_copy.shape[1],
             cache.fp8,
             cache.longest,
+            cache.window,
         )
         p_copy[:requests].copy_(copy)
         a_sink[:requests].copy_(share)
@@ -224,6 +226,7 @@ def _pointed(
         p_copy.shape[1],
         rows.shape[0],
         table.shape[1] * rows.shape[2],
+        cache.window,
         dim**-0.5,
         D=dim,
         DP=triton.next_power_of_2(dim),
@@ -250,6 +253,7 @@ def _pointer_kernel(
     vocab,
     blocks,
     longest,
+    window,
     scale,
     D: tl.constexpr,
     DP: tl.constexpr,
@@ -257,16 +261,18 @@ def _pointer_kernel(
     BN: tl.constexpr,
     DIGITS: tl.constexpr,
 ):
-    """One request's query over its positions before it: the softmax's max and sum
-    in a first pass, then each position's share added into its token's entry."""
+    """One request's query over its positions before it within `window`: the
+    softmax's max and sum in a first pass, then each position's share added into
+    its token's entry."""
     r = tl.program_id(0)
     end = tl.minimum(tl.load(POSITION + r), longest)  # the block table's positions
+    lo = tl.maximum(end - window, 0)
     d = tl.arange(0, DP)  # a power of two of channels, D of them the key's
     on = d < D
     q = tl.load(Q + r * D + d, mask=on, other=0.0).to(tl.float32)
     s0 = tl.load(SINK + r)
     m, total = s0, s0 * 0.0 + 1.0
-    for start in range(0, end, BN):
+    for start in range(lo, end, BN):
         at = start + tl.arange(0, BN)
         seen = at < end
         block = tl.load(TABLE + r * stride_table + at // B, mask=seen, other=0)
@@ -282,7 +288,7 @@ def _pointer_kernel(
         top = tl.maximum(m, tl.max(s, 0))
         total = total * tl.exp(m - top) + tl.sum(tl.exp(s - top), 0)
         m = top
-    for start in range(0, end, BN):
+    for start in range(lo, end, BN):
         at = start + tl.arange(0, BN)
         seen = at < end
         block = tl.load(TABLE + r * stride_table + at // B, mask=seen, other=0)

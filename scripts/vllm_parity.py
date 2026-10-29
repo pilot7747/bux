@@ -183,6 +183,9 @@ CASES = {
     # samples, the pointer's keys and tokens in a paged cache of the head's own.
     "cplm": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer(dim=64))",
     "cplm-128": LLAMA + "model = embed block^2 rmsnorm head(pointer=copy_pointer())",
+    # A window shorter than all prompts but the first.
+    "cplm-window": LLAMA
+    + "model = embed block^2 rmsnorm head(pointer=copy_pointer(window=12))",
     "moe": HEAD
     + ATTN
     + EXPERT
