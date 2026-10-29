@@ -841,6 +841,14 @@ S = layer(attn(index=$topk))
 model = embed "AAA" "SSS" "FSSS"^18 norm @h out mtp^3
 ```
 
+Sharing saves the indexer's work where contexts are long, where it scores every key a
+query sees. On one B300 (vLLM 0.32, FP8 weights and KV cache, 2026-10-29), a KDA hybrid
+of d_model 3584 with DSA's indexer (4 heads of 64, top 2048) on its 14 global layers
+serves 1.43 times as many 256k-token sessions an hour within 30 ms a token when 4 of
+them run it and the other 10 reuse their picks, and its time to first token falls from
+3.9 s to 2.2 s. Under 16-24k-token sessions it serves 1.03 times as many: there the
+sparse attention itself, not the indexer, costs most.
+
 With `indexer(loss_over=served)`, every layer that reads the picks also distills the
 writer's indexer towards its own attention over them, IndexCache's multi-layer
 distillation ([The indexer's loss](#indexer-loss)). The writer's indexer then learns to
