@@ -29,7 +29,7 @@ type Json = dict[str, Any]
 #: The group of each top-level training setting, as the page sorts them.
 GROUPS: dict[str, tuple[str, ...]] = {
     "budget": ("seq_len", "batch", "batch_ramp", "steps", "curriculum", "seed"),
-    "optimizer": ("optimizer", "schedule", "clip"),
+    "optimizer": ("optimizer", "schedule", "clip", "ema"),
     "data": ("data", "tokenizer", "packing"),
     "loss": ("loss",),
     "eval": ("eval", "checkpoint", "objective"),
