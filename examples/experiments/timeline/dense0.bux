@@ -1,0 +1,29 @@
+# No dense layer on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv).
+# The candidate's first layer has a dense SwiGLU and every later one the experts, as
+# every 2026 model of the study: 2024 DeepSeekMoE and DeepSeek-V2 keep 1 layer dense,
+# DeepSeek-V3 3, 2025 Kimi K2 1 and GLM-4.5 3, for the routing and load balance of
+# the first layers, which DeepSeekMoE finds converge slowest. A token's 7 experts and
+# the shared one are about as wide as the dense SwiGLU, so the arm keeps about the
+# active parameters and adds a layer of experts' total ones. More dense layers would
+# be most of a model of 8 or 12 layers, so the arm tests none against one. Everything
+# else is the candidate's, so it pairs with it by seed.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# factorial.bux's vres(g_k, fr_experts), with the experts in its first layer too.
+g_k = fr_global(kv_conv_size=4)
+
+# 2023 Mixtral, 2025 Qwen3 MoE, gpt-oss: the first layer's FFN routed, as every other's;
+# a layer of experts' capacity at the same active parameters, every layer alike.
+dense0 = embed
+         fr_layer(hy_delta) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+         (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+         fr_norm @h fr_out hy_mtp
+model  = dense0
+
+residual = hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), as the candidate's.
+optimizer.lr = 2e-3

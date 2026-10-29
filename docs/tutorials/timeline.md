@@ -217,6 +217,7 @@ curriculum = base: yarn_phase | rope: yarn_phase | rope_500k: yarn_phase | ...
 | `zoo.bux` | the 2021 reference | the 2025-26 zoo's open choices: window sizes and ratios, sinks, gate forms, DyT, KDA ratios |
 | `milestones.bux`, `zoo_moe.bux`, `swa.bux` | the 2020 baseline; the 2026 frontier | a family for each year; the frontier's routing; the frontier with the hybrid's winners and a leaner window |
 | `stacks.bux`, `stacks2.bux`, `factorial.bux`, `audit.bux` | the 2026 hybrid | its add-ons, one at a time and in a fractional factorial (step 8), and the candidate's cheaper variants |
+| `dense0.bux` | the candidate (step 8) | its first layer's FFN routed like every other's: no dense layer before the experts |
 
 Some changes are not arms. Zero-centered gains train as plain ones, since bux's
 weight decay leaves every gain alone. ALiBi, differential attention and value
