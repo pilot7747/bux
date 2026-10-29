@@ -2,9 +2,9 @@
 
 | | rungs | × per parameter | 1T tokens | 1T tokens, range |
 |---|---|---|---|---|
-| candidate + DSA | 512×3/768×2 | 1.00 | +0.12 | [-0.15, +0.12] |
-| candidate + QSA | 512×3/768×2 | 0.97 | +0.23 | [-0.13, +0.23] |
-| candidate + MSA | 512×3/768×2 | 0.97 | +0.25 | [-0.14, +0.25] |
-| candidate + DSA, an indexer in 1 global layer of 2 | 768×2 | 0.97 | +0.12 | [-0.15, +0.12] |
-| candidate + DSA, an indexer in 1 global layer of 4 | 512×3/768×2 | 0.87 | +0.15 | [-0.12, +0.15] |
-| the same, with the cross-layer loss | 512×3/768×2 | 0.95 | +0.03 | [+0.02, +0.03] |
+| candidate + DSA | 512×3/768×3 | 0.97 | +0.14 | [-0.15, +0.14] |
+| candidate + QSA | 512×3/768×2 | 0.97 | +0.25 | [-0.14, +0.25] |
+| candidate + MSA | 512×3/768×2 | 0.97 | +0.27 | [-0.15, +0.27] |
+| candidate + DSA, an indexer in 1 global layer of 2 | 768×2 | 0.98 | +0.12 | [-0.16, +0.12] |
+| candidate + DSA, an indexer in 1 global layer of 4 | 512×3/768×3 | 0.90 | +0.16 | [-0.12, +0.16] |
+| the same, with the cross-layer loss | 512×3/768×3 | 0.95 | +0.03 | [+0.02, +0.03] |

@@ -181,6 +181,7 @@ TABLES = {
         ("milestones/m2024_llama3", "2024 Llama 3"), ("positions/rope", "2021 reference"),
         ("newlayers_cplm/nl_cplm", "candidate + copy pointer"),
         ("stack5", "candidate + copy pointer + GatedNorm"),
+        ("dense_last", "candidate, the dense layer last"),
     ), tuple(
         Col(f"{c}: 1T", c, offset=1) for c in ("16-24k", "64k", "128k", "256k")
     )),
