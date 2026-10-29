@@ -223,6 +223,7 @@ curriculum = base: yarn_phase | rope: yarn_phase | rope_500k: yarn_phase | ...
 | `ideas_opt.bux`, `newlayers_opt.bux`, `muon_2020.bux`, `muon_2021.bux` | the candidate; the 2020 baseline; the 2021 reference | training options beside the AdamW recipe, not architecture: inits, Muon, NorMuon, the tail EMA, cautious weight decay |
 | `sparse_native.bux` | the candidate (step 8) | DSA, QSA and MSA on its global layers, in the shapes vLLM serves on its own kernels (DeepSeek-V3.2's, Qwen3.8's, MiniMax-M3's) |
 | `dense0.bux` | the candidate (step 8) | its first layer's FFN routed like every other's: no dense layer before the experts |
+| `indexshare.bux` | `sparse_native.bux`'s `dsa_c` | index sharing (GLM-5.2's IndexShare): one global layer in four, or in two, runs the indexer, and the global layers up to the next reuse its picks |
 
 Some changes are not arms. Zero-centered gains train as plain ones, since bux's
 weight decay leaves every gain alone. ALiBi has no layer in bux.
