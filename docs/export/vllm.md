@@ -398,6 +398,8 @@ from its mixture, as bux's loss scores it
   head's softmax over the vocabulary but `<copy>`.
 - **Weights:** the pointer's projections stay in the model's dtype, whole on every
   rank, under FP8 weights too. Each rank computes the pointer.
+- **Order:** the pointer's sums run in no fixed order, so in bfloat16 two runs may
+  break a near tie between tokens differently, within bux's own bfloat16 spread.
 
 transformers' modeling refuses a head with a pointer: generating would need the
 pointer's cache, which its cache classes do not keep.
