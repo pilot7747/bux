@@ -264,3 +264,31 @@ def target(
 
 def as_dict(t: Target) -> dict:
     return asdict(t)
+
+
+def load_longctx(path: Path) -> dict[str, dict]:
+    """targets-measured-longctx.json's targets by context, against the budget model
+    at that context: ``{context: {"budget": sessions/h, "families": {family:
+    {"n_active", "n_total", "d_model", "flags"} or {"error"}}}}``, its keys'
+    ``+fp8`` and ``+dsdims`` turned into flags."""
+    raw = json.loads(path.read_text())
+    out = {}
+    for context, c in raw.get("contexts", {}).items():
+        fams = {}
+        for key, v in c.get("families", {}).items():
+            family, *tags = key.split("+")
+            match = v.get("match", {})
+            if match.get("reference") or not isinstance(match, dict):
+                continue
+            flags = ["DeepSeek dims"] if "dsdims" in tags else []
+            flags += (
+                ["kernel-limited, an upper bound of cost"]
+                if v.get("kernel_limited")
+                else []
+            )
+            if "N_active" in match:
+                fams[family] = _aliases(match) | {"flags": flags}
+            else:
+                fams[family] = {"error": match.get("error", "no match"), "flags": flags}
+        out[context] = {"budget": c.get("budget_sessions_per_hour"), "families": fams}
+    return out

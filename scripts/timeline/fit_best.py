@@ -273,3 +273,101 @@ def e_line(free: Analysis | None, bounded: Analysis | None) -> str:
         )
         parts.append(f"fit within [{lo}, {hi}] it lands at {e:.4f}{on}")
     return "; ".join(parts) + "." if parts else ""
+
+
+def longctx_rows(
+    a: Analysis, contexts: dict[str, dict], candidates: list[str]
+) -> list[dict]:
+    """A row per family of the long-context targets (the candidates first): its
+    1T objective at each context's target of equal serving cost, by the same laws,
+    against its context's hybrid (the candidates' parent) and 2020 baseline."""
+    ref = next(
+        (a.fams[c].parent for c in candidates if c in a.fams), "milestones/m2026_hybrid"
+    )
+    names = list(
+        dict.fromkeys(
+            [
+                *candidates,
+                *sorted({f for c in contexts.values() for f in c["families"]}),
+            ]
+        )
+    )
+    rows = []
+    for f in names:
+        row: dict = {
+            "family": f,
+            "flags": ", ".join(
+                sorted(
+                    {
+                        x
+                        for c in contexts.values()
+                        for x in c["families"].get(f, {}).get("flags", [])
+                    }
+                )
+            ),
+        }
+        for label, c in contexts.items():
+            loss = _loss_at(a, f, c["families"])
+            row[f"{label}: 1T"] = DASH if loss is None else loss
+            for key, other in (
+                (f"{label}: vs hybrid %", ref),
+                (f"{label}: vs 2020 %", ROOT),
+            ):
+                base = _loss_at(a, other, c["families"])
+                row[key] = (
+                    100 * (loss / base - 1)
+                    if loss is not None and base is not None
+                    else DASH
+                )
+        rows.append(row)
+    return rows
+
+
+DASH = "—"  # no target at that context, or no fit
+
+
+def _loss_at(a: Analysis, f: str, families: dict) -> float | None:
+    """`f`'s predicted 1T objective at its target in `families`, if it has both."""
+    t = families.get(f)
+    if f not in a.laws or not t or "n_active" not in t:
+        return None
+    return float(a.laws[f].loss(t["n_active"], 1e12))
+
+
+def longctx_columns(contexts: dict[str, dict]) -> list[tuple]:
+    """The long-context table's columns: per context the 1T objective and its deltas."""
+    cols = [("family", "family", "s")]
+    for label in contexts:
+        cols += [(f"{label}: 1T", f"{label}: 1T", ".4f"), ("vs hybrid %", f"{label}: vs hybrid %", "+.2f"),
+                 ("vs 2020 %", f"{label}: vs 2020 %", "+.2f")]  # fmt: skip
+    return cols + [("flags", "flags", "s")]
+
+
+def longctx_notes(contexts: dict[str, dict], preliminary: bool) -> list[str]:
+    """What the long-context table rests on: each context's budget, its matches, and
+    the families with no match there."""
+    out = (
+        ["PRELIMINARY: the long-context targets are not all in yet."]
+        if preliminary
+        else []
+    )
+    for label, c in contexts.items():
+        fams = c["families"]
+        matched = sorted(f for f, v in fams.items() if "n_active" in v)
+        missing = sorted(f"{f} ({v['error']})" for f, v in fams.items() if "error" in v)
+        budget = (
+            f"{c['budget']:.0f} sessions/h per GPU"
+            if c.get("budget")
+            else "budget unknown"
+        )
+        out.append(
+            f"{label} ({budget}): {len(matched)} matched"
+            + (f"; no match: {', '.join(missing)}" if missing else "")
+        )
+    if not any(ROOT in c["families"] for c in contexts.values()):
+        out.append(
+            "The 2020 baseline has no target in the long-context file, so its column is '—' throughout."
+        )
+    return out + [
+        "A '—' is a family with no target at that context (or no fit); its deltas need the reference's target there too."
+    ]
