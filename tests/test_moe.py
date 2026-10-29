@@ -19,11 +19,14 @@ from bux.architecture.experts.moe import (
     Kernels,
     MoE,
     balance_loss,
+    budget_loss,
+    budget_move,
     experts,
     random_logits,
     routed,
     run_sorted,
     smebu_move,
+    zero_experts,
 )
 from bux.architecture.layers.mlp import activate
 from bux.architecture.layers.norm import Norm
@@ -293,6 +296,121 @@ def test_a_model_without_reporting_layers_trains_as_before():
     assert set(trainer.train_on_batch(batch)) == {"loss", "grad_norm"}
 
 
+# --- Zero experts (LongCat-Flash) -------------------------------------------------------
+
+
+def zero_layer(**settings) -> MoE:
+    """4 FFN experts and 2 zero experts, 3 picks a token, sigmoid and aux-free."""
+    given = {
+        "num_zero_experts": 2,
+        "top_k": 3,
+        "router": "sigmoid",
+        "load_balancing": "aux_free",
+    }
+    return moe_layer(**given | settings)
+
+
+def test_zero_experts_add_the_token_times_their_weights():
+    """A router that scores the zero experts alone high picks them, and each adds
+    the token times its weight: half of 2.5 each, normalized over two picks."""
+    e = zero_layer(top_k=2, router_bias=True, routed_scaling_factor=2.5)
+    assert e.router.kernel[...].shape == (D, 6) and e.router.bias is not None
+    e.router.kernel[...] = jnp.zeros_like(e.router.kernel[...])
+    e.router.bias[...] = jnp.array([-9.0, -9, -9, -9, 9, 9])
+    x = jax.random.normal(jax.random.key(1), (2, 5, D))
+    idx, weights, _ = e._route(x)
+    assert (idx >= 4).all()
+    for method in ("dense", "sorted"):
+        assert jnp.allclose(run(method, e, x)[0], 2.5 * x, atol=1e-6)
+    # Picks of routed experts add nothing of the token.
+    assert (zero_experts(x, idx - 4, weights, 4) == 0).all()
+
+
+def test_zero_experts_run_only_by_dense_and_sorted():
+    e = zero_layer()
+    x = jnp.ones((1, 4, D))
+    for method in ("all_to_all", "ragged_tokens"):
+        with (
+            parallel.use(
+                tcfg.MeshConfig(data=1), methods=tcfg.MethodsConfig(moe=method)
+            ),
+            pytest.raises(NotImplementedError, match="zero experts"),
+        ):
+            e(x, Taps())
+
+
+def test_the_budget_moves_ffn_experts_by_longcat_s_rule_and_zero_experts_not():
+    """LongCat-Flash's eq. 2, mu (K_e / (K N) - T_i / (K T)), with mu = rate K N /
+    K_e: 2 tokens of 3 picks, K_e 2 of them FFN experts', 1 a target of each of 4."""
+    c = cfg.MoEConfig(
+        num_experts=4,
+        top_k=3,
+        num_zero_experts=2,
+        ffn_experts_per_token=2,
+        expert=GATED,
+        load_balancing="aux_free",
+        bias_update_rate=0.1,
+    )
+    load = jnp.array([2.0, 1, 0, 1, 1, 1])  # T = 2 tokens, K T = 6 picks
+    mu, k, n, k_e, t = 0.1 * 3 * 4 / 2, 3, 4, 2, 2
+    paper = mu * (k_e / (k * n) - load[:4] / (k * t))
+    assert jnp.allclose(budget_move(load, c), jnp.concatenate([paper, jnp.zeros(2)]))
+    assert jnp.allclose(budget_move(load, c)[:4], 0.1 * jnp.array([-1.0, 0, 1, 0]))
+    # A scanned repeat's layers, each its own; no picks move nothing.
+    stacked = budget_move(jnp.stack([load, jnp.zeros(6)]), c)
+    assert jnp.allclose(stacked[0], budget_move(load, c)) and (stacked[1] == 0).all()
+
+
+def test_training_moves_the_ffn_experts_bias_by_the_budget():
+    e = zero_layer(bias_update_rate=0.01)
+    assert e.router_bias is not None and e.router_bias[...].shape == (6,)
+    x = jax.random.normal(jax.random.key(1), (4, 8, D))
+    idx, _, _ = e._route(x)
+    load = jax.nn.one_hot(idx, 6).sum((0, 1, 2))
+    e(x, Taps(training=True))
+    assert jnp.allclose(e.router_bias[...], budget_move(load, e.config))
+    assert (e.router_bias[...][:4] != 0).any() and (e.router_bias[...][4:] == 0).all()
+
+
+def test_the_budget_loss_is_longcat_s_and_one_at_the_budget():
+    """Eqs. 3-5, a group an FFN expert: one sequence of two tokens of 3 picks over 2
+    FFN experts and 2 zero experts, K_e = 2."""
+    c = cfg.MoEConfig(
+        num_experts=2,
+        top_k=3,
+        num_zero_experts=2,
+        ffn_experts_per_token=2,
+        expert=GATED,
+        aux_loss_coef=1.0,
+    )
+    scores = jnp.array([[[2.0, 1, 1, 0], [1.0, 2, 0, 1]]])
+    picks = jnp.array(
+        [[[1.0, 1, 1, 0], [1.0, 1, 0, 1]]]
+    )  # each FFN expert once a token
+    p = (scores / 4).mean(1)[0]  # [3/8, 3/8, 1/8, 1/8]
+    f_ffn = 2 / (2 * 2) * picks[0, :, :2].sum(0)  # N / (K_e T) times the count: 1
+    f_zero = picks[0, :, 2:].sum() / ((3 - 2) * 2)  # 1
+    expected = (f_ffn * p[:2]).sum() + f_zero * p[2:].sum()
+    for sequence in (False, True):
+        loss = budget_loss(scores, picks, c, sequence)
+        assert jnp.isclose(loss, expected) and jnp.isclose(loss, 1)
+
+
+def test_zero_experts_settings_are_checked():
+    zero = {"num_experts": 4, "top_k": 2, "num_zero_experts": 2, "expert": GATED}
+    assert cfg.MoEConfig.model_validate(zero).ffn_budget == 2 * 4 / 6
+    assert cfg.MoEConfig.model_validate(zero | {"top_k": 6}).top_k == 6
+    for wrong, message in [
+        ({"ffn_experts_per_token": 2.0}, "between 0 and top_k"),
+        ({"load_balancing": "smebu"}, "load_balancing=smebu"),
+        ({"center_bias": True}, "center_bias"),
+        ({"num_groups": 2}, "num_groups"),
+        ({"num_zero_experts": 0, "ffn_experts_per_token": 1.0}, "needs num_zero"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            cfg.MoEConfig.model_validate(zero | wrong)
+
+
 # --- The methods that run the experts --------------------------------------------------
 
 # Every MoE option the example architectures use.
@@ -329,6 +447,15 @@ OPTIONS = {
         "router_logit_scale": 2.0,
         "routed_scaling_factor": 2.5,
         "normalize_top_k": False,
+    },
+    "zero experts": {
+        "num_zero_experts": 2,
+        "top_k": 3,
+        "num_shared_experts": 1,
+        "router": "sigmoid",
+        "routed_scaling_factor": 2.5,
+        "load_balancing": "aux_free",
+        "latent_size": 8,
     },
 }
 

@@ -89,6 +89,11 @@ class MoE(nnx.Module):
       by a momentum (Trinity).
     - LatentMoE (``latent_size``, Nemotron 3): the routed experts run in a narrower
       space, between a down and an up projection.
+    - Zero experts (``num_zero_experts``, LongCat-Flash): identity experts the
+      router scores after the routed ones, each adding the token as the experts
+      take it, times its weight. With them the balance loss is `budget_loss`, and
+      ``aux_free`` moves the bias by `budget_move`, toward ``ffn_experts_per_token``
+      FFN experts a token on average. Only ``dense`` and ``sorted`` run them.
 
     The run's ``methods.moe`` runs the routed experts: `run_sorted`, the default,
     `run_dense`, the reference, or a method of expert parallelism
@@ -136,16 +141,23 @@ class MoE(nnx.Module):
     def __init__(self, config: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
         n, f = config.num_experts, config.expert.intermediate_size
         self.config = config
-        # With shared_expert_sink, the router scores the shared experts too, last.
+        # The router scores the zero experts after the routed ones, and with
+        # shared_expert_sink the shared experts too, last.
+        scored = n + config.num_zero_experts
         sinks = config.num_shared_experts if config.shared_expert_sink else 0
         self.router = linear(
-            width, n + sinks, ("embed", None), config.router_bias, rngs, in_compute=True
+            width,
+            scored + sinks,
+            ("embed", None),
+            config.router_bias,
+            rngs,
+            in_compute=True,
         )
         by_bias = config.load_balancing != "aux_loss"
-        self.router_bias = nnx.Variable(jnp.zeros(n)) if by_bias else None
+        self.router_bias = nnx.Variable(jnp.zeros(scored)) if by_bias else None
         # The picks of each expert since the bias last moved; with `update_at_step_end`
         # set (by the trainer), the bias moves in `step_end_update`, once per step.
-        self.router_load = nnx.Variable(jnp.zeros(n)) if by_bias else None
+        self.router_load = nnx.Variable(jnp.zeros(scored)) if by_bias else None
         # SMEBU's running average of the bias's moves, which moves the bias.
         smebu = config.load_balancing == "smebu"
         self.router_momentum = nnx.Variable(jnp.zeros(n)) if smebu else None
@@ -198,12 +210,29 @@ class MoE(nnx.Module):
             The routed and shared experts' outputs, the shape of `x`.
         """
         idx, weights, sinks = self._route(x, taps)
-        y = parallel.method("moe")(self, self._latent(x), idx, weights, taps)
+        z = self._latent(x)
+        y = self._method()(self, z, idx, weights, taps)
+        if self.config.num_zero_experts:
+            y = y + zero_experts(z, idx, weights, self.config.num_experts)
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         if self.from_latent is not None:
             y = self.from_latent(y)
         return y if self.shared is None else y + self._shared(x, sinks)
+
+    def _method(self) -> Callable[..., Float[Array, "b t d"]]:
+        """Return the run's ``methods.moe``.
+
+        Raises:
+            NotImplementedError: zero experts under expert parallelism, whose
+                methods take picks of the routed experts alone.
+        """
+        name = parallel.choice("moe")
+        if self.config.num_zero_experts and name not in ("dense", "sorted"):
+            raise NotImplementedError(
+                f"moe: zero experts under methods.moe={name}; dense and sorted run them"
+            )
+        return parallel.method("moe")
 
     def _route(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
@@ -213,8 +242,10 @@ class MoE(nnx.Module):
         """Return each token's top-k experts and their weights, and the shared
         experts' weights if the router scores them too. A training forward also
         balances the experts, and routes by random logits under `random_logits`.
-        Scores and top-k are in float32, the weights in x's dtype."""
-        config, n = self.config, self.config.num_experts
+        Scores and top-k are in float32, the weights in x's dtype; a pick of
+        ``num_experts`` or more is a zero expert's."""
+        config = self.config
+        n = config.num_experts + config.num_zero_experts
         logits = self._logits(x) * config.router_logit_scale
         if self.routing is not None and training(taps):
             logits = random_logits(logits, self.routing())
@@ -260,7 +291,10 @@ class MoE(nnx.Module):
         picks = jax.nn.one_hot(idx, scores.shape[-1]).sum(-2)
         if config.aux_loss_weight:
             per_sequence = config.aux_loss_scope == "sequence"
-            loss = balance_loss(scores, picks, config.top_k, per_sequence)
+            if config.num_zero_experts:
+                loss = budget_loss(scores, picks, config, per_sequence)
+            else:
+                loss = balance_loss(scores, picks, config.top_k, per_sequence)
             report(taps, "balance_loss", config.aux_loss_weight, loss)
         if self.router_load is not None:
             self.router_load[...] = self.router_load[...] + picks.sum((0, 1))
@@ -277,8 +311,11 @@ class MoE(nnx.Module):
         """Observe the routing, on the steps a run observes (`bux.architecture.observe`):
 
         - ``router/max_load`` and ``router/min_load``: the most and the fewest picks
-          an expert has, over the mean, 1 when the experts are balanced;
+          an expert has, over the mean, 1 when the experts are balanced (of the FFN
+          experts, with zero experts);
         - ``router/dead``: the share of experts no token picked;
+        - ``router/ffn_experts``: with zero experts, the mean FFN experts a token
+          goes through;
         - ``router/entropy``: the mean entropy of a token's scores, normalized over
           the experts, over that of uniform ones: 1 uniform, 0 sure of one expert;
         - ``router/z``: the mean of log Z² of the router's logits (ST-MoE's z-loss);
@@ -287,9 +324,9 @@ class MoE(nnx.Module):
         """
         if not observe.observing(taps):
             return
-        n, k = scores.shape[-1], self.config.top_k
+        n, k, ffn = scores.shape[-1], self.config.top_k, self.config.num_experts
         picks = jax.nn.one_hot(idx, n).sum(-2)
-        load = picks.sum((0, 1))
+        load = picks[..., :ffn].sum((0, 1))
         share = load / jnp.maximum(load.mean(), 1e-9)
         p = scores / jnp.maximum(scores.sum(-1, keepdims=True), 1e-30)
         entropy = -jnp.sum(p * jnp.log(jnp.maximum(p, 1e-30)), -1).mean() / jnp.log(n)
@@ -298,7 +335,12 @@ class MoE(nnx.Module):
         observe.stat(taps, "router/dead", jnp.mean(load == 0))
         observe.stat(taps, "router/entropy", entropy)
         observe.stat(taps, "router/z", jnp.mean(jax.nn.logsumexp(logits, -1) ** 2))
-        observe.stat(taps, "router/balance", balance_loss(scores, picks, k, False))
+        if self.config.num_zero_experts:
+            balance = budget_loss(scores, picks, self.config, False)
+            observe.stat(taps, "router/ffn_experts", picks[..., :ffn].sum(-1).mean())
+        else:
+            balance = balance_loss(scores, picks, k, False)
+        observe.stat(taps, "router/balance", balance)
         if self.router_bias is not None:
             observe.stat(taps, "router/bias_std", jnp.std(self.router_bias[...]))
 
@@ -310,14 +352,17 @@ class MoE(nnx.Module):
         ``bias_update_rate``: up if it was picked less than the mean, down if more;
         with ``center_bias``, the biases' mean is then taken off them. Under
         ``smebu`` (Trinity) the bias moves by the running average of `smebu_move`,
-        of momentum ``bias_momentum``. A forward calls it itself unless the trainer
+        of momentum ``bias_momentum``. With zero experts, ``aux_free`` moves it by
+        `budget_move` (LongCat-Flash). A forward calls it itself unless the trainer
         sets `update_at_step_end`, to call it once a step. Without a bias it does
         nothing.
         """
         if self.router_bias is None or self.router_load is None:
             return
         config, load = self.config, self.router_load[...]
-        if self.router_momentum is None:
+        if config.num_zero_experts:
+            bias = self.router_bias[...] + budget_move(load, config)
+        elif self.router_momentum is None:
             step = config.bias_update_rate * jnp.sign(load.mean() - load)
             bias = self.router_bias[...] + step
             if config.center_bias:
@@ -379,6 +424,43 @@ def smebu_move(
     return move - move.mean(-1, keepdims=True)
 
 
+def budget_move(
+    load: Float[Array, "*l E"], config: cfg.MoEConfig
+) -> Float[Array, "*l E"]:
+    """Return LongCat-Flash's move of the router bias, with zero experts (eq. 2).
+
+    The paper moves each FFN expert's bias by ``mu (K_e / (K N) - T_i / (K T))``:
+    toward its share of the ``K_e = ffn_experts_per_token`` FFN picks a token, of K
+    = top_k picks of T tokens, T_i of them its own. This is that move with ``mu =
+    bias_update_rate K N / K_e``, so that the rate is the move of an expert no token
+    picked, as aux_free's is: ``bias_update_rate (1 - T_i / target)``, ``target = K_e
+    T / N``. The zero experts' bias stays 0.
+
+    Args:
+        load: how many picks each of the routed and zero experts had since the bias
+            last moved; a layer's each, for the layers of a scanned repeat.
+        config: the layer's settings.
+    """
+    n = config.num_experts
+    target = config.ffn_budget * load.sum(-1, keepdims=True) / (config.top_k * n)
+    picked = target > 0
+    shortfall = jnp.where(picked, 1 - load[..., :n] / jnp.where(picked, target, 1), 0)
+    move = config.bias_update_rate * shortfall
+    return jnp.concatenate([move, jnp.zeros_like(load[..., n:])], -1)
+
+
+def zero_experts(
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+    num_experts: int,
+) -> Float[Array, "b t d"]:
+    """Return the zero experts' output: each token times the weights of its picks
+    of ``num_experts`` or more, the zero experts', summed."""
+    zero = jnp.where(idx >= num_experts, weights, 0).sum(-1, keepdims=True)
+    return z * zero.astype(z.dtype)
+
+
 def random_logits(
     logits: Float[Array, "b t e"], key: Key[Array, ""]
 ) -> Float[Array, "b t e"]:
@@ -424,6 +506,43 @@ def balance_loss(
     f = picks.mean(over) / k
     p = (scores / scores.sum(-1, keepdims=True)).mean(over)
     return scores.shape[-1] * (f * p).sum(-1).mean()
+
+
+def budget_loss(
+    scores: Float[Array, "b t S"],
+    picks: Float[Array, "b t S"],
+    config: cfg.MoEConfig,
+    sequence: bool,
+) -> Float[Array, ""]:
+    """Return LongCat-Flash's balance loss with zero experts, ``sum_j f_j P_j`` over
+    the FFN experts and the zero experts as one more (eqs. 3-5, a group an FFN
+    expert).
+
+    ``P_j`` is an FFN expert's mean score, normalized over all S experts, or the zero
+    experts' sum. ``f_j`` is an FFN expert's picks a token times ``N / K_e``, and the
+    zero experts' times ``1 / (K - K_e)``: all 1, and the loss 1, when the FFN
+    experts take ``K_e = ffn_experts_per_token`` of a token's ``K = top_k`` picks,
+    each as many. Without zero experts it is `balance_loss`. The paper's ``f`` of the
+    zero experts counts the tokens that pick any; this counts their picks, which makes
+    it 1 at the target as the FFN experts' are.
+
+    Args:
+        scores: every token's score of the FFN experts, then the zero experts.
+        picks: how many of each token's picks are each expert's: its top-k, one-hot.
+        config: the layer's settings.
+        sequence: whether to take f and P per sequence, then average the losses,
+            rather than over the batch.
+
+    Returns:
+        The loss, a scalar.
+    """
+    over, n, budget = 1 if sequence else (0, 1), config.num_experts, config.ffn_budget
+    count = picks.mean(over)
+    p = (scores / scores.sum(-1, keepdims=True)).mean(over)
+    f = n / budget * count[..., :n]
+    f_zero = count[..., n:].sum(-1) / (config.top_k - budget)
+    loss = (f * p[..., :n]).sum(-1) + f_zero * p[..., n:].sum(-1)
+    return loss.mean()
 
 
 def _norm(config: cfg.NormalizationConfig | None, width: int) -> Norm | None:

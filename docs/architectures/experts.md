@@ -201,6 +201,56 @@ model = embed
 ```
 :::
 
+(zero-experts)=
+## Zero experts
+
+`num_zero_experts=z` adds `z` zero-computation experts (LongCat-Flash): identity
+experts, each of which returns the token as it is. The router scores them after the
+`num_experts` FFN experts, and a token picks its `top_k` among all of them, so it goes
+through as few FFN experts as its context needs:
+
+$$
+y = \sum_{e \in \text{top-}k(x),\, e \le N} g_e(x)\, E_e(x)
+  \;+\; \Big(\sum_{e \in \text{top-}k(x),\, e > N} g_e(x)\Big)\, x .
+$$
+
+The weights $g_e$ are normalized over all of a token's picks, the zero experts'
+included, and scaled by `routed_scaling_factor`. In LatentMoE, $x$ is the token in
+the latent.
+
+`ffn_experts_per_token` is the number of FFN experts a token goes through on average,
+LongCat's $K_e$. It is the target of the balancing below, and defaults to the share
+of the picks that uniform routing gives the FFN experts, `top_k * num_experts /
+(num_experts + num_zero_experts)`. LongCat-Flash picks 12 of 512 FFN experts and 256
+zero experts, 8 FFN experts a token on average, so the default is its own. With half
+as many zero experts as FFN experts, as LongCat's, and the FFN experts of a top 7
+on average, out of 10 picks:
+
+```bux
+experts = moe(num_experts=256, top_k=10, num_zero_experts=128, ffn_experts_per_token=7,
+              num_shared_experts=1, router=sigmoid, routed_scaling_factor=2.5,
+              load_balancing=aux_free, bias_update_rate=1e-2, aux_loss_coef=1e-4,
+              aux_loss_scope=sequence,
+              expert=gated_mlp(intermediate_size=2048, activation=swish))
+```
+
+- **The bias** (`aux_free`) moves each FFN expert's bias by LongCat-Flash's rule
+  (its eq. 2), toward its share of the target, $K_e T / N$ of a step's $T$ tokens:
+  by `bias_update_rate` times $1 - T_e / (K_e T / N)$, where $T_e$ is its picks. The
+  paper's rate $\mu$ is `bias_update_rate` $\cdot K N / K_e$. The zero experts' bias
+  stays 0, so the FFN experts' biases set how often a token picks them.
+- **The balance loss** is LongCat-Flash's (eqs. 3 to 5), with the zero experts as
+  one more group: an FFN expert's picks a token weigh by $N / K_e$, the zero
+  experts' by $1 / (K - K_e)$, so the loss is 1 when the FFN experts take $K_e$
+  picks a token, evenly. The paper's weight of the zero experts counts the tokens
+  that pick any of them; bux counts their picks, which is 1 at the target too.
+- **Observed:** `router/ffn_experts`, the mean FFN experts a token went through, and
+  the loads of the FFN experts alone.
+
+Zero experts take neither `smebu` nor `center_bias`, whose centered moves would
+undo the target, nor `num_groups`. Only `methods.moe=dense` and `sorted` run them;
+the expert-parallel methods raise.
+
 (moe-load-balancing)=
 ## Load balancing
 
@@ -218,7 +268,7 @@ experts.aux_loss_scope = sequence
 | `load_balancing` | `aux_loss` | `aux_loss`: the balance loss alone; `aux_free`: also a bias per expert; `smebu`: the bias moved by SMEBU |
 | `aux_loss_coef` | `1e-2`, or `0` with a bias | the weight of each layer's balance loss |
 | `aux_loss_scope` | `batch` | `batch`: over the whole batch (Switch, Qwen); `sequence`: per sequence, then averaged (DeepSeek-V3) |
-| `bias_update_rate` | `1e-3` | how far `aux_free`'s bias moves per step; SMEBU's largest move |
+| `bias_update_rate` | `1e-3` | how far `aux_free`'s bias moves per step; SMEBU's largest move; with zero experts, the move of an FFN expert no token picked |
 | `center_bias` | `false` | `aux_free`: subtract the biases' mean after every move (Trinity Nano and Mini) |
 | `bias_softclamp` | `2` | SMEBU's $\kappa$, how soon its moves saturate |
 | `bias_momentum` | `0.5` | SMEBU's $\beta$, the decay of its moves' running average |
