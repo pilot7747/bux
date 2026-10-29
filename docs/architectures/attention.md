@@ -57,6 +57,10 @@ model = embed block^12 norm head(tied=true)
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
+| `exclusive` | `false` | each head's output less its part along the token's own value: `true` or `learned` ([below](#exclusive-self-attention-xsa)) (XSA) |
+| `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
+| `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
+| `differential` | `false` | two query heads for each output head, the second's map subtracted from the first's ([below](#differential-attention-diff-v2)) (DIFF V2) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):
@@ -84,6 +88,23 @@ A fused projection's split points between q, k and v do not fall on head
 boundaries, so under tensor parallelism it stays whole, and every device computes
 it ([Tensor parallelism](../parallelism/tensor.md)).
 :::
+
+### Values from the keys
+
+Gemma 4's global layers make their values from the key projection
+(`attention_k_eq_v`), and have no value projection:
+
+```bux
+glob = gqa(num_heads=16, num_kv_heads=4, head_dim=128, qk_norm=rmsnorm, k_eq_v=true)
+```
+
+Each head's projected key $k$, after the conv with `kv_conv_size`, is the value
+$v = k / \mathrm{rms}(k)$: an RMSNorm without a gain, at the eps of `qk_norm` (1e-6
+without one), and not rotated. The keys go on through `qk_norm` and RoPE. The
+values' head is the keys', so `v_head_dim` stays unset. A `v` port mixes and pushes
+these values as any others. Without RoPE, and with a QK RMSNorm, every key is its
+value times the norm's gain, so vLLM can cache one vector a token for the layer
+([Values from the keys](../export/vllm.md#values-from-the-keys)).
 
 ## `mla`: multi-head latent attention
 
@@ -190,6 +211,9 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `gate_per_head` | `false` | one gate value per head instead (with `gated`, as the next two) | Laguna |
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
+| `gate_input_rank` | `none` | the gate's projection of the input low-rank, `SiLU(x W_d) W_u` ([Gated attention](#gated-attention)) | HyGA |
+| `gate_output_rank` | `none` | the gate also reads each head's own output, by a rank of this many dims | HyGA |
+| `gate_cross_head` | `false` | a second gate, a value a head, from all the heads' outputs | HyGA |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
 | `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3 |
 | `softcap` | `none` | `c * tanh(logits / c)` on the logits | Gemma 2 |
@@ -270,6 +294,30 @@ main ones:
   attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
              gated=true, gate_head_bias=true)
   ```
+
+- **G1 by HyGA** (Zhou et al., 2026, arXiv 2608.11805): the gate of head $i$ also
+  reads the head's output $o_i$, and a gate of each head from all of them multiplies
+  it:
+
+  $$
+  o_i' = o_i \odot \sigma\big(x W_i + \mathrm{SiLU}(o_i W^d_i) W^u_i\big)
+  \odot \sigma\big((o W_c)_i\big).
+  $$
+
+  `gate_output_rank=r` adds the second term, $W^d_i$ and $W^u_i$ of rank $r$ each
+  head's own (the H-gate). `gate_cross_head=true` adds the last factor, $o$ all the
+  heads' outputs side by side (the C-gate). `gate_input_rank=r` makes the first term
+  low-rank, $\mathrm{SiLU}(x \bar W^d_i) \bar W^u_i$ (the paper's cheaper X-gate). The
+  paper's main runs have the H-gate as wide as the head, the X-gate full and learned
+  sinks:
+
+  ```bux
+  attn = gqa(num_heads=8, num_kv_heads=2, gated=true, gate_output_rank=64,
+             gate_cross_head=true, sinks=true)
+  ```
+
+  The H-gate reads the outputs the gate multiplies: after `output_norm`, under one.
+  The paper sets no init for the new matrices; they start as the model's others.
 
 - **G5**, after the output projection: write the gate with the algebra, as
   `examples/architectures/primitives.bux` does:
@@ -381,6 +429,60 @@ global = attn(power_scale=0.1, power_scale_length=2048)
 
 It scales the queries, not the logits, so unlike `log_scale` it runs under every
 attention method.
+
+### Exclusive self-attention (XSA)
+
+`exclusive=true`, a setting of `gqa`, takes out of each head's output $y_i$ its part
+along the token's own value $v_i$, before the output's norm and gate (Zhai, 2026,
+arXiv 2603.09078):
+
+$$
+z_i = y_i - \frac{y_i^\top v_i}{\lVert v_i \rVert^2}\, v_i.
+$$
+
+Attention then passes on only what the context adds to the token, and a query can
+park attention on its own key, as on a sink. A query head takes the value of its
+group's kv head. The paper finds the gain grows with the sequence length. It adds no
+parameters, and runs after the attention, so under every attention method and with
+an indexer.
+
+`exclusive=learned` takes a learned share of that part, $\tanh(a)$ for each head,
+from $a = 0$, so that the layer starts as plain attention (modded-nanogpt's learned
+XSA):
+
+```bux
+global = attn(exclusive=learned)
+```
+
+XSA reads the values the layer attends to: those its `v` port mixed in, under a value
+residual. A layer that reads the `kv` port has no values of its own, and raises.
+
+### Differential attention (DIFF V2)
+
+`differential=true`, a setting of `gqa`, gives the layer two query heads for each of
+its `num_heads` output heads, both in the group of one kv head, and makes each output
+the difference of their attention (Ye et al., 2026, Differential Transformer V2):
+
+$$
+o_i = a_{i,1} - \sigma(x W_\lambda)_i\, a_{i,2},
+$$
+
+$a_{i,1}$ and $a_{i,2}$ the outputs of the pair's query heads, and $W_\lambda$ a
+projection of the input to a weight for each head and token, without a bias. The kv
+heads, their cache and the output projection are as without it; the queries and the
+attention's FLOPs double. The subtraction lets a head's output shrink to nothing,
+which a softmax alone cannot, and the post finds it stabler than DIFF V1, which had a
+norm of each head after it. Sinks, if set, are one a query head.
+
+```bux
+global = attn(differential=true)
+```
+
+It composes with the gate (on the output heads), QK-norm, RoPE, the conv on keys and
+values, and both ports. With XSA, the pair shares one value, so removing the part
+along it from the difference is removing it from each map: `exclusive` takes the
+output heads. An indexer and a relative bias, which see each query head alone, are
+not yet supported with it.
 
 ## Positions
 
@@ -507,6 +609,8 @@ A config lists its ports; using a port the layer does not have is a compile erro
 |-------|------|-------------------|-------------------|
 | `gqa` | `v` | pushes the value heads | mixes the tap's values into its own (value residual) |
 | `gqa` | `kv` | pushes the keys and values | uses them instead of projecting its own (cross-layer KV sharing, YOCO, CLA) |
+| `gqa` | `ve` | - | adds a `value_embed` table's rows to its values (value embeddings) |
+| `value_embed` | `ve` | pushes the input tokens' rows of its table | - |
 | `gqa`, `mla`, `csa` | `index` | pushes the keys the indexer kept for each query | attends to them, and runs no indexer (IndexCache) |
 | `csa` | `kv` | pushes the compressed latents, with the indexer's keys | uses them instead of compressing its own; an indexer it runs scores those keys |
 | `csa` | `candidates` | pushes a pool of coarse blocks of compressed positions | its indexer keeps keys only inside the pool |
@@ -532,6 +636,41 @@ A reading layer computes $a v + b v_1$, with $a = b = 0.5$ to start.
 | `fixed` | $a = b = 0.5$, not learned | ResFormer's code (Identity-ResFormer) |
 | `learned` | $a$ and $b$ learned | Learnable-ResFormer |
 | `convex` | $a$ learned, $b = 1 - a$ | |
+
+### Value embeddings
+
+modded-nanogpt adds a table of a row per token to some layers' values. A
+`value_embed` layer holds the table and pushes the input tokens' rows to its `ve`
+port; a `gqa` layer that reads the port adds them to its values. The table leaves
+the stream as it is, so it goes bare, on a widened stream too, or inside the branch:
+
+```bux
+ve    = value_embed(features=128)  # num_kv_heads * head_dim of the readers
+attn  = gqa(num_heads=8, num_kv_heads=2, qk_norm=rmsnorm)
+model = embed ve(ve=@e1) [norm attn(ve=$e1!)] [norm ffn]
+        [norm ve(ve=@e2) attn(ve=$e2!)] [norm ffn] norm head
+```
+
+Each layer adds the rows $e$ by a gate of its own per kv head, as modded-nanogpt's
+current record does:
+
+$$v + 2\,\sigma\big(W\,[x_{:n}, e_{:n}]\big)\, e$$
+
+from the first $n$ channels of the layer's input $x$ and of $e$ (`value_embed_gate`,
+6). $W$ starts at 0, so the gate starts at 1. `value_embed_gate=none` adds $e$
+ungated. Several layers may read one table, as modded-nanogpt's earlier records
+shared theirs between early and late layers.
+
+| `value_embed` setting | Default | What it does |
+|-----------------------|---------|--------------|
+| `features` | required | the row's width: the readers' `num_kv_heads * v_head_dim` |
+| `std` | `0.01` | the rows' normal init, where the model sets no `init` |
+
+The rows go into the layer's own values first, then the value residual mixes them
+with the `v` port's ([Value residuals](#value-residuals)), and the `v` port pushes
+them with the rows in. A layer that reads `kv` has no values of its own, so it
+cannot read `ve`. The table splits over the vocabulary as the embedding's does, Muon
+leaves it to the other optimizer, and weight decay takes it, as modded-nanogpt's.
 
 ### Shared keys and values
 

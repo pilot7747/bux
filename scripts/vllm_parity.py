@@ -102,6 +102,13 @@ SPARSE_LATENT = (
     " top_k=12))\n"
 )
 
+#: The hybrid's global layer, as the timeline's candidate has it, and a value
+#: embedding of its 2 kv heads of 32.
+GLOBAL = (
+    "glob = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\nve = value_embed(features=64)\n"
+)
+
 #: Hymba's blocks: attention without a window (F) and with one, which writes its
 #: keys and values to the tap kv (W), reads them (S) or takes them off (R); and one
 #: without a window that writes them (G).
@@ -220,6 +227,29 @@ CASES = {
     + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
     " load_balancing=aux_free, expert=gated_mlp(intermediate_size=64,"
     " activation=situ, up_softcap=0.5))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    # Zero experts: on the timeline's experts (a shared one, sigmoid, aux-free),
+    # LongCat-Flash's (softmax, unnormalized, scaled, no bias), and beside an expert
+    # norm, which routes apart.
+    "moe-zero": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, num_shared_experts=1,"
+    " router=sigmoid, routed_scaling_factor=2.5, load_balancing=aux_free,"
+    " expert=dense)\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-zero-longcat": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-zero-norm": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " load_balancing=aux_free, expert_norm=rmsnorm, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
@@ -421,6 +451,66 @@ CASES = {
     " softcap=20, rope=rope())\n"
     + "model = embed [rmsnorm beam] [rmsnorm ffn] [rmsnorm inkling] [rmsnorm ffn]"
     " rmsnorm head",
+    # XSA: each head's output less its part along its own value, all of it and a
+    # learned share of it, with a window, sinks and the value residual.
+    "xsa": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, exclusive=true, rope=rope())\n"
+    + "share = attn(exclusive=learned, sliding_window_size=8, sinks=true,"
+    " value_residual=learned)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm share(v=$v1)]"
+    " [rmsnorm ffn] rmsnorm head",
+    # The timeline's hybrid under hc, its global layers with learned XSA: no
+    # positions, QK-norm, a gate, a conv on keys and values and the value residual,
+    # 4 query heads to a kv head (each rank's copy of it under TP), beside KDA.
+    "xsa-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4, exclusive=learned)\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
+    # HyGA's gates: as the paper's main runs have them (the input's gate, the head's
+    # own output's at its width, the cross-head gate, sinks), and low-rank with a
+    # head bias.
+    "hyga": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, gated=true, gate_output_rank=32,"
+    " gate_cross_head=true, sinks=true, rope=rope())\n"
+    + "low = attn(gate_input_rank=8, gate_output_rank=8, gate_head_bias=true,"
+    " sinks=false)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm low] [rmsnorm ffn]"
+    " rmsnorm head",
+    # xsa-hybrid with HyGA's gates on its global layers too.
+    "hyga-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " gate_output_rank=32, gate_cross_head=true, kv_conv_size=4, exclusive=learned)\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
+    # DIFF V2: two query heads to an output head, a pair in one kv head's group, with
+    # sinks for each query head and a window; and with a gate, QK-norm of all heads
+    # and fused projections.
+    "diff": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, differential=true, rope=rope())\n"
+    + "local = attn(sliding_window_size=8, sinks=true)\n"
+    + "fused = attn(gated=true, qk_norm=rmsnorm, qk_norm_all_heads=true,"
+    " fused_qkv=true)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " [rmsnorm fused] [rmsnorm ffn] rmsnorm head",
+    # xsa-hybrid's global layers differential, without XSA.
+    "diff-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4, differential=true)\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
     "dsa": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
     + "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
@@ -495,6 +585,37 @@ CASES = {
     " rope=rope())\n"
     + "ln = rms(qk_norm=layernorm(bias=true))\n"
     + "model = embed [rmsnorm rms] [rmsnorm ffn] [rmsnorm ln] [rmsnorm ffn]"
+    " rmsnorm head",
+    # Value embeddings on the hybrid's global layer (QK-norm, a gate, the conv on
+    # keys and values, no positions): a table a layer, gated, beside the value
+    # residual; then one table two layers read, ungated, under hc.
+    "value-embed": HEAD
+    + FFN
+    + GLOBAL
+    + "model = embed ve(ve=@t) [rmsnorm glob(v=@v1, ve=$t!)] [rmsnorm ffn]"
+    " [rmsnorm ve(ve=@u) glob(v=$v1!, ve=$u!)] [rmsnorm ffn] rmsnorm head",
+    "value-embed-shared": HEAD
+    + "residual = hc(expansion=2)\n"
+    + FFN
+    + GLOBAL
+    + "plain = glob(value_embed_gate=none)\n"
+    + "model = embed ve(ve=@t) [rmsnorm plain(ve=$t)] [rmsnorm ffn]"
+    " [rmsnorm plain(ve=$t!)] [rmsnorm ffn] rmsnorm head",
+    # Gemma 4's values from the keys: with RoPE, a window and a fused projection,
+    # beside the value residual; then on the hybrid's global layer (QK-norm, a gate,
+    # the conv on keys and values, no positions).
+    "k-eq-v": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm,"
+    " rope=rope())\n"
+    + "local = attn(sliding_window_size=8, fused_qkv=true)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
+    " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
+    "k-eq-v-nope": HEAD
+    + FFN
+    + "glob = gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm,"
+    " gated=true, kv_conv_size=4)\n"
+    + "model = embed [rmsnorm glob] [rmsnorm ffn] [rmsnorm glob] [rmsnorm ffn]"
     " rmsnorm head",
     "kv-conv": HEAD
     + FFN

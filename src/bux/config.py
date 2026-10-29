@@ -229,7 +229,8 @@ class MoEConfig(Config):
     shared experts, if any, take every token. A loss, a bias or both balance the
     experts' loads (`load_balancing`). The run's ``methods.moe`` says how the experts
     run: every expert on every token (``dense``), each on its own tokens
-    (``sorted``, the default), or over devices by expert parallelism.
+    (``sorted``, the default), or over devices by expert parallelism. Zero experts
+    (`num_zero_experts`, LongCat-Flash) let a token go through fewer FFN experts.
     """
 
     type: Literal["moe"] = "moe"
@@ -269,6 +270,9 @@ class MoEConfig(Config):
     # more (DeepSeek-V3). smebu moves the same bias by a step that shrinks as an expert's
     # load nears the mean: tanh(bias_softclamp * (mean - load) / mean) times the rate,
     # centered over the experts and averaged by a momentum of bias_momentum (Trinity).
+    # With zero experts, aux_free moves each FFN expert's bias by LongCat-Flash's rule
+    # instead, the rate times (1 - load / target) toward ffn_experts_per_token's share
+    # of the picks, and the zero experts' bias stays 0.
     load_balancing: Literal["aux_loss", "aux_free", "smebu"] = "aux_loss"
     # How far the bias moves each training step, for each expert: aux_free's step, and
     # SMEBU's largest (Trinity Large: 5e-4).
@@ -283,7 +287,8 @@ class MoEConfig(Config):
     bias_momentum: Annotated[float, Field(ge=0, lt=1)] = 0.5
     # Weight of each layer's balance loss, E * sum_e f_e P_e, where f_e is the fraction
     # of top-k picks that go to expert e and P_e its mean score, normalized over the
-    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with a bias. Every
+    # experts (Switch; DeepSeek-V3, eqs. 17-20); with zero experts, LongCat-Flash's,
+    # the zero experts one more group (eqs. 3-5). None -> 1e-2, or 0 with a bias. Every
     # layer adds its own, as in Megatron-LM. transformers pools the layers into one loss
     # and counts tokens, not picks, so its coefficient c is about c * top_k / layers.
     aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
@@ -302,12 +307,59 @@ class MoEConfig(Config):
     # The shared experts are weighted by the router too, normalized with the top-k
     # (Inkling); otherwise they are added with weight 1.
     shared_expert_sink: bool = False
+    # Zero-computation experts (LongCat-Flash): identity experts the router scores
+    # after the routed ones, each the token as it is, times its weight. A token picks
+    # its top_k among both, so it goes through fewer FFN experts than top_k.
+    num_zero_experts: Annotated[int, Field(ge=0)] = 0
+    # The FFN experts a token goes through on average, which aux_free's bias steers
+    # toward and the balance loss weighs by (LongCat's K_e); None -> top_k *
+    # num_experts / (num_experts + num_zero_experts), what uniform picks give.
+    ffn_experts_per_token: float | None = None
+
+    @model_validator(mode="after")
+    def _zero_experts(self) -> Self:
+        """Check the zero experts' settings, and that they balance by a rule that
+        keeps them."""
+        if not self.num_zero_experts:
+            if self.ffn_experts_per_token is not None:
+                raise ValueError("ffn_experts_per_token needs num_zero_experts")
+            return self
+        budget = self.ffn_budget
+        if not 0 < budget < self.top_k:
+            raise ValueError(
+                f"ffn_experts_per_token={budget} is not between 0 and top_k={self.top_k}"
+            )
+        refused = [
+            name
+            for name, on in (
+                ("load_balancing=smebu", self.load_balancing == "smebu"),
+                ("center_bias", self.center_bias),
+                ("num_groups", self.num_groups > 1),
+            )
+            if on
+        ]
+        if refused:
+            raise ValueError(
+                f"num_zero_experts with {', '.join(refused)}: the zero experts' bias "
+                "stays 0, which centering would move, and they are in no group"
+            )
+        return self
+
+    @property
+    def ffn_budget(self) -> float:
+        """`ffn_experts_per_token`, or its default: the FFN experts' share of the
+        top-k, ``top_k`` without zero experts."""
+        if self.ffn_experts_per_token is not None:
+            return self.ffn_experts_per_token
+        n = self.num_experts
+        return self.top_k * n / (n + self.num_zero_experts)
 
     @model_validator(mode="after")
     def _groups(self) -> Self:
         """Check that the experts split into groups that hold the top-k."""
         n, groups, picked = self.num_experts, self.num_groups, self.top_k_groups
-        if n % groups or picked > groups or self.top_k > picked * (n // groups):
+        scored = n + self.num_zero_experts  # in one group, with zero experts
+        if n % groups or picked > groups or self.top_k > picked * (scored // groups):
             raise ValueError(
                 f"{groups} groups of {n} experts, {picked} of them picked, cannot hold "
                 f"the top {self.top_k}"
@@ -442,6 +494,17 @@ class QuadraticAttentionConfig(AttentionConfig):
     # A learned bias per head on the gate, before its activation, shared by the head's
     # dims and starting at 0 (Beam).
     gate_head_bias: bool = False
+    # The gate's projection of the input made low-rank, SiLU(x W_d) W_u, W_d of this
+    # many columns for each head and W_u each head's own (HyGA's low-rank X-gate);
+    # None: one projection.
+    gate_input_rank: int | None = None
+    # The gate also reads the head's output o: SiLU(o W_d) W_u of this rank, by the
+    # head's own matrices, added to its logits from the input before the activation
+    # (HyGA's H-gate; the paper's main runs make it as wide as the head); None: none.
+    gate_output_rank: int | None = None
+    # A second gate, one value a head, sigmoid(o W_c) of all the heads' outputs
+    # together, times the first (HyGA's C-gate).
+    gate_cross_head: bool = False
     # A norm of each head's output, before the gate (Muse); None: none.
     output_norm: NormalizationConfig | None = None
     # Norm of each query and key head, before RoPE (Qwen3); gqa's qk_norm_all_heads
@@ -477,11 +540,20 @@ class QuadraticAttentionConfig(AttentionConfig):
                 ("gate_per_head", self.gate_per_head),
                 ("gate_head_bias", self.gate_head_bias),
                 ("gate_activation", self.gate_activation != "sigmoid"),
+                ("gate_input_rank", self.gate_input_rank is not None),
+                ("gate_output_rank", self.gate_output_rank is not None),
+                ("gate_cross_head", self.gate_cross_head),
             )
             if on
         ]
         if given and not self.gated:
             raise ValueError(f"{', '.join(given)} set the gate, which gated=true adds")
+        ranks = self.gate_input_rank is not None or self.gate_output_rank is not None
+        if ranks and self.gate_per_head:
+            raise ValueError(
+                "gate_input_rank and gate_output_rank gate each dim of a head: not with "
+                "gate_per_head"
+            )
         return self
 
     @model_validator(mode="after")
@@ -513,10 +585,11 @@ class GQAConfig(QuadraticAttentionConfig):
 
     Ports: ``v`` exports the value heads, or imports them for value-residual mixing
     (ResFormer); ``kv`` exports keys and values, or imports them instead of computing
-    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k.
+    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k;
+    ``ve`` imports a `ValueEmbeddingConfig` table's rows, added to the values.
     """
 
-    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index"})
+    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index", "ve"})
 
     type: Literal["gqa"] = "gqa"
     num_heads: int  # query heads
@@ -560,6 +633,53 @@ class GQAConfig(QuadraticAttentionConfig):
     # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
     # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
+    # Exclusive self-attention (XSA): each head's output y less its part along the
+    # query's own value v, y - (y . v) v / (v . v), before the output's norm and gate,
+    # so that attention carries only what the token lacks (Zhai, 2026). "learned"
+    # takes tanh(a) of that part, a learned for each head from 0 (modded-nanogpt).
+    # The values are those the layer attends to: not with its kv port read.
+    exclusive: bool | Literal["learned"] = False
+    # A layer that reads the ve port adds its rows e to its values by a gate per kv
+    # head, v + 2 sigmoid(W [x[:n], e[:n]]) e, from the first n channels of its input
+    # x and of e, W starting at 0 (modded-nanogpt: 6); None: no gate, v + e.
+    value_embed_gate: Positive | None = 6
+    # Values from the key projection, no v projection of their own (Gemma 4's global
+    # layers, attention_k_eq_v): each head's projected key, after the conv with
+    # kv_conv_size, RMS-normalized without a gain, at qk_norm's eps (1e-6 without
+    # one), and not rotated; the keys go on through qk_norm and RoPE.
+    k_eq_v: bool = False
+
+    @model_validator(mode="after")
+    def _k_eq_v(self) -> Self:
+        """Check that values from the keys have the keys' width."""
+        if self.k_eq_v and self.v_head_dim not in (None, self.head_dim):
+            raise ValueError(
+                "gqa(k_eq_v=true) makes the values from the keys, so v_head_dim is "
+                f"head_dim: give no v_head_dim (got {self.v_head_dim})"
+            )
+        return self
+
+    # Differential attention (DIFF V2; Ye et al., 2026): twice the query heads, both
+    # of each pair in the group of one kv head, and each of the num_heads outputs
+    # a1 - sigmoid(x W) a2 of its pair, W a projection of the input to a value a head
+    # and token. Its kv heads, KV cache and output projection are as without it.
+    differential: bool = False
+
+    @model_validator(mode="after")
+    def _differential(self) -> Self:
+        """Check that differential attention comes without the settings that see a
+        head of each output alone: an indexer and a relative bias."""
+        given = [
+            name
+            for name, on in (
+                ("indexer", self.indexer),
+                ("relative_bias", self.relative_bias),
+            )
+            if on is not None
+        ]
+        if self.differential and given:
+            raise ValueError(f"gqa: differential with {', '.join(given)} not yet")
+        return self
 
 
 class MLAConfig(QuadraticAttentionConfig):
@@ -896,6 +1016,27 @@ class EmbeddingConfig(Config):
     dropout: float = 0.0  # Dropout rate of the embedding, in training.
 
 
+class ValueEmbeddingConfig(Config):
+    """Value embeddings (modded-nanogpt): a table of `vocab_size` rows of `features`,
+    each input token's row pushed to the ``ve`` port for a ``gqa`` layer to add to its
+    values: ``value_embed(features=128, ve=@ve1)``.
+
+    It leaves the stream as it is, so it goes bare, on a widened stream too, or
+    inside a branch before the layer that reads it. Several layers may read one table.
+
+    Ports: ``ve`` exports the rows of the input tokens.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"ve"})
+
+    type: Literal["value_embed"] = "value_embed"
+    # Width of a row: the kv heads times the value head dim of the layers that read it.
+    features: Positive
+    # Std of the rows' normal init (modded-nanogpt: 0.01), where the model sets no
+    # init; one that does starts them as its embedding.
+    std: float = 0.01
+
+
 class LMHeadConfig(Config):
     """The language-model head: the stream to logits over the vocabulary,
     ``softcap(x W + b)``. Every head is an output of the model; nothing follows one
@@ -1206,6 +1347,7 @@ LayerConfig = Annotated[
     | ScaleConfig
     | DropoutConfig
     | EmbeddingConfig
+    | ValueEmbeddingConfig
     | LMHeadConfig
     | NextNConfig
     | EngramConfig

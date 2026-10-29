@@ -77,12 +77,19 @@ def check(c: dict, site: Site) -> None:
     """Raise for what the plugin's ``csa`` does not run.
 
     Raises:
-        NotImplementedError: A relative bias, a length scale, an indexer of
+        NotImplementedError: A relative bias, a length scale, HyGA's gates, an indexer of
             blocks, ``o_groups`` or heads that the ranks do not split, speculative
             decoding, decode context parallelism, or a KV cache dtype other than
             the model's.
     """
-    unsupported(c, "relative_bias", "log_scale")
+    unsupported(
+        c,
+        "relative_bias",
+        "log_scale",
+        "gate_input_rank",
+        "gate_output_rank",
+        "gate_cross_head",
+    )
     ix = c["indexer"]
     if ix and ix["block_size"] > 1:
         raise NotImplementedError("csa: an indexer of blocks (block_size > 1)")

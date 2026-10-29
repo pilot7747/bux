@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.cache_utils import (
     CacheLayerMixin,
@@ -340,7 +341,8 @@ def cache_layer(c: dict, ports: list) -> tuple[str, dict] | None:
     """
     if reads(ports, "kv"):
         return None
-    conv = {"number_of_conv_states": 2} if c.get("kv_conv_size") else {}
+    states = 1 if c.get("k_eq_v") else 2  # the keys', and the values' unless shared
+    conv = {"number_of_conv_states": states} if c.get("kv_conv_size") else {}
     window = c["sliding_window_size"]
     if sparse(c, ports):
         if reads(ports, "index"):
@@ -402,11 +404,13 @@ class SoftmaxAttention(nn.Module):
     ):
         super().__init__()
         self.h, self.dv, self.ports = heads, dv, site.ports
-        gate_width = heads if c["gate_per_head"] else heads * dv
+        gate_dims = c["gate_input_rank"] or dv
+        gate_width = heads if c["gate_per_head"] else heads * gate_dims
         self.gate = nn.Linear(width, gate_width, bias=bias) if c["gated"] else None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
         head_bias = c["gated"] and c["gate_head_bias"]
         self.gate_bias = nn.Parameter(torch.zeros(heads)) if head_bias else None
+        self._hybrid_gate(c, heads, dv, bias)
         rel = c["relative_bias"]
         self.rel_proj = (
             nn.Linear(width, heads * rel["rank"], bias=bias) if rel else None
@@ -428,6 +432,20 @@ class SoftmaxAttention(nn.Module):
         self.cache_window = self.window if self.kind == "sliding_attention" else None
         self.config, self.is_causal = site.config, True
         self.num_key_value_groups = 1  # the interface's; set at each call
+
+    def _hybrid_gate(self, c: dict, heads: int, dv: int, bias: bool) -> None:
+        """Make HyGA's parts of the gate: each head's up projection of a low-rank
+        input gate, its projections of its own output, and the cross-head gate."""
+
+        def per_head(n_in: int, n_out: int) -> nn.Parameter:
+            return nn.Parameter(torch.zeros(heads, n_in, n_out))
+
+        rank, own = c["gate_input_rank"], c["gate_output_rank"]
+        self.gate_up = per_head(rank, dv) if rank else None
+        self.output_gate_down = per_head(dv, own) if own else None
+        self.output_gate_up = per_head(own, dv) if own else None
+        cross = c["gate_cross_head"]
+        self.cross_gate = nn.Linear(heads * dv, heads, bias=bias) if cross else None
 
     # --- ports -----------------------------------------------------------------------
 
@@ -490,7 +508,7 @@ class SoftmaxAttention(nn.Module):
             return softmax_attention(
                 q, kv.k, kv.v, keep, self.scale, self.softcap, self.sinks, bias, gain
             )
-        self.num_key_value_groups = self.h // kv.k.shape[1]
+        self.num_key_value_groups = q.shape[1] // kv.k.shape[1]
         attend = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention
         )
@@ -550,19 +568,75 @@ class SoftmaxAttention(nn.Module):
     def output(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Normalize and gate the heads' outputs, b t h dv, then project them back to
         the width."""
-        b, t, _ = x.shape
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
-            gate = self.gate(x).view(b, t, self.h, -1)
-            if self.gate_bias is not None:
-                gate = gate + self.gate_bias.to(gate.dtype)[:, None]
-            out = out * self.gate_activation(gate)
+            out = out * self.gated(x, out)
         return self.project(out)
+
+    def gated(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """The gate on the heads' outputs, b t h _: the input's projection (or its
+        low-rank SiLU(x W_d) W_u), plus SiLU(o W_d) W_u of each head's output and a
+        bias per head, through the activation; times sigmoid(o W_c) of every head's
+        output, a value a head (HyGA's three gates, each where it is set)."""
+        assert self.gate is not None
+        b, t, _ = x.shape
+        logits = self.gate(x).view(b, t, self.h, -1)
+        if self.gate_up is not None:
+            logits = by_head(F.silu(logits), self.gate_up)
+        if self.output_gate_down is not None and self.output_gate_up is not None:
+            low = F.silu(by_head(out, self.output_gate_down))
+            logits = logits + by_head(low, self.output_gate_up)
+        if self.gate_bias is not None:
+            logits = logits + self.gate_bias.to(logits.dtype)[:, None]
+        gate = self.gate_activation(logits)
+        if self.cross_gate is None:
+            return gate
+        return gate * torch.sigmoid(self.cross_gate(out.flatten(2)))[..., None]
 
     def project(self, out: torch.Tensor) -> torch.Tensor:
         """Project the heads' outputs, b t h dv, back to the width."""
         return self.o(out.flatten(2))
+
+
+def differential(out: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
+    """Each output head's ``a1 - sigmoid(lam) a2``, b t h dv, of its pair of query
+    heads' outputs side by side in out, b t 2h dv (DIFF V2), lam b t h."""
+    b, t, _, dv = out.shape
+    pairs = out.view(b, t, -1, 2, dv)
+    return (
+        pairs[..., 0, :]
+        - torch.sigmoid(lam).to(out.dtype)[..., None] * pairs[..., 1, :]
+    )
+
+
+def by_head(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Each head's x, b t h i, times its own matrix of w, h i o."""
+    return torch.einsum("bthi,hio->btho", x, w.to(x.dtype))
+
+
+def exclusive(
+    out: torch.Tensor, v: torch.Tensor, strength: torch.Tensor | None
+) -> torch.Tensor:
+    """Return each head's output y, b t h dv, less its part along its query's own
+    value v, b t g dv, by XSA: ``y - s (y @ u) u`` with ``u = v / max(norm(v),
+    1e-12)``, in float32; s = 1, or `strength` for each head."""
+    y = out.float()
+    u = v.float().repeat_interleave(out.shape[2] // v.shape[2], dim=2)
+    u = u * u.square().sum(-1, keepdim=True).clamp(min=1e-24).rsqrt()
+    along = (y * u).sum(-1, keepdim=True) * u
+    if strength is not None:
+        along = along * strength.float()[:, None]
+    return (y - along).to(out.dtype)
+
+
+def value_norm(c: dict) -> Norm:
+    """The norm of values made from the keys (``k_eq_v``, Gemma 4's): an RMSNorm
+    without a gain, at the eps of the layer's QK-norm, or 1e-6 without one."""
+    qk = c["qk_norm"]
+    eps = 1e-6 if qk is None else qk["eps"]
+    plain = {"type": "rmsnorm", "eps": eps, "affine": False, "bias": False}
+    return Norm(plain | {"zero_centered": False, "scale_input": False}, 1)
 
 
 def check_reader(c: dict, ports: list) -> None:
@@ -573,13 +647,18 @@ def check_reader(c: dict, ports: list) -> None:
         raise NotImplementedError("gqa: the v port of a layer that reads kv")
     if c["indexer"] and not reads(ports, "index"):
         raise NotImplementedError("gqa: an indexer in a layer that reads kv")
+    if c["exclusive"]:
+        raise NotImplementedError("gqa: exclusive (XSA) in a layer that reads kv")
 
 
 class Attention(SoftmaxAttention):
     """bux's ``gqa``, every setting: q, k and v projections (one each, or fused), a
     causal conv on k and v, QK-norm (of each head, or of all heads together under
-    ``qk_norm_all_heads``) then RoPE, and its ports: ``v`` (value residual), ``kv``
-    (cross-layer KV sharing) and ``index`` (an indexer's kept keys).
+    ``qk_norm_all_heads``) then RoPE, and its ports: ``ve`` (value embeddings, added
+    to the values first), ``v`` (value residual), ``kv`` (cross-layer KV sharing) and
+    ``index`` (an indexer's kept keys); differential attention, two query heads an
+    output head (`differential`); and XSA, each head's output less its part along
+    the query's own value (`exclusive`).
 
     A layer that reads ``kv`` attends to the writer's keys and values as the writer's
     cache layer keeps them, all of them while decoding, and keeps none of its own; it
@@ -594,26 +673,47 @@ class Attention(SoftmaxAttention):
         dk = c["head_dim"] or width // h
         dv = c["v_head_dim"] or dk
         super().__init__(c, width, site, h, dk, dv, c["bias"])
-        self.g, self.dk = g, dk
+        self.g, self.dk, self.hq = g, dk, 2 * h if c["differential"] else h
         self.reads_kv = reads(site.ports, "kv")
         if self.reads_kv:
             check_reader(c, site.ports)
         self._projections(c, width, h, g, dk, dv)
         qk, self.all_heads = c["qk_norm"], c["qk_norm_all_heads"]
-        q_width, k_width = (h * dk, g * dk) if self.all_heads else (dk, dk)
+        q_width, k_width = (self.hq * dk, g * dk) if self.all_heads else (dk, dk)
         self.q_norm = Norm(qk, q_width) if qk else None
         self.k_norm = Norm(qk, k_width) if qk and not self.reads_kv else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self.v_norm = value_norm(c) if c["k_eq_v"] and not self.reads_kv else None
         self.power_scale = c["power_scale"], c["power_scale_length"]
         self.value_residual = c["value_residual"]
         trained = reads(site.ports, "v") and self.value_residual != "fixed"
         shape = (2,) if self.value_residual == "learned" else ()
         self.v_mix = nn.Parameter(torch.full(shape, 0.5)) if trained else None
+        n = c["value_embed_gate"] if reads(site.ports, "ve") else None
+        self.ve_gate = nn.Linear(2 * n, g, bias=False) if n else None
         index = c["indexer"] and not reads(site.ports, "index")
         rotated = rotated_dims(dk, c["rope"])
         self.indexer = (
             Indexer(c["indexer"], width, width, c["rope"], rotated) if index else None
         )
+        self.exclusive = c["exclusive"]
+        learned = self.exclusive == "learned"
+        self.xsa_alpha = nn.Parameter(torch.zeros(h)) if learned else None
+        self._differential(c, width, site)
+
+    def _differential(self, c: dict, width: int, site: Site) -> None:
+        """Make differential attention's projection to each output head's weight
+        on its second map, and a sink for each query head.
+
+        Raises:
+            NotImplementedError: Differential attention reading the ``index`` port.
+        """
+        on = c["differential"]
+        if on and reads(site.ports, "index"):
+            raise NotImplementedError("gqa: differential with the index port")
+        self.lambda_proj = nn.Linear(width, self.h, bias=False) if on else None
+        if on and c["sinks"]:
+            self.sinks = nn.Parameter(torch.zeros(self.hq))
 
     def _projections(
         self, c: dict, width: int, h: int, g: int, dk: int, dv: int
@@ -624,16 +724,18 @@ class Attention(SoftmaxAttention):
         out_bias = bias if c["output_bias"] is None else c["output_bias"]
         fused = c["fused_qkv"] and not self.reads_kv
         split = not (fused or self.reads_kv)
+        own_v = 0 if c["k_eq_v"] else g * dv  # k_eq_v: values from the keys
+        hq = self.hq
         self.qkv = (
-            nn.Linear(width, h * dk + g * (dk + dv), bias=bias) if fused else None
+            nn.Linear(width, hq * dk + g * dk + own_v, bias=bias) if fused else None
         )
-        self.q = None if fused else nn.Linear(width, h * dk, bias=bias)
+        self.q = None if fused else nn.Linear(width, hq * dk, bias=bias)
         self.k = nn.Linear(width, g * dk, bias=bias) if split else None
-        self.v = nn.Linear(width, g * dv, bias=bias) if split else None
+        self.v = nn.Linear(width, own_v, bias=bias) if split and own_v else None
         self.o = nn.Linear(h * dv, width, bias=out_bias)
         size = None if self.reads_kv else c["kv_conv_size"]
         self.k_conv = CausalConv(g * dk, size, False) if size else None
-        self.v_conv = CausalConv(g * dv, size, False) if size else None
+        self.v_conv = CausalConv(own_v, size, False) if size and own_v else None
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         q, k, v = self._project(x)
@@ -643,29 +745,40 @@ class Attention(SoftmaxAttention):
         else:
             slot = ctx.cache_slot()
             k, v = self._keys_and_values(k, v, ctx, slot)
+            if reads(self.ports, "ve"):
+                v = self._add_value_embedding(x, v, self.read(ctx, "ve"))
             if reads(self.ports, "v"):
                 v = self._mix_values(v, self.read(ctx, "v"))
             self.write(ctx, "v", v)
             kv = self.cached(k, v, ctx, slot)
         self.write(ctx, "kv", kv)
         kept = self.kept(x, x, ctx, kv)
-        return self.output(x, self.attend(x, q, kv, ctx, kept))
+        out = self.attend(x, q, kv, ctx, kept)
+        if self.lambda_proj is not None:
+            out = differential(out, self.lambda_proj(x))
+        if self.exclusive:
+            strength = None if self.xsa_alpha is None else self.xsa_alpha.tanh()
+            out = exclusive(out, v, strength)
+        return self.output(x, out)
 
     def _project(self, x: torch.Tensor) -> list[Any]:
         """Project x to q, k and v, b t _; k and v are None if the layer reads kv."""
         if self.qkv is not None:
-            q, k = self.h * self.dk, self.g * self.dk
+            q, k = self.hq * self.dk, self.g * self.dk
+            if self.v_norm is not None:
+                q, k = self.qkv(x).split([q, k], -1)
+                return [q, k, k]
             return list(self.qkv(x).split([q, k, self.g * self.dv], -1))
         assert self.q is not None
-        kv = (
-            [None, None] if self.k is None or self.v is None else [self.k(x), self.v(x)]
-        )
-        return [self.q(x), *kv]
+        if self.k is None:
+            return [self.q(x), None, None]
+        k = self.k(x)
+        return [self.q(x), k, k if self.v is None else self.v(x)]
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """Split the projected queries into heads with QK-norm (`_split_normed`),
         then apply RoPE and the power scale."""
-        q = self._split_normed(q, self.h, self.q_norm)
+        q = self._split_normed(q, self.hq, self.q_norm)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
         power, length = self.power_scale
@@ -682,8 +795,12 @@ class Attention(SoftmaxAttention):
         the cache layer `slot`), split them into heads, the keys with QK-norm
         (`_split_normed`), then apply RoPE to the keys."""
         b, t, _ = k.shape
-        if self.k_conv is not None and self.v_conv is not None:
-            k, v = k + self.k_conv(k, ctx, slot, 0), v + self.v_conv(v, ctx, slot, 1)
+        if self.k_conv is not None:
+            k = k + self.k_conv(k, ctx, slot, 0)
+        if self.v_conv is not None:
+            v = v + self.v_conv(v, ctx, slot, 1)
+        if self.v_norm is not None:  # k_eq_v: each head's key, normalized
+            v = self.v_norm(k.view(b, t, self.g, self.dk))
         k, v = self._split_normed(k, self.g, self.k_norm), v.view(b, t, self.g, self.dv)
         return (k if self.rope is None else self.rope(k, ctx.positions)), v
 
@@ -698,6 +815,18 @@ class Attention(SoftmaxAttention):
             x, norm = norm(x), None
         x = x.view(b, t, heads, self.dk)
         return x if norm is None else norm(x)
+
+    def _add_value_embedding(
+        self, x: torch.Tensor, v: torch.Tensor, e: torch.Tensor
+    ) -> torch.Tensor:
+        """The values, b t g dv, plus the ve port's rows e, b t g dv flat, by a gate
+        per kv head: v + 2 sigmoid(W [x[:n], e[:n]]) e."""
+        rows = e.to(v.dtype).view(v.shape)
+        if self.ve_gate is None:
+            return v + rows
+        n = self.ve_gate.in_features // 2
+        gate = self.ve_gate(torch.cat([x[..., :n], e[..., :n].to(x.dtype)], -1))
+        return v + 2 * torch.sigmoid(gate)[..., None].to(v.dtype) * rows
 
     def _mix_values(self, v: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
         """The value residual a v + b v1: a = b = 0.5 fixed, both learned, or a learned

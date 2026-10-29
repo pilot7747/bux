@@ -192,6 +192,13 @@ of its curriculum's phases and of its evals. Under a
 residual algebra that widens the stream (`hc`, `mhc`, `gr`, `attnres`, `msar`), `embed` widens
 its output ([Residual algebras](../language/residual-algebras.md)).
 
+### `value_embed`
+
+`value_embed(features=n)` is a second table of `vocab_size` rows, `n` wide
+({bux}`value_embed`), whose rows the attention layers that read its `ve` port add to
+their values (modded-nanogpt). It leaves the stream as it is
+([Value embeddings](attention.md#value-embeddings)).
+
 ### `head`
 
 `head` maps the stream to logits over the vocabulary ({bux}`head`).
