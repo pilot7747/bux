@@ -64,10 +64,15 @@ model = embed ve(ve=@e) [dyt attn(v=@v1, ve=$e!)] [norm mix(v=$v1) dropout(rate=
         norm head
 """,
     f"d_model = {D}\nvocab_size = {V}\nresidual = hc()\nmodel = embed [rmsnorm] head",
+    # The document-local copy feature at its two sites, through its copy port.
+    (
+        f"d_model = {D}\nvocab_size = {V}\n"
+        "model = embed doc_copy(copy=@c) [rmsnorm] doc_copy(gain=1, copy=$c!) rmsnorm head"
+    ),
 ]
 
 
-@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc"])
+@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc", "doc_copy"])
 def test_no_parameter_of_another_model_is_weakly_typed(source):
     arch = compile(source)
     assert not weak(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))
