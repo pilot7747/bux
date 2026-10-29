@@ -330,7 +330,7 @@ def test_differential_attention_subtracts_each_pairs_second_map():
     assert wide.sinks is not None
     wide.sinks[...] = diff.sinks[...]
     x_, projected = wide._projections(x)
-    q, k, v = wide._heads(projected, None, Taps())
+    q, k, v = wide._heads(x_, projected, None, Taps())
     maps = wide._attend(x_, q, k, v, None)
     lam = jax.nn.sigmoid(diff.lambda_proj(x))[..., None]
     heads = maps[:, :, 0::2] - lam * maps[:, :, 1::2]

@@ -58,6 +58,9 @@ GQA_SETTINGS = {
     "mqa": "gqa(num_heads=4, num_kv_heads=1, rope=rope())",
     "no rope": "gqa(num_heads=4, num_kv_heads=2)",
     "window": GQA + ", sliding_window_size=4)",
+    "keys as values": GQA + ", k_eq_v=true, qk_norm=rmsnorm(eps=1e-5))",
+    "keys as values, the hybrid's global layer": "gqa(num_heads=4, num_kv_heads=2, k_eq_v=true,"
+    " qk_norm=rmsnorm, gated=true, kv_conv_size=3, fused_qkv=true)",
     "sinks": GQA + ", sinks=true)",
     "sinks, window": GQA + ", sinks=true, sliding_window_size=3)",
     "softcap": GQA + ", softcap=2.0)",
@@ -97,6 +100,8 @@ GQA_SETTINGS = {
     " gate_cross_head=true, exclusive=learned, output_norm=rmsnorm)",
     "differential": GQA + ", differential=true)",
     "paired": GQA + ", paired=true)",
+    "paired, values from the keys": "gqa(num_heads=4, num_kv_heads=2,"
+    " paired=true, k_eq_v=true, qk_norm=rmsnorm)",
     "paired, window, gated, qk norm, conv": GQA
     + ", paired=true, sliding_window_size=5,"
     " gated=true, qk_norm=rmsnorm, kv_conv_size=2)",
@@ -114,6 +119,8 @@ GQA_SETTINGS = {
     " extent=4))",
     "kv conv, window": GQA + ", kv_conv_size=3, sliding_window_size=4)",
     "dropouts": GQA + ", attention_dropout=0.1, output_dropout=0.1)",
+    "mimetic init": GQA + ", mimetic_vo=0.05, mimetic_noise=0.02, gated=true,"
+    " kv_conv_size=3)",
     "everything at once": "gqa(num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=12,"
     " bias=true, sinks=true, softcap=3.0, gated=true, output_norm=rmsnorm,"
     " qk_norm=rmsnorm, log_scale=0.3, log_scale_floor=3, relative_bias=relbias(rank=2,"
@@ -179,6 +186,11 @@ PORTS = {
         "attn(v=@v1)",
         "attn(v=$v1)",
     ),
+    "keys as values, value residual": wired(
+        "gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm, kv_conv_size=2)",
+        "attn(v=@v1)",
+        "attn(v=$v1!)",
+    ),
     "kv sharing": wired(
         GQA + ", qk_norm=rmsnorm)",
         "attn(kv=@kv)",
@@ -202,6 +214,23 @@ PORTS = {
         "attn(kv=@kv, kv_conv_size=3)",
         "attn(kv=$kv!, sliding_window_size=3)",
     ),
+}
+
+
+#: The hybrid's global layer, beside value embeddings of its 2 kv heads of 16.
+VALUE_EMBED = (
+    HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=2)\nve = value_embed(features=32)\n"
+    + "block(mixer) = [rmsnorm mixer] [rmsnorm ffn]\n"
+)
+PORTS |= {
+    "value embeddings": VALUE_EMBED
+    + "model = embed ve(ve=@t) block(attn(v=@v1, ve=$t))"
+    " [rmsnorm ve(ve=@u) attn(v=$v1, ve=$u!)] [rmsnorm ffn] rmsnorm head",
+    "value embeddings, one table, no gate, hc": "residual = hc(expansion=2)\n"
+    + VALUE_EMBED
+    + "model = embed ve(ve=@t) block(attn(ve=$t, value_embed_gate=none))"
+    " block(attn(ve=$t!, value_embed_gate=none)) rmsnorm head",
 }
 
 

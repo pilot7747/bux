@@ -116,9 +116,23 @@ def cache_layers(p: Plan) -> list[tuple[str, dict]]:
     """Return the kind of each cache layer, in the order the calls that keep state run
     as the model generates (`Plan.generation`), and what its config sets for it alone
     (`bux.export.codegen.cache_layer`), with settings of `_CACHE_DEFAULTS` (a sliding
-    window, conv states)."""
-    layers = (codegen.cache_layer(call.layer) for call in p.generation())
-    return [layer for layer in layers if layer is not None]
+    window, conv states); an msar branch's conv state among them, where it reads."""
+    stateful = [
+        (call.trail, codegen.cache_layer(call.layer)) for call in p.generation()
+    ]
+    stateful += [(b.trail, ("conv", {})) for b in _stateful_branches(p)]
+    # A branch reads before the calls inside it, whose trails its own begins.
+    return [layer for _, layer in sorted(stateful, key=lambda s: s[0]) if layer]
+
+
+def _stateful_branches(p: Plan) -> list:
+    """Return the residual algebra's branches that keep state as the model generates:
+    msar's, whose convs keep the last inputs of the source each one expands."""
+    residual = p.arch.residual
+    if residual is None or residual.type != "msar":
+        return []
+    stop = p.stop()
+    return [b for b in p.branches if stop is None or b.trail[: len(stop)] <= stop]
 
 
 def _per_layer(layers: list[tuple[str, dict]]) -> dict:

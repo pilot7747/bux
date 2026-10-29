@@ -25,7 +25,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal
 
+import jax
+import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Key
 
 from bux import config as cfg
 from bux.train.registry import Registry
@@ -132,3 +135,57 @@ def _(c: cfg.FanInitConfig, matrix: Matrix) -> nnx.Initializer:
 def _(c: cfg.ZerosInitConfig, matrix: Matrix) -> nnx.Initializer:
     """Start at 0."""
     return nnx.initializers.zeros
+
+
+def mimetic_vo(
+    width: int,
+    heads: int,
+    kv_heads: int,
+    v_head_dim: int,
+    beta: float,
+    noise: float,
+    key: Key[Array, ""],
+) -> tuple[Float[Array, "d gv"], Float[Array, "hv d"]]:
+    """Return the value and output kernels of a mimetic init (modded-nanogpt's
+    mimetic V-O init, after Trockman & Kolter, 2023).
+
+    Value head j reads the stream's channels ``j dv`` to ``(j + 1) dv``, times
+    ``sqrt(beta)``, and each query head of its group writes its output back onto
+    them, times ``-sqrt(beta) / group``, a group being the ``heads / kv_heads`` query
+    heads that share it. A head that attends to itself alone then subtracts ``beta /
+    group`` of those channels, and the layer ``beta`` of each: with as many kv heads
+    as heads tiling the width, its value-output map is ``-beta I``, the source's.
+    Both kernels then take noise of std `noise`, in place of their own draws.
+
+    Args:
+        width: The stream's width d, which v reads and o writes.
+        heads: The query heads h.
+        kv_heads: The value heads g, each read by h / g query heads.
+        v_head_dim: The width of a value head dv.
+        beta: The scale of the value-output map.
+        noise: The std of the noise on both kernels.
+        key: Draws the noise.
+
+    Returns:
+        v's kernel, (d, g dv), and o's, (h dv, d), as gqa's projections hold them.
+
+    Raises:
+        ValueError: If the value heads together are wider than the stream.
+    """
+    if kv_heads * v_head_dim > width:
+        raise ValueError(
+            f"mimetic_vo maps {kv_heads} value heads of {v_head_dim} onto the stream's "
+            f"channels: {kv_heads * v_head_dim} of them do not fit in a width of {width}"
+        )
+    values, group = kv_heads * v_head_dim, heads // kv_heads
+    root = beta**0.5
+    v = root * jnp.eye(width, values)
+    # Query head i's dim r goes to the channel of its value head's dim r.
+    read = jnp.arange(heads * v_head_dim)
+    channel = (read // v_head_dim) // group * v_head_dim + read % v_head_dim
+    o = -root / group * jax.nn.one_hot(channel, width)
+    a, b = jax.random.split(key)
+    return (
+        v + noise * jax.random.normal(a, v.shape),
+        o + noise * jax.random.normal(b, o.shape),
+    )

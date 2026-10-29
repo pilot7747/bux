@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .common import Ctx, Norm, Site, norm_config
+from .conv import CausalConv, history, without_padding
 
 #: In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 EPS = 1e-6
@@ -33,7 +34,7 @@ def widening(residual: dict | None) -> int | None:
         return None
     if residual["type"] in ("hc", "mhc", "gr"):
         return residual["expansion"]
-    return 1 if residual["type"] == "attnres" else None
+    return 1 if residual["type"] in ("attnres", "msar") else None
 
 
 def widen(x: torch.Tensor, n: int) -> torch.Tensor:
@@ -256,6 +257,115 @@ class AttentionResidual(nn.Module):
         return torch.cat([kept, y[:, :, None]], 2)
 
 
+def msar_layout(s: int, block: int, e: int) -> tuple[int, int] | None:
+    """Return the finished blocks and the outputs of the block under way of an msar
+    state of s entries, as bux's ``_layout``: the embedding and its e expansions,
+    each finished block's outputs and expansions, the block under way's outputs, and
+    the head's read last; None for a fresh state, the embedding alone."""
+    if s == 1:
+        return None
+    rest, width = s - 2 - e, block + e
+    k = (rest - 1) % width + 1
+    if rest < 1 or k > block:
+        raise ValueError(f"msar: a state of {s} entries is none of blocks of {block}")
+    return (rest - k) // width, k
+
+
+def msar_sources(x: torch.Tensor, block: int, e: int) -> tuple[torch.Tensor, Any]:
+    """Return the expanded sources of an msar state, b t n m d, the newest source to
+    expand, b t d, and whether it is a finished one, as bux's ``_msar_sources``."""
+    b, t, s, d = x.shape
+    at = msar_layout(s, block, e)
+    if at is None:
+        return x.new_zeros(b, t, 0, e + 1, d), (x[:, :, 0], True)
+    blocks, k = at
+    width, m = block + e, e + 1
+    streams = [x[:, :, :m]]
+    for j in range(blocks):
+        first = m + j * width
+        total = x[:, :, first : first + block].sum(2, keepdim=True)
+        streams.append(torch.cat([total, x[:, :, first + block : first + width]], 2))
+    newest = m + blocks * width
+    partial = x[:, :, newest : newest + k].sum(2)
+    return torch.stack(streams, 2), (partial, k == block)
+
+
+class MultiStreamAttentionResidual(nn.Module):
+    """bux's ``msar``: each source expands into its streams, itself and its causal
+    convs over the tokens, by the bank of the branch that reads it first; f reads a
+    softmax over depth in each stream, mixed by ``sigmoid(a rmsnorm(Z) W + b)``. The
+    state is bux's: the sources raw, the finished ones' expansions, and the head's
+    read, ``h + f(h)``, last. The convs keep the newest source's last inputs in the
+    branch's cache slot while decoding. Without a body, it is the head's read."""
+
+    bux_residuals = ("msar",)
+
+    def __init__(self, c: dict, d: int, body: bool = True):
+        super().__init__()
+        self.block, self.eps = c["block_size"] or 1, c["norm_eps"]
+        self.sizes, self.body = list(c["kernel_sizes"]), body
+        if not body:
+            return
+        m = 1 + len(self.sizes)
+        self.convs = nn.ModuleList(CausalConv(d, k, False) for k in self.sizes)
+        self.query = nn.Parameter(torch.zeros(m, d))
+        self.proj = nn.Parameter(torch.zeros(m * d, m))
+        self.scale = nn.Parameter(torch.tensor(0.01))
+        self.bias = nn.Parameter(torch.zeros(m))
+
+    def _expand(self, v: torch.Tensor, ctx: Ctx, slot: int) -> torch.Tensor:
+        """Return the source v's streams, b t m d: itself, then its convs, which
+        read the inputs before it from the cache slot while decoding."""
+        keep, t = max(self.sizes, default=1) - 1, v.shape[1]
+        xs = history(without_padding(v, ctx), ctx, slot, 0, keep)
+        streams = [v]
+        for conv, k in zip(self.convs, self.sizes, strict=True):
+            assert isinstance(conv, CausalConv)
+            start = keep - k + 1  # where its first tap reads, of the kept inputs
+            y = torch.zeros_like(v)
+            for i in range(k):
+                y = y + conv.weight[i] * xs[:, start + i :][:, :t]
+            streams.append(y)
+        return torch.stack(streams, 2)
+
+    def _mix(self, sources: torch.Tensor) -> torch.Tensor:
+        """Return what f reads: each stream's softmax over depth, mixed."""
+        b, t, _, m, d = sources.shape
+        keys = rms_normalized(sources, self.eps)
+        scores = torch.einsum("btnmd,md->btnm", keys, self.query)
+        weights = scores.float().softmax(2).to(sources.dtype)
+        z = torch.einsum("btnm,btnmd->btmd", weights, sources)
+        flat = z.reshape(b, t, m * d)
+        rms = torch.rsqrt(flat.float().square().mean(-1, keepdim=True) + self.eps)
+        logits = (flat @ self.proj).float() * rms * self.scale + self.bias
+        return torch.einsum("btm,btmd->btd", torch.sigmoid(logits).to(z.dtype), z)
+
+    def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """Return what f reads of the state x, and what `write_back` needs; the
+        head's read, without a body."""
+        if not self.body:
+            return (x[:, :, 0] if x.shape[2] == 1 else x[:, :, -1]), None
+        slot = ctx.cache_slot()
+        done, (newest, finished) = msar_sources(x, self.block, len(self.sizes))
+        expanded = self._expand(newest, ctx, slot)
+        h = self._mix(torch.cat([done, expanded[:, :, None]], 2))
+        kept = x if x.shape[2] == 1 else x[:, :, :-1]
+        return h, (kept, expanded[:, :, 1:] if finished else None, h)
+
+    def write_back(self, kept: Any, y: torch.Tensor) -> torch.Tensor:
+        """Return the state after the branch: the newest source's expansions if it
+        is finished, f's output, and the head's read, ``h + f(h)``."""
+        state, expansions, h = kept
+        parts = [state] if expansions is None else [state, expansions]
+        return torch.cat([*parts, y[:, :, None], (h + y)[:, :, None]], 2)
+
+
+def rms_normalized(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """x over its RMS, without a gain, computed in float32, in x's dtype."""
+    y = x.float()
+    return (y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)).to(x.dtype)
+
+
 class ResidualGate(nn.Module):
     """bux's ``vpgate``: x becomes ``a x + b f(x)`` per channel, for
     ``b = sigmoid(g / temperature)`` and ``a = sqrt(max(1 - b^2, eps))``."""
@@ -288,6 +398,7 @@ ALGEBRAS: dict[str, type] = {
         ManifoldHyperConnections,
         GatedResidual,
         AttentionResidual,
+        MultiStreamAttentionResidual,
         ResidualGate,
     )
     for kind in cls.bux_residuals

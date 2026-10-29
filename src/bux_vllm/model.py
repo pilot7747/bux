@@ -43,6 +43,7 @@ from .plan import (
     children,
     is_call,
     live,
+    msar_packs,
     plan,
     ports,
 )
@@ -179,7 +180,10 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":
             embedding = layer
-    return layers | build_branches(config.bux, p, len(calls))
+    branches = build_branches(config.bux, p, len(calls))
+    slot = sum(map(len, states.values()))  # msar's packs come after every state
+    _keep_histories(vllm_config, config.bux, p, branches, slot)
+    return layers | branches
 
 
 def build_branches(arch: Node, p: Plan, calls: int) -> dict[str, nn.Module]:
@@ -198,6 +202,34 @@ def build_branches(arch: Node, p: Plan, calls: int) -> dict[str, nn.Module]:
         else:
             out[b.path] = Unused()
     return out
+
+
+def _keep_histories(
+    vllm_config: VllmConfig, arch: Node, p: Plan, branches: dict, slot: int
+) -> None:
+    """Make msar's packs of its convs' states (`bux_vllm.msar`), named after every
+    other state, and give each branch the place of each of its calls' in them, in
+    the order they run; nothing without msar."""
+    packs = msar_packs(arch, p)
+    if not packs:
+        return
+    from . import msar  # vLLM's ops, on a GPU alone
+
+    d, size = arch["d_model"], max(arch["residual"]["kernel_sizes"], default=1)
+    made = [
+        msar.Histories(
+            n * d, size, vllm_config, cache_name(slot + i, f"model.msar.{i}")
+        )
+        for i, n in enumerate(packs)
+    ]
+    live_calls = len(live(p.calls))
+    places = ((made[j // packs[0]], j % packs[0] * d) for j in range(sum(packs)))
+    for b in (b for b in p.branches if b.calls < live_calls):
+        branch = branches[b.path]
+        branch.path = b.path
+        branch.histories.append(msar.History(*next(places)))
+    # vLLM finds them by their names (`Histories`); the first branch holds them.
+    branches[p.branches[0].path].packs = nn.ModuleList(made)
 
 
 def _class(call: Call) -> type[Layer]:
