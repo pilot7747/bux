@@ -154,6 +154,8 @@ def _convolve(
     kept, reading the kept ones before they change."""
     start, slot, init, seq = _steps(meta, v.device)
     t, dims = seq.shape[0], v.shape[1]
+    assert v.is_contiguous() and weight.is_contiguous() and out.is_contiguous()
+    assert states.shape[1] == dims and weight.shape[2] == dims, (states.shape, dims)
     r, k = weight.shape[:2]
     s0, s1, s2 = states.stride()
     if t:
@@ -175,7 +177,8 @@ def _kept_or_token(v_ptr, st_ptr, row, src, slot, init, ch, mask, dims, s0, s1, 
     `row` (src >= 0), else the sequence's kept value, if it has any."""
     own = src >= 0
     x = tl.load(v_ptr + row * dims + ch, mask=mask & own, other=0.0).to(tl.float32)
-    at = st_ptr + slot * s0 + ch * s1 + (K - 1 + src) * s2
+    # A pack's slot is pages apart: past 2^31 elements at a width of thousands.
+    at = st_ptr + slot * s0 + ch * s1 + (K - 1 + src).to(tl.int64) * s2
     kept = tl.load(at, mask=mask & (src < 0) & init, other=0.0).to(tl.float32)
     return tl.where(own, x, kept)
 
@@ -189,9 +192,10 @@ def _conv_kernel(
     tok, blk = tl.program_id(0), tl.program_id(1)
     ch = blk * BLOCK + tl.arange(0, BLOCK)
     mask = ch < dims
+    tok = tok.to(tl.int64)
     s = tl.load(seq_ptr + tok)
     pos = tok - tl.load(start_ptr + s)
-    slot, init = tl.load(slot_ptr + s), tl.load(init_ptr + s)
+    slot, init = tl.load(slot_ptr + s).to(tl.int64), tl.load(init_ptr + s)
     for r in tl.static_range(R):
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         for j in tl.static_range(K):  # tap j reads the value K - 1 - j before
@@ -215,8 +219,9 @@ def _keep_kernel(
     s, blk = tl.program_id(0), tl.program_id(1)
     ch = blk * BLOCK + tl.arange(0, BLOCK)
     mask = ch < dims
-    first, end = tl.load(start_ptr + s), tl.load(start_ptr + s + 1)
-    slot, init = tl.load(slot_ptr + s), tl.load(init_ptr + s)
+    first = tl.load(start_ptr + s).to(tl.int64)
+    end = tl.load(start_ptr + s + 1).to(tl.int64)
+    slot, init = tl.load(slot_ptr + s).to(tl.int64), tl.load(init_ptr + s)
     n = end - first
     for j in tl.static_range(K - 1):
         c = n - (K - 1) + j
