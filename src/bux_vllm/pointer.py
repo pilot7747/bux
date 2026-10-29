@@ -431,6 +431,66 @@ def _pointer_kernel(
         tl.atomic_add(TOTAL + r, total, sem="relaxed")
 
 
+def mixture(
+    logits: torch.Tensor,
+    p_copy: torch.Tensor,
+    a_sink: torch.Tensor,
+    total: torch.Tensor,
+    copy: int,
+) -> torch.Tensor:
+    """`bux_vllm.copying.mixed` in one Triton launch, a program a row, in the
+    logits' dtype: the head's log-softmax over the rows but `copy` and the gate in
+    a first pass over the row, the mixture in a second. Its dozen PyTorch ops
+    cost vLLM's sampler about 7 times the head's log-softmax alone, each a launch
+    outside graphs."""
+    logits = logits.contiguous()
+    rows, vocab = logits.shape
+    out = torch.empty_like(logits)
+    if rows:
+        _mixture_kernel[(rows,)](
+            logits, p_copy, a_sink, total, out, p_copy.stride(0), vocab, copy, BV=2048
+        )
+    return out
+
+
+@triton.jit
+def _logaddexp(a, b):
+    """log(e^a + e^b), -inf where both are."""
+    top = tl.maximum(a, b)
+    top = tl.where(top == -float("inf"), 0.0, top)
+    return top + tl.log(tl.exp(a - top) + tl.exp(b - top))
+
+
+@triton.jit
+def _mixture_kernel(
+    LOGITS, P_COPY, A_SINK, TOTAL, OUT, stride_copy, vocab, copy, BV: tl.constexpr
+):
+    """A row's mixture: ``log(p_lm (1 - a + a a_sink) + a p_copy)``, its masses over
+    `TOTAL`, -inf at <copy>."""
+    r = tl.program_id(0).to(tl.int64)
+    row, out, masses = LOGITS + r * vocab, OUT + r * vocab, P_COPY + r * stride_copy
+    m = tl.full([], -float("inf"), tl.float32)
+    total = tl.full([], 0.0, tl.float32)
+    for start in range(0, vocab, BV):  # the log-softmax over every row but <copy>
+        v = start + tl.arange(0, BV)
+        z = tl.load(row + v, mask=(v < vocab) & (v != copy), other=-float("inf"))
+        z = z.to(tl.float32)
+        top = tl.maximum(m, tl.max(z, 0))
+        total = total * tl.exp(m - top) + tl.sum(tl.exp(z - top), 0)
+        m = top
+    lse_lm = m + tl.log(total)
+    gate = tl.load(row + copy).to(tl.float32)
+    lse = _logaddexp(lse_lm, gate)
+    log_gate = gate - lse - tl.log(tl.load(TOTAL + r))
+    kept = _logaddexp(lse_lm - lse, log_gate + tl.log(tl.load(A_SINK + r)))
+    for start in range(0, vocab, BV):
+        v = start + tl.arange(0, BV)
+        z = tl.load(row + v, mask=v < vocab, other=0.0).to(tl.float32)
+        p = tl.load(masses + v, mask=v < vocab, other=0.0)
+        y = _logaddexp(z - lse_lm + kept, log_gate + tl.log(p))
+        tl.store(out + v, tl.where(v == copy, -float("inf"), y), mask=v < vocab)
+
+
 def _fake(
     x: torch.Tensor,
     q: torch.Tensor,

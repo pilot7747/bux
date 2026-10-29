@@ -167,8 +167,9 @@ class Pointer(Layer):
 
     def __init__(self, c: dict, width: int, vocab: int, site: Site):
         super().__init__()
-        from .pointer import PointerCache
+        from .pointer import PointerCache, mixture
 
+        self.mixture = mixture  # the mixture's kernel
         if site.vllm_config.num_speculative_tokens:
             raise NotImplementedError("head: a copy pointer with speculative decoding")
         dim, self.dim = c["dim"], c["dim"]
@@ -217,7 +218,8 @@ class Pointer(Layer):
         each request's sampled row, which the forward pointed for; or, for prompt
         logprobs, rows of the step's head input, which it points for now
         (`bux_vllm.copying.prompted`), or of a full graph's step, whose every token
-        is its request's last (`bux_vllm.copying.Prompts`)."""
+        is its request's last (`bux_vllm.copying.Prompts`); mixed in one launch
+        (`bux_vllm.pointer.mixture`)."""
         stash, n = self.cache.stash, logits.shape[0]
         fresh = stash is not None and stash.sampled == 1
         if fresh and (first := stash.rows.at(hidden)) is not None:
@@ -228,8 +230,9 @@ class Pointer(Layer):
             p_copy, a_sink = copying.prompted(
                 q, sink, rows, stash.steps, first, vocab, fp8, window
             )
-            out = copying.mixed(logits, p_copy, a_sink, self.copy)
-            return out.to(logits.dtype)
+            return self.mixture(
+                logits, p_copy, a_sink, torch.ones_like(a_sink), self.copy
+            )
         at = _row_in(self.cache.graphed, hidden)
         if at is None and stash is not None:  # the rows vLLM samples, gathered
             stash.sampled += 1
@@ -237,7 +240,7 @@ class Pointer(Layer):
         p_copy, a_sink, total = copying.rows_of(
             self.p_copy[at:], self.a_sink[at:], self.total[at:], n
         )
-        return copying.mixed(logits, p_copy, a_sink, self.copy, total).to(logits.dtype)
+        return self.mixture(logits, p_copy, a_sink, total, self.copy)
 
 
 def _row_in(graphs: list[copying.Rows], hidden: torch.Tensor) -> int | None:

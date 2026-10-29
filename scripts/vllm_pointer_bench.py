@@ -20,8 +20,9 @@ bfloat16, the blocks shuffled), it prints the microseconds of:
   one program a request as the kernel's;
 - **scatter**: its adds into the vocabulary's rows alone, one a position, with
   Triton's default ordering (acq_rel) and relaxed;
-- **mixture**: the logits' mixture (`bux_vllm.copying.mixed`), outside graphs as
-  vLLM runs it, against the head's log-softmax alone;
+- **mixture**: the logits' mixture, outside graphs as vLLM runs it: the plugin's
+  kernel (`bux_vllm.pointer.mixture`) and PyTorch's ops (`bux_vllm.copying.mixed`),
+  against the head's log-softmax alone;
 - **read**: the bytes of the keys read whole, the bandwidth's floor, and vLLM's
   FlashAttention decoding over as many bytes (a kv head of 64, keys and values).
 
@@ -222,6 +223,13 @@ def bench(requests: int, keys: int, fp8: bool) -> None:
     s, r = setup(requests, keys, fp8, VOCAB), setup(requests, keys, fp8, REPEATS)
     print(f"{requests} requests x {keys} keys, {'FP8' if fp8 else 'bf16'}")
     report("step", timed(lambda: step(s)), s.key_bytes)
+    kernels(s, r)
+    mixtures(s)
+    reads(s)
+
+
+def kernels(s: SimpleNamespace, r: SimpleNamespace) -> None:
+    """The kernel's times, and of its reads and adds alone; `r` of fewer tokens."""
     report("kernel", timed(lambda: kernel(s)), s.key_bytes)
     report(f"kernel, {REPEATS} tokens", timed(lambda: kernel(r)), r.key_bytes)
     past = 2 * (copying.TOP + copying.FLOOR) / (2 * copying.KEY_NORM * DIM**0.5)
@@ -230,19 +238,34 @@ def bench(requests: int, keys: int, fp8: bool) -> None:
     w = SimpleNamespace(**vars(s))
     w.cache = SimpleNamespace(**vars(s.cache) | {"window": WINDOW})
     report(f"kernel, a window of {WINDOW}", timed(lambda: kernel(w)))
-    out = torch.zeros(requests, device="cuda")
+    out = torch.zeros(s.requests, device="cuda")
     report("keys: one pass, scored", timed(lambda: keys_only(s, out)), s.key_bytes)
-    report(
-        "scatter: acq_rel adds, as the kernel's were", timed(lambda: scatter(s, False))
-    )
+    acq_rel = timed(lambda: scatter(s, False))
+    report("scatter: acq_rel adds, as the kernel's were", acq_rel)
     report("scatter: relaxed adds", timed(lambda: scatter(s, True)))
     report(f"scatter: relaxed adds, {REPEATS} tokens", timed(lambda: scatter(r, True)))
-    mix = timed(
-        lambda: copying.mixed(s.logits, s.p_copy, s.a_sink, VOCAB - 1), graph=False
-    )
-    report("mixture, eager", mix)
+
+
+def mixtures(s: SimpleNamespace) -> None:
+    """The mixture's times, by PyTorch's ops and by the kernel, and their agreement."""
+    args = s.p_copy, s.a_sink, s.total
+    ops = timed(lambda: copying.mixed(s.logits, *args[:2], VOCAB - 1), graph=False)
+    report("mixture, PyTorch's ops, eager", ops)
+    fused = timed(lambda: pointer.mixture(s.logits, *args, VOCAB - 1), graph=False)
+    report("mixture, the plugin's kernel, eager", fused)
     soft = timed(lambda: s.logits.float().log_softmax(-1), graph=False)
     report("head's log-softmax alone, eager", soft)
+    logits = s.logits.float()  # both in float32, the check's
+    want = copying.mixed(logits, *args[:2], VOCAB - 1, s.total)
+    got = pointer.mixture(logits, *args, VOCAB - 1)
+    finite = torch.isfinite(want)
+    agree = "ok" if torch.equal(torch.isfinite(got), finite) else "DIFFERS"
+    off = (got - want)[finite].abs().max().item()
+    print(f"  {'mixture, kernel against PyTorch':44s} {off:9.1e}    {agree}")
+
+
+def reads(s: SimpleNamespace) -> None:
+    """The times of reading the keys' bytes whole, and of an attention over as many."""
     whole = s.cache.rows.view(torch.uint8)
     report("read: the cache's bytes whole", timed(whole.amax), whole.numel())
     try:
