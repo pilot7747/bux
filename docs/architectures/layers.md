@@ -201,6 +201,7 @@ its output ([Residual algebras](../language/residual-algebras.md)).
 | `tied` | `false` | reuse the first embedding's table: $x E^\top$ | GPT-2, Gemma |
 | `bias` | `false` | a bias per token | GPT-J |
 | `softcap` | `none` | $c \tanh(\ell / c)$ on the logits | Gemma 2, modded-nanogpt |
+| `pointer` | `none` | a copy pointer, whose mixture with the softmax is the next token's distribution ([below](#copy-pointer)) | modded-nanogpt's CPLM |
 
 The logits are computed in the stream's dtype with float32 accumulation, then the
 bias and the soft-cap are applied. By default the loss takes the logits a chunk of
@@ -222,6 +223,50 @@ logits = (_ * logit_scale) out
 
 Under `muon`, the embedding and the head train by its `adam`, never orthogonalized
 ([Optimizers](../training/optimizers.md)).
+
+(copy-pointer)=
+#### Copy pointer
+
+`head(pointer=copy_pointer())` makes the next token's distribution a mixture of the
+head's softmax and a pointer over the earlier tokens of the document
+(modded-nanogpt's CPLM). The model copies a token it has seen by pointing at it:
+
+$$
+p(y) = p_\text{lm}(y)\,\bigl(1 - a\,(1 - a_\text{sink})\bigr) + a\, p_\text{copy}(y).
+$$
+
+- **The gate $a$:** the softmax's mass on the `<copy>` row of the vocabulary, the
+  pointer's `token`, by default the last row. It is a row no token is, a padding
+  row: a target never equals it. $p_\text{lm}$ is the softmax over the other rows.
+- **The pointer:** one head of `dim` (128) on the head's input. Each position
+  attends to the positions strictly before it in its own document, and to a
+  learned sink, by RMS-normed queries times a learned gain and RMS-normed keys,
+  scaled by $1/\sqrt{\text{dim}}$. $p_\text{copy}(y)$ is its attention on the
+  positions whose token is $y$; $a_\text{sink}$, the sink's, goes back to
+  $p_\text{lm}$. `window` caps how far back it looks; `none`, the default, is the
+  whole document.
+- **The loss and the evals** take the mixture's negative log-likelihood of the
+  true next token, in log space: `loss`, an eval's `loss`, and its bits per byte,
+  which are then the mixture's. Where $a$ is 0 it is the softmax's cross-entropy
+  without the `<copy>` row, to the bit. The z-loss is of the whole softmax.
+- **One head:** the pass's first head takes the pointer. A head after it, such as
+  an MTP module's that shares the head, keeps its softmax, the `<copy>` row a
+  class it never predicts, as modded-nanogpt's.
+
+```bux
+shared out = head(pointer=copy_pointer())
+model = embed block^layers norm @h out $h nextn(norm=norm) block norm out
+```
+
+The pointer's scores are float32, a chunk of 512 queries at a time against every
+key of the row, made again in the backward: at rows of 16k they cost about one
+attention head of 128 over the whole row. Positions split over `seq` are not
+taken, and neither a transformers nor a vLLM export takes the pointer yet.
+
+modded-nanogpt's pointer looks back over two blocks of 2048 tokens in training and
+8192 in evals, its kernel's band; bux's sees the whole document unless `window`
+says otherwise. Its loss floors the probability at $10^{-9}$; bux's is exact in
+log space. It trains its MTP terms on the softmax over every row, as bux does.
 
 ### `nextn`: multi-token prediction
 

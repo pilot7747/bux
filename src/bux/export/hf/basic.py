@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .common import ACTIVATIONS, Ctx, Norm, Site
+from .common import ACTIVATIONS, Ctx, Norm, Site, unsupported
 
 
 class TokenEmbedding(nn.Module):
@@ -45,6 +45,7 @@ class Head(nn.Module):
 
     def __init__(self, c: dict, width: Any, site: Site):
         super().__init__()
+        unsupported(c, "pointer")  # a mixture transformers' generate does not sample
         vocab = site.config.vocab_size
         self.tied, self.softcap = c["tied"], c["softcap"]
         self.proj = None if self.tied else nn.Linear(width, vocab, bias=c["bias"])

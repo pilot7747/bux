@@ -26,7 +26,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
-from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
+from .common import ACTIVATIONS, Ctx, Layer, Norm, Site, unsupported
 
 
 class Embedding(Layer):
@@ -78,6 +78,7 @@ class Head(Layer):
 
     def __init__(self, c: dict, width: Any, site: Site):
         super().__init__()
+        unsupported(c, "pointer")
         vocab = site.config.vocab_size
         self.tied = c["tied"]
         lm_head = ParallelLMHead(

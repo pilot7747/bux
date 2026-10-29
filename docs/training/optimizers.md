@@ -343,7 +343,9 @@ an error, as a norm of 0 would leave the optimizer no gradient. The log's
 loss = loss(z=1e-4, mtp=0.3)
 ```
 
-The objective is the cross-entropy of the model's first head, plus these terms:
+The objective is the cross-entropy of the model's first head, plus these terms. A
+first head with a copy pointer takes its mixture's negative log-likelihood instead,
+and so do its evals ([Copy pointer](../architectures/layers.md#copy-pointer)):
 
 | Field | Default | The term |
 |-------|---------|----------|

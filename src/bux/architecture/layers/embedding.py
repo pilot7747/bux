@@ -9,6 +9,7 @@ from jaxtyping import Array, Float, Int
 from bux import config as cfg
 from bux import initializers, parallel
 from bux.architecture.common.sharding import linear, projection
+from bux.architecture.copy import CopyPointer
 from bux.architecture.layers.norm import Norm
 from bux.architecture.logits import HeadOutput, Projection
 from bux.architecture.registry import Context, Taps, positions, register
@@ -126,7 +127,9 @@ class Head(nnx.Module):
     softcap. The head does not make them: it leaves its input and its projection in
     the taps (`~bux.architecture.logits.HeadOutput`), from which the objective makes
     the logits a chunk at a time, and passes the stream on. Muon leaves its matrix to
-    the other optimizer (``no_muon``).
+    the other optimizer (``no_muon``). With ``pointer``, the pass's first head also
+    leaves its copy pointer's view of the stream (`~bux.architecture.copy`), whose
+    mixture the loss and the evals then take.
 
     Args:
         config: Its settings (`bux.config.LMHeadConfig`).
@@ -158,6 +161,10 @@ class Head(nnx.Module):
             nnx.Param(jnp.zeros(vocab), names=("vocab",)) if tied and bias else None
         )
         self.softcap = config.softcap
+        pointer = config.pointer
+        self.pointer = (
+            None if pointer is None else CopyPointer(pointer, width, vocab, ctx.rngs)
+        )
 
     def projection(self) -> Projection:
         """Return the map from the stream to logits, of the weights as they are now."""
@@ -170,8 +177,11 @@ class Head(nnx.Module):
         return Projection(kernel, None if bias is None else bias[...], cap)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        """Leave x and the projection in ``taps.heads``, and return x."""
-        taps.heads.append(HeadOutput(x, self.projection()))
+        """Leave x and the projection in ``taps.heads``, and return x: with a copy
+        pointer, its view of x too, at the pass's first head alone."""
+        first = self.pointer is not None and not taps.heads
+        pointer = self.pointer(x, taps) if first and self.pointer is not None else None
+        taps.heads.append(HeadOutput(x, self.projection(), pointer))
         return x
 
 

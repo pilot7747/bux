@@ -328,6 +328,7 @@ _NEWER_LAYER_FIELDS = {
         "bias_momentum": 0.5,
     },
     "mamba2": {"num_heads": None},
+    "head": {"pointer": None},
     "gqa": {
         "gate_head_bias": False,
         "power_scale": None,

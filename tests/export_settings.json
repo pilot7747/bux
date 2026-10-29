@@ -275,6 +275,7 @@
  ],
  "LMHeadConfig": [
   "bias",
+  "pointer",
   "softcap",
   "tied",
   "type"
@@ -328,6 +329,12 @@
   "extent",
   "rank",
   "type"
+ ],
+ "CopyPointerConfig": [
+  "dim",
+  "token",
+  "type",
+  "window"
  ],
  "SparseIndexerConfig": [
   "block_size",
