@@ -384,6 +384,12 @@
   "norm_eps",
   "type"
  ],
+ "MultiStreamAttentionResidualConfig": [
+  "block_size",
+  "kernel_sizes",
+  "norm_eps",
+  "type"
+ ],
  "ResidualGateConfig": [
   "eps",
   "temperature",

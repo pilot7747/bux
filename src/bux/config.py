@@ -1197,7 +1197,8 @@ for _init in (InitConfig, NormalInitConfig, FanInitConfig, ZerosInitConfig):
 # Residual algebras: what a residual branch `[f]` does instead of `x + f(x)`, set for
 # the whole model by the top-level setting `residual`, as `residual = mhc()`. Only
 # branches outside any other change; one inside another stays `x + f(x)`. `hc`,
-# `mhc`, `gr` and `attnres` widen the stream, and `merge` reads it back into one.
+# `mhc`, `gr`, `attnres` and `msar` widen the stream, and `merge` reads it back into
+# one.
 
 
 class HyperConnectionsConfig(Config):
@@ -1257,6 +1258,29 @@ class AttentionResidualConfig(Config):
     norm_eps: float = 1e-6  # Epsilon of the keys' RMS norm (Kimi K3: 1e-5).
 
 
+class MultiStreamAttentionResidualConfig(Config):
+    """Multi-stream attention residuals (Qin et al., 2026, MSAR): a residual algebra,
+    ``residual = msar(block_size=8)``.
+
+    attnres in several streams: each source (the embedding, a block's sum of branch
+    outputs, the block under way) becomes one stream as it is and one more for each
+    of `kernel_sizes`, its causal depthwise conv over the tokens, by a bank of convs
+    of the source's own. Each branch reads a softmax over depth in every stream, by
+    a query of its own per stream, and mixes the streams it read by sigmoid weights
+    of their RMS norm, ``sigmoid(a rmsnorm(Z) W + b)``. The head reads the last
+    branch's input plus its output. The stream holds the sources, so `engram` and
+    `nextn` need one stream under it, as under attnres.
+    """
+
+    type: Literal["msar"] = "msar"
+    # Branch outputs summed into one source; None -> each is its own source.
+    block_size: Positive | None = None
+    # The taps of each stream's conv after the first, the source as it is (MSAR's
+    # main setting: 4, 8 and 12, so 4 streams).
+    kernel_sizes: tuple[Positive, ...] = (4, 8, 12)
+    norm_eps: float = 1e-6  # Epsilon of the keys' and the mixer's RMS norms.
+
+
 class ResidualGateConfig(Config):
     """Variance-preserving residual gate (Muse Spark): a residual algebra,
     ``residual = vpgate()``.
@@ -1275,7 +1299,7 @@ class ResidualGateConfig(Config):
 
 
 class MergeConfig(Config):
-    """Reads a widened residual stream back into one (hc, mhc, gr, attnres).
+    """Reads a widened residual stream back into one (hc, mhc, gr, attnres, msar).
 
     The read the algebra does for a branch, without the write. The compiler puts one
     before the first layer outside a branch that needs one stream, such as the final
@@ -1285,12 +1309,13 @@ class MergeConfig(Config):
     type: Literal["merge"] = "merge"
 
 
-#: The residual algebras, `hc`, `mhc`, `gr`, `attnres` and `vpgate`, by their
+#: The residual algebras, `hc`, `mhc`, `gr`, `attnres`, `msar` and `vpgate`, by their
 #: ``type``, the values of the top-level ``residual`` setting.
 ResidualConfig = Annotated[
     HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
+    | MultiStreamAttentionResidualConfig
     | ResidualGateConfig,
     Field(discriminator="type"),
 ]
@@ -1341,6 +1366,7 @@ SubConfig = Annotated[
     | HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
+    | MultiStreamAttentionResidualConfig
     | ResidualGateConfig
     | NormalInitConfig
     | FanInitConfig

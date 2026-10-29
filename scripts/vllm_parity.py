@@ -347,6 +347,17 @@ CASES = {
     "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "attnres": LLAMA
     + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    # MSAR's 4 streams, its convs of 4, 8 and 12 taps reading each sequence's last
+    # values; then on the hybrid's shape (KDA, gated global layers without positions
+    # with QK-norm, the conv on keys and values and the v port), in blocks of 2.
+    "msar": LLAMA + "residual = msar(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    "msar-hybrid": HEAD
+    + FFN
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "glob = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\nresidual = msar(block_size=2)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm glob(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm glob(v=$v1!)] [rmsnorm ffn] rmsnorm head",
     "mhc": LLAMA + "residual = mhc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "mhc-single": LLAMA + "residual = mhc(expansion=4, single_pass=true)\n"
     "model = embed block^2 rmsnorm head",

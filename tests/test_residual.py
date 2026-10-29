@@ -16,6 +16,7 @@ from bux.architecture.residual import (
     HyperConnections,
     ManifoldHyperConnections,
     Merge,
+    MultiStreamAttentionResidual,
     ResidualGate,
     sinkhorn,
     sources,
@@ -47,6 +48,8 @@ WIDENING = [
     "gr(expansion=2, rank=4)",
     "attnres(block_size=2)",
     "attnres",
+    "msar(block_size=2)",
+    "msar(kernel_sizes=[2, 3])",
 ]
 ALGEBRAS = [*WIDENING, "vpgate"]
 
@@ -288,6 +291,81 @@ def test_attnres_branches_add_their_outputs_to_the_state():
     assert first(x, taps).shape == (2, 8, 2, D)
     assert second(first(x, taps), taps).shape == (2, 8, 3, D)
     assert isinstance(first, AttentionResidual) and isinstance(merge, Merge)
+
+
+def rmsnorm(x, eps=1e-6):
+    return x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
+
+
+def conv(v, w):
+    """The causal depthwise conv of v, b t d, by taps w, k d, w[-1] the token's own:
+    ``sum_delta c_delta v_{t - delta}``, zero before the sequence (MSAR's eq. 10)."""
+    k, t = w.shape[0], v.shape[1]
+    padded = jnp.pad(v, ((0, 0), (k - 1, 0), (0, 0)))
+    return sum(w[i] * padded[:, i : i + t] for i in range(k))
+
+
+def msar_read(branch, sources, banks):
+    """MSAR's eqs. 11-14 for one target layer: each source expanded by its bank,
+    a softmax over depth per stream, and the sigmoid mixer."""
+    streams = jnp.stack(
+        [
+            jnp.stack([v, *(conv(v, w) for w in bank)], 2)
+            for v, bank in zip(sources, banks)
+        ],
+        2,
+    )  # b t n m d
+    q = branch.query[...]
+    alpha = jax.nn.softmax(jnp.einsum("btnmd,md->btnm", rmsnorm(streams), q), 2)
+    z = jnp.einsum("btnm,btnmd->btmd", alpha, streams)
+    b, t, m, d = z.shape
+    flat = z.reshape(b, t, m * d)
+    rms = jax.lax.rsqrt(jnp.mean(flat**2, -1, keepdims=True) + 1e-6)
+    pre = jax.nn.sigmoid(
+        branch.scale[...] * rms * (flat @ branch.proj[...]) + branch.bias[...]
+    )
+    return jnp.einsum("btm,btmd->btd", pre, z)
+
+
+@pytest.mark.parametrize("block", [None, 2, 3])
+def test_msar_is_the_papers_block_msar(block):
+    """Block MSAR (Qin et al., 2026, eqs. 10-17, appendix C) of 5 branches: target
+    l reads the embedding, each finished block and the partial of its block, the
+    embedding expanded by bank E_0, block j by E_{e_j} of its last output, and the
+    partial by E_{l-1}; the head reads h_L + f(h_L)."""
+    c = cfg.MultiStreamAttentionResidualConfig(block_size=block, kernel_sizes=(2, 3, 4))
+    bodies = [Tanh(seed) for seed in range(5)]
+    branches = [
+        MultiStreamAttentionResidual(c, D, nnx.Rngs(i), f) for i, f in enumerate(bodies)
+    ]
+    for i, br in enumerate(branches):
+        randomize(br, seed=10 + i, scale=0.5)
+    banks = [[w.weight[...] for w in br.convs] for br in branches]  # E_{l-1} of l
+    e = jax.random.normal(jax.random.key(0), (2, 7, D))
+    x, outputs, size = e[:, :, None], [], block or 1
+    for l, branch in enumerate(branches, start=1):
+        sources, chosen = [e], [banks[0]]
+        done = (l - 1) // size
+        for j in range(done):
+            sources.append(sum(outputs[j * size : (j + 1) * size]))
+            chosen.append(banks[(j + 1) * size])  # E_{e_j}, branch e_j + 1's
+        if (l - 1) % size:
+            sources.append(sum(outputs[done * size :]))
+            chosen.append(banks[l - 1])
+        h = msar_read(branch, sources, chosen)
+        y = bodies[l - 1](h, None)
+        outputs.append(y)
+        x = branch(x, Taps())
+        assert jnp.allclose(x[:, :, -1], h + y, atol=1e-4)
+    assert jnp.allclose(branches[0].read(x), outputs[-1] + h, atol=1e-4)
+
+
+def test_msar_adds_the_papers_parameters_to_each_branch():
+    """(m^2 + m + sum kappa) d + m + 1 a branch, appendix C's L(44d + 5) at m = 4."""
+    c = cfg.MultiStreamAttentionResidualConfig(block_size=4)
+    branch = MultiStreamAttentionResidual(c, D, nnx.Rngs(0), Zero())
+    assert num_params(branch) == 44 * D + 5
+    assert num_params(MultiStreamAttentionResidual(c, D, nnx.Rngs(0))) == 0
 
 
 def test_vpgate_keeps_the_variance_of_every_channel():

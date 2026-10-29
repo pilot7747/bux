@@ -9,11 +9,13 @@ and `branch` builds each residual branch outside any other by it:
 - ``mhc``: `ManifoldHyperConnections` (DeepSeek mHC, 2025);
 - ``gr``: `GatedResidual` (Qwen3.8-Flash-Next, 2026);
 - ``attnres``: `AttentionResidual` (Kimi, 2026);
+- ``msar``: `MultiStreamAttentionResidual` (Qin et al., 2026);
 - ``vpgate``: `ResidualGate` (Muse Spark).
 
 hc, mhc and gr widen the stream into n copies of it, an array ``(b, t, n, d)``.
 attnres keeps the embedding and every branch output so far, ``(b, t, 1 + L, d)``,
-and sums them into blocks as it reads. So what a branch reads follows from the state
+and sums them into blocks as it reads; msar keeps them too, with its finished
+sources' expansions and the head's read (`_Layout`). So what a branch reads follows from the state
 alone, at whatever depth it runs (a shared block runs at several), and taps save and
 restore it as it is. vpgate keeps one stream. ``embed`` widens its output with
 `widen`, and so does nextn when it gets one stream. Single-pass hc and mhc hand the
@@ -24,6 +26,7 @@ needs one, such as the final norm.
 
 import functools
 import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +35,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import initializers
+from bux.architecture.layers.conv import CausalConv
 from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register
 from bux.lang import ir
@@ -50,7 +54,7 @@ def widening(residual: cfg.ResidualConfig | None) -> int | None:
     match residual:
         case cfg.HyperConnectionsConfig() | cfg.GatedResidualConfig():
             return residual.expansion
-        case cfg.AttentionResidualConfig():
+        case cfg.AttentionResidualConfig() | cfg.MultiStreamAttentionResidualConfig():
             return 1
     return None
 
@@ -395,6 +399,152 @@ class AttentionResidual(nnx.Module):
         return shard_stream(jnp.concatenate([x, y[:, :, None]], 2))
 
 
+class _Layout(NamedTuple):
+    """Where an msar state (`MultiStreamAttentionResidual`) keeps its sources, of s
+    entries: the embedding and its e expansions, each finished block's raw outputs
+    followed by its sum's e expansions, the block under way's k raw outputs, and the
+    last branch's input plus its output (the head's read). A fresh state, the
+    embedding alone, has s = 1."""
+
+    blocks: int  # finished blocks, each with its expansions
+    under_way: int  # raw outputs of the block under way: 1 to block_size
+    block: int  # outputs a block sums
+    expansions: int  # convs a source expands by
+
+
+def _layout(s: int, block: int, expansions: int) -> _Layout | None:
+    """Return the layout of an msar state of s entries; None for a fresh one.
+
+    Raises:
+        ValueError: s entries are no msar state of blocks of `block`.
+    """
+    if s == 1:
+        return None
+    rest = s - 1 - (1 + expansions)  # less the head's read and the embedding's
+    width = block + expansions
+    k = (rest - 1) % width + 1
+    if rest < 1 or k > block:
+        raise ValueError(f"msar: a state of {s} entries is none of blocks of {block}")
+    return _Layout((rest - k) // width, k, block, expansions)
+
+
+def _msar_sources(
+    x: Float[Array, "b t s d"], at: _Layout | None, m: int
+) -> tuple[Float[Array, "b t n m d"], Float[Array, "b t d"], bool]:
+    """Return an msar state's expanded sources (the embedding's and each finished
+    block's m streams, ``b t n m d``), the newest source still to expand (the
+    embedding of a fresh state, or the sum of the block under way), and whether that
+    source is a finished one: the embedding, or a block of all its outputs."""
+    b, t, _, d = x.shape
+    if at is None:
+        return jnp.zeros((b, t, 0, m, d), x.dtype), x[:, :, 0], True
+    width = at.block + m - 1
+    streams = [x[:, :, :m]]  # the embedding and its expansions
+    for j in range(at.blocks):
+        first = m + j * width
+        total = x[:, :, first : first + at.block].sum(2, keepdims=True)
+        expanded = x[:, :, first + at.block : first + width]
+        streams.append(jnp.concatenate([total, expanded], 2))
+    newest = m + at.blocks * width
+    partial = x[:, :, newest : newest + at.under_way].sum(2)
+    return jnp.stack(streams, 2), partial, at.under_way == at.block
+
+
+class MultiStreamAttentionResidual(nnx.Module):
+    """Multi-stream attention residuals around one branch f (Qin et al., 2026),
+    ``msar``, Block MSAR as the paper has it. Each source (the embedding, each
+    finished block's sum of branch outputs, the block under way's partial sum)
+    expands into m streams: itself and its causal depthwise convs over the tokens,
+    of `kernel_sizes` taps, by a bank of the source's own. In each stream r, f reads
+    ``z_r``, the softmax over the sources v_r of ``dot(w_r, rmsnorm(v_r))``, then
+    ``h = sum_r p_r z_r``, ``p = sigmoid(a rmsnorm(flat(Z)) W + b)``.
+
+    The branch's bank expands the newest source, the one the branch before it last
+    added to: the embedding in the first branch, a block once it has all its
+    outputs, else the partial sum. A finished source's streams join the state, so
+    later branches read them as they are, by the bank that expanded it. The state
+    holds the sources raw and the finished ones' expansions (`_Layout`), and the
+    last branch's input plus its output, ``h + f(h)``, which the head reads: the
+    paper merges the last output with no expansion.
+
+    As the paper's: the queries w and the convs start at 0, the mixer's gate a at
+    0.01, W at 0, and its norms have no gain. The paper gives no init for the bias
+    b, so it starts at ``sigmoid(b) = 1 / m``, as `ManifoldHyperConnections` starts
+    its read. Without f it is the head's read alone: ``merge``.
+
+    Args:
+        config: The algebra's settings.
+        d: The model's width, of each source.
+        rngs: The random streams the convs draw from.
+        body: The branch f; None for the head's read alone.
+    """
+
+    no_weight_decay = ("scale", "bias")
+
+    def __init__(
+        self,
+        config: cfg.MultiStreamAttentionResidualConfig,
+        d: int,
+        rngs: nnx.Rngs,
+        body: nnx.Module | None = None,
+    ):
+        self.body, self.eps = body, config.norm_eps
+        self.block_size = config.block_size or 1
+        self.expansions = len(config.kernel_sizes)
+        if body is None:  # the head's read takes no parameters
+            return
+        m = 1 + self.expansions
+        convs = [CausalConv(d, k, False, rngs, zero=True) for k in config.kernel_sizes]
+        self.convs = nnx.List(convs)
+        self.query = nnx.Param(jnp.zeros((m, d)))
+        self.proj = nnx.Param(jnp.zeros((m * d, m)))  # W
+        self.scale = nnx.Param(jnp.asarray(0.01, jnp.float32))  # a
+        self.bias = nnx.Param(jnp.full(m, -math.log(max(m - 1, 1)), jnp.float32))
+
+    def _rmsnorm(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead d"]:
+        y = x.astype(jnp.float32)
+        y = y * jax.lax.rsqrt(jnp.square(y).mean(-1, keepdims=True) + self.eps)
+        return y.astype(x.dtype)
+
+    def _expand(
+        self, v: Float[Array, "b t d"], taps: Taps | None
+    ) -> Float[Array, "b t m d"]:
+        """Return the source v's streams: itself, then its convs over the tokens."""
+        return jnp.stack([v, *(conv(v, taps) for conv in self.convs)], 2)
+
+    def _mix(self, sources: Float[Array, "b t n m d"]) -> Float[Array, "b t d"]:
+        """Return what f reads of the expanded sources: each stream's softmax over
+        depth, mixed by the streams' sigmoid weights."""
+        b, t, _, m, d = sources.shape
+        scores = jnp.einsum("btnmd,md->btnm", self._rmsnorm(sources), self.query[...])
+        z = jnp.einsum("btnm,btnmd->btmd", softmax(scores, 2), sources)
+        flat = z.reshape(b, t, m * d)
+        rms = jax.lax.rsqrt(jnp.square(flat).mean(-1, keepdims=True) + self.eps)
+        logits = (flat @ self.proj[...]) * rms * self.scale[...] + self.bias[...]
+        return weighted(jax.nn.sigmoid(logits).astype(z.dtype), z)
+
+    def read(self, x: Float[Array, "b t s d"]) -> Float[Array, "b t d"]:
+        """Return what the head reads of the state x: the last branch's input plus
+        its output, or the embedding before any branch."""
+        return x[:, :, 0] if x.shape[2] == 1 else x[:, :, -1]
+
+    def __call__(
+        self, x: Float[Array, "b t s d"], taps: Taps
+    ) -> Float[Array, "b t s2 d"]:
+        """Return the state after the branch: the newest source's expansions if it
+        is a finished one, f's output, and ``h + f(h)`` for the head."""
+        assert self.body is not None
+        at = _layout(x.shape[2], self.block_size, self.expansions)
+        done, newest, finished = _msar_sources(x, at, self.expansions + 1)
+        expanded = self._expand(newest, taps)
+        h = self._mix(jnp.concatenate([done, expanded[:, :, None]], 2))
+        y = self.body(h, taps)
+        kept = x if at is None else x[:, :, :-1]
+        new = [kept, expanded[:, :, 1:]] if finished else [kept]
+        new += [y[:, :, None], (h + y)[:, :, None]]
+        return shard_stream(jnp.concatenate(new, 2))
+
+
 class ResidualGate(nnx.Module):
     """The variance-preserving residual gate around one branch f (Muse Spark),
     ``vpgate``: x becomes ``a * x + b * f(x)`` per channel, with
@@ -434,7 +584,13 @@ class ResidualGate(nnx.Module):
 
 
 #: The algebras that widen the stream, whose branches can read it without writing.
-Reader = HyperConnections | ManifoldHyperConnections | GatedResidual | AttentionResidual
+Reader = (
+    HyperConnections
+    | ManifoldHyperConnections
+    | GatedResidual
+    | AttentionResidual
+    | MultiStreamAttentionResidual
+)
 
 
 class Merge(nnx.Module):
@@ -474,6 +630,8 @@ def _algebra(
             return GatedResidual(residual, d, ctx.rngs, body)
         case cfg.AttentionResidualConfig():
             return AttentionResidual(residual, d, body)
+        case cfg.MultiStreamAttentionResidualConfig():
+            return MultiStreamAttentionResidual(residual, d, ctx.rngs, body)
     raise ValueError("merge reads a widened residual stream, but there is none")
 
 

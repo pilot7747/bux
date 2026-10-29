@@ -185,7 +185,7 @@ naming the layer or the setting.
 | `engram` | on a single or a widened stream; its last tokens and its conv's input tail stay in the cache while decoding. A token's class is its id mod `vocab_classes`, as in bux |
 | `nextn` | on a single or a widened stream; every head's logits on whole sequences (`all_heads=True`), skipped during generation |
 | `merge` | yes |
-| residual algebras | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
+| residual algebras | `hc`, `mhc`, `gr`, `attnres`, `msar`, `vpgate`, with every setting, single-pass included; `msar`'s convs keep their last inputs in the cache while decoding |
 | the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions |
 
 A few combinations of exported settings raise: a layer that reads a `kv` port and
