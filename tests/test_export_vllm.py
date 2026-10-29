@@ -48,8 +48,8 @@ from bux_vllm import (
     common,
     compressed,
     config,
-    copying,
     delta,
+    docmatch,
     dplr,
     feeds,
     kv,
@@ -1160,7 +1160,7 @@ def test_doc_copy_scans_each_tokens_sequence_as_bux_matches(lengths: tuple) -> N
     # Row 0's tokens 0-11 whole, row 1's 20-29 after 20 cached, row 2's token 29.
     rows = torch.tensor([0] * 12 + [1] * 10 + [2])
     pos = torch.cat([torch.arange(12), torch.arange(20, 30), torch.tensor([29])])
-    got = copying.scan(history, rows, pos, list(lengths), 3)
+    got = docmatch.scan(history, rows, pos, list(lengths), 3)
     for g, w in zip(got, want, strict=True):
         np.testing.assert_array_equal(g.numpy(), w[rows.numpy(), pos.numpy()])
 
@@ -1181,7 +1181,7 @@ def test_doc_copy_vectors_are_buxs() -> None:
     tokens = jax.random.randint(jax.random.key(3), (1, 24), 0, 3)
     want = np.asarray(first.vector(Taps(tokens=tokens)))[0]
     history = torch.from_numpy(np.array(tokens)).int()
-    c, b = copying.scan(
+    c, b = docmatch.scan(
         history,
         torch.zeros(24, dtype=torch.long),
         torch.arange(24),
@@ -1192,7 +1192,7 @@ def test_doc_copy_vectors_are_buxs() -> None:
     scale, embed = (
         torch.from_numpy(np.asarray(p[...])) for p in (first.scale, first.bucket_embed)
     )
-    got = copying.vector(table[c], b, scale, embed)
+    got = docmatch.vector(table[c], b, scale, embed)
     np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
 
 

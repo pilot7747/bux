@@ -7,7 +7,7 @@ alone, so the model runner's state (`DocCopyInputs`, vLLM's V2 model runner) fin
 them before the model runs, in a buffer of a fixed shape that CUDA graphs replay,
 as it gives an engram its ids (`bux_vllm.engram`). A Triton kernel scans each
 token's sequence, in vLLM's tokens of its requests, for the earlier windows that
-match its own (`bux_vllm.copying`), a program a token: no host sync, no loop over
+match its own (`bux_vllm.docmatch`), a program a token: no host sync, no loop over
 requests. The layers read them from the forward's context; the one that writes its
 ``copy`` port pushes the vector, and one that reads it adds it by its own gain.
 """
@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from . import copying
+from . import docmatch
 from .common import Ctx, Layer, Site
 from .plan import Node, live, plan
 
@@ -71,7 +71,7 @@ class DocCopy(Layer):
             assert ctx.doc_copy is not None, "doc_copy reads the runner's candidates"
             found = ctx.doc_copy[:, : x.shape[0]]
             rows = self.embedding[0].tokens(found[0])
-            v = copying.vector(rows, found[1].long(), self.scale, self.bucket_embed)
+            v = docmatch.vector(rows, found[1].long(), self.scale, self.bucket_embed)
         for name, tap, mode in self.ports:
             if name == "copy" and mode == "write":
                 ctx.push(tap, v)

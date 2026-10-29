@@ -228,10 +228,10 @@ def compare_csa_picks(relu: bool, dtype: torch.dtype, decoding: bool) -> bool:
 
 def compare_doc_copy(vocab: int, length: int) -> bool:
     """doc_copy's scan by its Triton kernel (`bux_vllm.doc_copy`) against PyTorch's
-    (`bux_vllm.copying`): a prompt chunk after cached tokens, a whole prompt and
+    (`bux_vllm.docmatch`): a prompt chunk after cached tokens, a whole prompt and
     decoded tokens, over sequences of `length` tokens of `vocab`; equal candidates
     and buckets."""
-    from bux_vllm import copying, doc_copy  # vLLM's, on a GPU alone
+    from bux_vllm import doc_copy, docmatch  # vLLM's, on a GPU alone
 
     lengths, dev = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32), "cuda"
     history = torch.randint(0, vocab, (4, length), device=dev, dtype=torch.int32)
@@ -240,7 +240,7 @@ def compare_doc_copy(vocab: int, length: int) -> bool:
         torch.arange(length - 300, length), torch.arange(50),
         torch.tensor([length - 1, length // 2]),
     ]).to(dev)  # fmt: skip
-    want = copying.scan(history, rows, pos, list(lengths), 3)
+    want = docmatch.scan(history, rows, pos, list(lengths), 3)
     inputs = doc_copy.DocCopyInputs.__new__(doc_copy.DocCopyInputs)
     inputs.lengths, inputs.counts = lengths, 3
     inputs.doc_lengths = torch.tensor(lengths, dtype=torch.int32, device=dev)
