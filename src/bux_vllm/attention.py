@@ -62,10 +62,10 @@ class Attention(Layer):
     With ``k_eq_v`` (Gemma 4's global layers) its values are its keys as
     projected, after the conv, RMS-normalized without a gain: as vLLM's Gemma 4
     does, bux's key projection loads into both the k and the v shard of the
-    projection, whose v output goes unused. Where each key is its value times the
-    key norm's gain (`bux_vllm.kv.keys_from_values`), the KV cache holds the values
-    alone, read as both by vLLM's Triton attention (`bux_vllm.keyed`), and the
-    gain goes on the queries; else it holds both.
+    projection, whose v output goes unused, and the KV cache holds both. Asked
+    for, where each key is its value times the key norm's gain
+    (`bux_vllm.kv.keys_from_values`), it holds the values alone, read as both by
+    vLLM's Triton attention (`bux_vllm.keyed`), and the gain goes on the queries.
 
     Each call of the layer keeps a KV cache of its own, a conv state beside it with
     ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that

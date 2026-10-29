@@ -159,8 +159,9 @@ def keys_from_values(c: dict, ports: list) -> bool:
     gain, so that one cached vector a token serves as both, the gain on the queries
     (`bux_vllm.keyed`): values from the keys (``k_eq_v``), the keys' norm an RMSNorm
     of each head, without a bias, at the values' eps, no RoPE, and no port that
-    mixes other values in (``v`` and ``ve`` read) or shares the cache (``kv``).
-    ``BUX_VLLM_K_EQ_V_CACHE=both`` keeps keys and values apart all the same."""
+    mixes other values in (``v`` and ``ve`` read) or shares the cache (``kv``); and
+    asked for, by ``BUX_VLLM_K_EQ_V_CACHE=keys``. By default the cache keeps keys
+    and values apart, as vLLM's Gemma 4 does, on the backend vLLM picks."""
     qk = c["qk_norm"]
     norm = qk is not None and qk["type"] == "rmsnorm" and not qk["bias"]
     plain = norm and not qk["scale_input"] and not c["qk_norm_all_heads"]
@@ -168,7 +169,7 @@ def keys_from_values(c: dict, ports: list) -> bool:
         ports, "kv"
     )
     own = not (c["indexer"] or c["relative_bias"] or c["rope"] or others)
-    keyed = os.environ.get("BUX_VLLM_K_EQ_V_CACHE", "keys") == "keys"
+    keyed = os.environ.get("BUX_VLLM_K_EQ_V_CACHE", "both") == "keys"
     return bool(c["k_eq_v"] and plain and own and keyed)
 
 
