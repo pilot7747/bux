@@ -557,6 +557,8 @@ ROUTERS = {
     " routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
     "zero experts, longcat": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
     " normalize_top_k=false, routed_scaling_factor=6, expert=e)",
+    "zero experts, sinks": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " num_shared_experts=2, shared_expert_sink=true, router=sigmoid, expert=e)",
 }
 
 
@@ -588,8 +590,9 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
 
 
 def test_zero_experts_split_as_bux_runs_them() -> None:
-    """What vLLM's ZeroExpertRouter makes of the picks (`zero_split`): bux's zero
-    experts' output, and picks of the routed experts that weigh them as bux's."""
+    """The zero experts' output (`zero_split`) is bux's, and the picks the fused MoE
+    keeps of `given_logits` (`pick_given`), or `zero_split`'s for `apart`, weigh the
+    routed experts as bux's do."""
     c = cfg.MoEConfig.model_validate(
         {
             "num_experts": 4,
@@ -614,6 +617,44 @@ def test_zero_experts_split_as_bux_runs_them() -> None:
     dense = bux_moe.dense_weights(idx, weights, 4)[0]
     got = bux_moe.dense_weights(jnp.asarray(picks.numpy()), jnp.asarray(w.numpy()), 4)
     np.testing.assert_allclose(np.asarray(got), np.asarray(dense), rtol=1e-6)
+    w, i = (torch.from_numpy(np.array(a)[0]) for a in (weights, idx))
+    given_w, given_ids = routing.pick_given(
+        torch.zeros(32, 16), routing.given_logits(w, i, 4), 3, True
+    )
+    assert given_ids.shape == (32, 3) and (given_ids < 4).all()
+    given = bux_moe.dense_weights(jnp.asarray(given_ids), jnp.asarray(given_w), 4)
+    np.testing.assert_allclose(np.asarray(given), np.asarray(dense), rtol=1e-6)
+
+
+def test_zero_experts_route_in_one_graph() -> None:
+    """The routing with zero experts traces whole, as torch.compile takes the
+    model's forward, where vLLM's ZeroExpertRouter's assertion fails."""
+    c = {
+        "num_experts": 8,
+        "num_zero_experts": 4,
+        "top_k": 3,
+        "router": "sigmoid",
+        "router_logit_scale": 1.0,
+        "num_groups": 1,
+        "normalize_top_k": True,
+        "routed_scaling_factor": 2.5,
+        "load_balancing": "aux_free",
+    }
+    router = routing.Router(c)
+
+    def routed(z: torch.Tensor, logits: torch.Tensor) -> tuple:
+        weights, idx, _ = router.route(logits, 3)
+        zero = routing.zero_split(z, weights, idx, 8)[0]
+        return zero, routing.pick_given(
+            z, routing.given_logits(weights, idx, 8), 3, True
+        )
+
+    z, logits = torch.randn(5, 16), torch.randn(5, 12)
+    traced = torch.compile(routed, fullgraph=True, backend="eager")
+    for a, b in zip(
+        jax.tree.leaves(traced(z, logits)), jax.tree.leaves(routed(z, logits))
+    ):
+        assert torch.equal(a, b)
 
 
 ROPES = {

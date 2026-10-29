@@ -338,7 +338,7 @@ in every run.
 | `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention); DeepSeek-V3.2's on vLLM's DSA kernels, [DSA on vLLM's kernels](#dsa-on-vllms-kernels)), a relative bias (Inkling's, by the plugin's own op, as an indexer), the `v` port: the value residual, fixed, learned or convex, the `kv` port: cross-layer KV sharing, by vLLM's own, between layers of the same kv heads, the reader's window no longer than the writer's, and the `index` port: one layer's picks shared with others ([Sparse attention](#sparse-attention)). QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: the `kv` port of a sparse layer, or a relative bias beside an indexer or ports |
 | `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. With an indexer (DeepSeek-V3.2's, its picks by vLLM's DSA kernels where they take it) or the `index` port's picks, sparse attention in the latent space by the plugin's ops ([Sparse attention](#sparse-attention)), with a window, soft-capping and sinks too, in any dtype. Not yet: QK-norm, a window, soft-capping or sinks without an indexer, a relative bias, `log_scale`, `gate_head_bias`, the `kv` port, an indexer that picks per group, `mla` that vLLM runs as MLA beside other attention, or such `mla` layers of different dims or heads |
 | `csa` | bux's arithmetic on vLLM's paged caches ([Compressed sparse attention](#compressed-sparse-attention)): a sliding window or every token, compressed latents of any `compress_ratio`, the indexer's top-k (ReLU'd or plain dots, weighted or summed, its norm), queries at full rank or from a latent, QK-norm, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), sinks, soft-capping, its scale, `gated` (a gate per channel or per head, `gate_head_bias`), `output_norm`, a dense or grouped low-rank output, and its `kv`, `index` and `candidates` ports; in float32 or bfloat16. Not yet: an indexer of blocks, a relative bias, `log_scale`, speculative decoding, decode context parallelism, or an FP8 KV cache |
-| `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), SiTU-GLU experts (`situ` with an `up_softcap`, Kimi K3's, by vLLM's own), LatentMoE with its norms (vLLM's fused experts at the latent's width), shared experts the router scores (`shared_expert_sink`), and each routed expert's output normalized before its weight (`expert_norm`; each of a token's picks a row of its own in vLLM's fused MoE, so that their outputs come back apart, summed over the ranks, for the norm), and zero experts (`num_zero_experts`, LongCat-Flash's, by vLLM's own `ZeroExpertRouter`, [Zero experts](#zero-experts)). Not yet: an `up_softcap` on experts other than `situ` ones, or zero experts beside `shared_expert_sink` or in a latent no multiple of 256 wide |
+| `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), SiTU-GLU experts (`situ` with an `up_softcap`, Kimi K3's, by vLLM's own), LatentMoE with its norms (vLLM's fused experts at the latent's width), shared experts the router scores (`shared_expert_sink`), and each routed expert's output normalized before its weight (`expert_norm`; each of a token's picks a row of its own in vLLM's fused MoE, so that their outputs come back apart, summed over the ranks, for the norm), and zero experts (`num_zero_experts`, LongCat-Flash's, [Zero experts](#zero-experts)). Not yet: an `up_softcap` on experts other than `situ` ones |
 | `mamba`, `mamba2`, `gdn` | by vLLM's own layers (`mamba` as Jamba's, without speculative decoding), with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and without a short conv or an output gate by bux's own rule ([DPLR delta rules](#dplr-delta-rules)). Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate; by bux's own rule ([DPLR delta rules](#dplr-delta-rules)) without a conv or an output gate, with a `v_head_dim` other than `head_dim`, or a lower bound under -5. Not yet: speculative decoding |
 | `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, with a conv or none, `lightning`'s decay by the layer's depth among the token mixers and its RMSNorm of all heads, its statistics summed over the ranks, and `rwkv7`'s `v` port (the value residual). Not yet: `gla` without a conv in a 16-bit model, or speculative decoding |
@@ -357,22 +357,23 @@ and its state per sequence are bux's.
 
 ## Zero experts
 
-An `moe` with zero experts (`num_zero_experts`) routes by vLLM's own
-`ZeroExpertRouter`, as vLLM serves LongCat-Flash:
+An `moe` with zero experts (`num_zero_experts`) routes once, by bux's rule, in the
+compiled graph beside vLLM's fused MoE:
 
-- **Routing:** vLLM's fused top-k scores the FFN and zero experts in float32, adds
-  the aux-free bias to the scores that pick (0 for the zero experts, and for all
-  without a bias), and normalizes and scales the weights, as bux does.
-- **Zero experts:** a Triton kernel adds each token times its zero picks' weights,
-  after the routed experts' sum over the ranks. Each zero pick reaches the fused
-  experts as a pick of expert 0 of weight 0, so a token's FFN experts cost what
-  their number does, and nothing else changes: FP8 experts, expert parallelism and
-  CUDA graphs run as without zero experts.
-- **Limits:** vLLM's kernel takes the experts' width in whole blocks of 256 (the
-  width, or LatentMoE's latent). The plugin raises for another width, and for zero
-  experts beside `shared_expert_sink`. With `expert_norm`, which runs each pick as a
-  row of its own, bux's rule routes and the plugin adds the zero experts' output
-  itself.
+- **Routing:** the router's scores of the FFN and zero experts in float32, the
+  aux-free bias on the scores that pick, the top-k, and the weights normalized and
+  scaled, as bux computes them, which torch.compile fuses.
+- **Zero experts:** each token times its zero picks' weights, added to the fused
+  MoE's output after its sum over the ranks.
+- **FFN experts:** vLLM's fused MoE takes the picks as given: logits of the picks'
+  weights and $-\infty$ elsewhere, whose top-k it keeps, a zero expert's pick as one
+  of weight 0. A token's FFN experts cost what their number does, and FP8 experts,
+  expert parallelism and CUDA graphs run as without zero experts.
+
+vLLM serves LongCat-Flash's zero experts by its `ZeroExpertRouter`, which keeps
+their output aside inside the fused MoE's op. torch.compile's trace never runs that
+op, so vLLM 0.32 fails to compile such a model ("assert zero_expert_output is not
+None"); the plugin does not use it.
 
 ## DPLR delta rules
 
@@ -761,7 +762,7 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `moe-latent` | LatentMoE with its norms, a sigmoid router | 3.8e-6 | 1.9 (1.9) | 0.054 |
 | `moe-sink` | shared experts the router scores (`shared_expert_sink`) | 8.6e-6 | 2.3 (1.7) | 3.2, differs |
 | `moe-norm` | Muse Spark's experts: each one's output normalized before its weight, in a latent of 32 | 9.1e-6 | 1.7 (2.1) | 2.0 |
-| `moe-zero` | zero experts, at a width of 256: 4 beside 8 FFN experts, a top 3, a shared expert, a sigmoid router, the aux-free bias | - | - | - |
+| `moe-zero` | zero experts: 4 beside 8 FFN experts, a top 3, a shared expert, a sigmoid router, the aux-free bias | - | - | - |
 | `moe-zero-longcat` | LongCat-Flash's zero experts: a softmax router, unnormalized, scaled by 6, no bias | - | - | - |
 | `moe-zero-norm` | zero experts beside an expert norm, routed by bux's rule | - | - | - |
 | `mamba` | Jamba's Mamba beside attention | 9.5e-6 | 0.11 (0.14) | 0.096 |

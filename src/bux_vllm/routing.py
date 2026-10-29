@@ -5,8 +5,8 @@ The router runs as bux's does (`bux.architecture.experts.moe`): logits in float3
 scored by a softmax, a sigmoid or ``sqrt(softplus)``, the aux-free bias added to the
 scores that pick, groups limited by their best two experts' sum, the top-k weights
 normalized (with the shared experts' scores, where the router scores them) and
-scaled. Zero experts are scored after the routed ones, and `zero_split` passes
-their picks on as vLLM's ``ZeroExpertRouter`` does.
+scaled. Zero experts are scored after the routed ones; `zero_split` computes their
+output, and `given_logits` hands vLLM's fused MoE the routed experts' picks.
 """
 
 from __future__ import annotations
@@ -84,9 +84,9 @@ class Router(nn.Module):
 def zero_split(
     z: torch.Tensor, weights: torch.Tensor, idx: torch.Tensor, num_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """What vLLM's ``ZeroExpertRouter`` makes of a token's picks: the zero experts'
-    output, each token times its zero picks' weights summed, and the picks the
-    routed experts run, a zero expert's as expert 0 of weight 0.
+    """A token's picks split as vLLM's ``ZeroExpertRouter`` splits them: the zero
+    experts' output, each token times its zero picks' weights summed, and the picks
+    the routed experts run, a zero expert's as expert 0 of weight 0.
 
     Args:
         z: The tokens as the experts take them, (T, d).
@@ -100,6 +100,39 @@ def zero_split(
     zero = idx >= num_experts
     output = z * (weights * zero).sum(-1, keepdim=True).to(z.dtype)
     return output, weights.masked_fill(zero, 0), idx.masked_fill(zero, 0)
+
+
+def given_logits(
+    weights: torch.Tensor, idx: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+    """Logits that hand vLLM's fused MoE each token's picks of the routed experts
+    (`pick_given`): their weights where `idx` picks them, -inf elsewhere; picks of
+    the zero experts, ``num_experts`` and up, left out.
+
+    Args:
+        weights: The router's weights of each token's picks, (T, k), final.
+        idx: The picks, (T, k).
+        num_experts: The routed experts.
+
+    Returns:
+        The logits, (T, num_experts), in float32.
+    """
+    shape = (idx.shape[0], num_experts + 1)  # the zero experts' picks go last
+    every = torch.full(shape, -torch.inf, dtype=torch.float32, device=idx.device)
+    at = idx.long().clamp(max=num_experts)
+    return every.scatter(-1, at, weights.float())[:, :num_experts]
+
+
+def pick_given(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's custom routing of `given_logits`: each token's routed picks with their
+    weights, and, for each pick of a zero expert, a pick of weight 0."""
+    values, ids = gating_output.topk(topk, -1)
+    return torch.where(values.isfinite(), values, 0.0), ids
 
 
 def pick_rows(
