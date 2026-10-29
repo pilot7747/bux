@@ -594,7 +594,8 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
 def test_zero_experts_split_as_bux_runs_them() -> None:
     """The zero experts' output (`zero_split`) is bux's, and the picks the fused MoE
     keeps of `given_logits` (`pick_given`), or `zero_split`'s for `apart`, weigh the
-    routed experts as bux's do."""
+    routed experts as bux's do; every zero pick is the phantom expert, which the
+    expert map skips, so that a token's GEMM slots are its FFN experts'."""
     c = cfg.MoEConfig.model_validate(
         {
             "num_experts": 4,
@@ -611,21 +612,27 @@ def test_zero_experts_split_as_bux_runs_them() -> None:
     moe = MoE(c, 16, rngs=nnx.Rngs(0))
     x = jax.random.normal(jax.random.key(2), (1, 32, 16))
     idx, weights, _ = moe._route(x)
-    assert (np.asarray(idx) >= 4).any()
+    zeros = np.asarray(idx)[0] >= 4
+    assert zeros.any() and not zeros.all()
     as_torch = (torch.from_numpy(np.array(a)[0]) for a in (x, weights, idx))
     zero, w, picks = routing.zero_split(*as_torch, 4)
     want = bux_moe.zero_experts(x, idx, weights, 4)[0]
     np.testing.assert_allclose(zero.numpy(), np.asarray(want), rtol=1e-6)
+    emap = routing.phantom_map(4)
+    assert emap.tolist() == [0, 1, 2, 3, -1]
     dense = bux_moe.dense_weights(idx, weights, 4)[0]
-    got = bux_moe.dense_weights(jnp.asarray(picks.numpy()), jnp.asarray(w.numpy()), 4)
-    np.testing.assert_allclose(np.asarray(got), np.asarray(dense), rtol=1e-6)
-    w, i = (torch.from_numpy(np.array(a)[0]) for a in (weights, idx))
-    given_w, given_ids = routing.pick_given(
-        torch.zeros(32, 16), routing.given_logits(w, i, 4), 3, True
-    )
-    assert given_ids.shape == (32, 3) and (given_ids < 4).all()
-    given = bux_moe.dense_weights(jnp.asarray(given_ids), jnp.asarray(given_w), 4)
-    np.testing.assert_allclose(np.asarray(given), np.asarray(dense), rtol=1e-6)
+    w_, i_ = (torch.from_numpy(np.array(a)[0]) for a in (weights, idx))
+    given = routing.given_logits(w_, i_, 4)
+    assert given.shape == (32, 5) and torch.isinf(given[:, 4]).all()
+    for got_w, got_ids in (
+        (w, picks),
+        routing.pick_given(torch.zeros(32, 16), given, 3, True),
+    ):
+        skipped = emap[got_ids.long()] == -1  # the slots the kernels skip
+        np.testing.assert_array_equal(skipped.sum(-1).numpy(), zeros.sum(-1))
+        assert (got_w[skipped] == 0).all()
+        kept = bux_moe.dense_weights(jnp.asarray(got_ids), jnp.asarray(got_w), 4)
+        np.testing.assert_allclose(np.asarray(kept), np.asarray(dense), rtol=1e-6)
 
 
 def test_zero_experts_route_in_one_graph() -> None:
@@ -2584,6 +2591,8 @@ class StubTable(torch.nn.Module):
 class StubExperts(torch.nn.Module):
     """vLLM's routed experts (`FusedMoEFactory`'s): their stacked weights, whose
     loaders count, and their quantization config."""
+
+    use_ep = False  # one rank's every expert
 
     def __init__(self, num_experts, hidden_size, intermediate_size, **kwargs):
         super().__init__()
