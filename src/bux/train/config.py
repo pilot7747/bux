@@ -537,16 +537,38 @@ Phases = Annotated[tuple[PhaseConfig, ...], BeforeValidator(_phases)]
 # observe and profile. None of these but the loss is in the run's id.
 
 
+class PrefixConfig(Config):
+    """Prefix-token prediction (modded-nanogpt's record 88): beside each target token
+    T, the first head also predicts T's prefix token T', the token whose bytes are the
+    longest proper prefix of T's that the vocabulary has, by the same softmax.
+
+    The objective adds ``weight * CE(T')`` at each target that has a prefix token, a
+    mean over all the targets, as `prefix_loss`, its weight held for `hold` of the
+    run's steps, then falling linearly to 0 over the next `decay`: the record's
+    0.25 for the first third of its steps, to 0 over the second.
+    ``loss(prefix=prefix())``. It takes the run's tokenizer, which says the tokens'
+    bytes; evals measure the plain next-token loss and bits per byte."""
+
+    type: Literal["prefix"] = "prefix"
+    weight: Annotated[float, Field(ge=0)] = 0.25  # its weight while it holds
+    hold: Fraction = 1 / 3  # the share of the steps it holds its weight
+    decay: Fraction = 1 / 3  # the share after those over which it falls to 0
+
+
 class LossConfig(Config):
     """The loss a run minimizes: the cross-entropy of the first head, plus `z` times
     its z-loss, plus `mtp` times the mean cross-entropy of the heads after it, each of
-    which predicts one token further ahead for every `nextn` before it. The losses
-    layers report, as an MoE's balance loss, add with the weights set on the layer."""
+    which predicts one token further ahead for every `nextn` before it, plus, with
+    `prefix`, its prefix tokens' cross-entropy. The losses layers report, as an MoE's
+    balance loss, add with the weights set on the layer."""
 
     type: Literal["loss"] = "loss"
     z: float = 0.0  # weight of the z-loss, log(Z)^2 of the first head (PaLM: 1e-4)
     # Weight of the mean loss of the heads that predict further ahead (DeepSeek-V3).
     mtp: float = 0.3
+    # The first head also predicts each target's prefix token (modded-nanogpt's
+    # prefix-token prediction), as prefix() says; none: not.
+    prefix: PrefixConfig | None = None
 
 
 class EvalConfig(Config):
@@ -1286,6 +1308,16 @@ class TrainConfig(Config):
     objective: ObjectiveConfig | None = None
     search: SearchConfig = SearchConfig()  # how a run with dimensions is searched
 
+    @model_validator(mode="after")
+    def _prefix_tokens(self) -> "TrainConfig":
+        """Check that prefix-token prediction has a tokenizer to read bytes from."""
+        if self.loss.prefix is not None and self.tokenizer is None:
+            raise ValueError(
+                "loss(prefix=...) predicts each target's prefix token, by its bytes: "
+                "it takes a tokenizer = tokenizer(...)"
+            )
+        return self
+
 
 # The configs a .bux file calls by name, besides layers and their settings.
 Setting = Annotated[
@@ -1310,6 +1342,7 @@ Setting = Annotated[
     | PhaseConfig
     | RampConfig
     | LossConfig
+    | PrefixConfig
     | EvalConfig
     | CheckpointConfig
     | LogConfig

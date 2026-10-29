@@ -313,6 +313,7 @@ _NEWER_FIELDS = {
         "ns_restarts": None,
     },
     "schedule": {"horizon": 1.0},
+    "loss": {"prefix": None},
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
