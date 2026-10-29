@@ -1,21 +1,22 @@
 """Render the timeline tutorial's tables (docs/tutorials/timeline.md) from the fit's
 outputs, so that a new fit updates the page by rerunning this script.
 
-It reads fit.py's ``report.md``, sweep_fit.py's ``serving-measured.md`` (bf16, and
-FP8 if given) and factorial.py's output, and writes one Markdown table per entry of
-`TABLES` to ``docs/tutorials/timeline/tables/``, which the tutorial includes. A table
-picks rows by family and columns by header from the sections of a source, and
-renames both for the page. A row or column a source lacks renders empty, with a
-warning.
+It reads fit.py's ``report.md``, factorial.py's output, the ``+fp8`` rows of
+sweep_fit.py's ``serving-measured.md`` and the long-context sweeps' tables, and writes one Markdown table per entry of `TABLES` to
+``docs/tutorials/timeline/tables/``, which the tutorial includes. A table picks rows
+by family and columns by header from the sections of a source, and renames both for
+the page. A row or column a source lacks renders empty, with a warning.
 
     python scripts/timeline/factorial.py results.jsonl --reuse --extra > factorial.txt
-    python scripts/timeline/doc_tables.py fit/report.md serving-measured.md \\
-        factorial.txt [--fp8 serving-measured-fp8.md]
+    python scripts/timeline/doc_tables.py fit/report.md factorial.txt \\
+        --fp8 serving-measured.md \\
+        --longctx serving-longctx-table.md --changes serving-longctx-changes.md
 """
 
 import argparse
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +26,10 @@ RANGE = re.compile(r"\s*\[[^\]]*\]")
 LEADER = "One-change leaderboard (objective)"
 UNLIMITED = "(a) Unlimited data"
 LIMITED = "(b) Limited data"
+BEST = "Today's best architecture"
+BY_CONTEXT = "Today's best at equal serving cost by context"
 CANDIDATE = "factorial/r1v1k1f0p0s0"
+HYBRID = "milestones/m2026_hybrid"
 NAMES = {
     CANDIDATE: "hybrid + hc, value residual, key-value conv",
     "factorial/r1v1k0f0p0s0": "hybrid + hc, value residual",
@@ -68,19 +72,34 @@ SWA_ROWS = (
     ("milestones/m2026_frontier", "2026 sliding-window frontier"),
     ("swa/lean", "frontier, windows of 128 with sinks"),
     ("swa/swa_hvk", "frontier + hc, value residual, key-value conv"),
+    ("swa/swa_hv1k", "frontier + hc, value residual in every layer, key-value conv"),
     ("swa/lean_hv1k", "lean + hc, value residual in every layer, key-value conv"),
 )
+
+
+def first(cell: str) -> str:
+    """A cell's leading value, without the notes after it."""
+    return cell.split(" (")[0]
+
+
+def target(cell: str) -> str:
+    """A long-context target as its parameters per token and its width."""
+    m = re.match(r"d(\d+), ([\d.]+B) /", cell)
+    return f"{m.group(2)} ({m.group(1)})" if m else ""
 
 
 @dataclass(frozen=True)
 class Col:
     """A column: `header` of `section` (the table's if empty), shown as `label`;
-    `ranges` keeps the report's bracketed ranges."""
+    `ranges` keeps the report's bracketed ranges; `offset` takes the column that many
+    after the header's, for headers that repeat; `fmt` rewrites the cell."""
 
     header: str
     label: str
     ranges: bool = False
     section: str = ""
+    offset: int = 0
+    fmt: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -88,12 +107,16 @@ class Table:
     """A table of the page: `rows` as (key, label) of `section` in `source`. A row's
     cells from the leaderboard are blank where its parent is not `against`."""
 
-    source: str  # "report", "serving", "fp8" or "factorial"
-    section: str  # the start of a heading; "" for the source's first table
+    source: str  # "report", "factorial", "fp8", "longctx" or "changes"
+    section: (
+        str  # the start of a heading; "" for the source's first table, "#n" its nth
+    )
     rows: tuple
     columns: tuple
     key: int = 1  # how many leading cells make a row's key
     against: str = ""
+    suffix: str = ""  # appended to every row's key: "+fp8" for the FP8 rows
+    note: str = ""  # the header of a column of each row's third entry, if it has one
 
 
 SERVING_COLS = (
@@ -109,15 +132,93 @@ TABLES = {
         Col("(b) Δ 1T vs %", "against 2020", True, LEADER),
         Col("(a) speedup to vs@1T", "GPU-hours, speedup", True, LEADER),
     ), against="baseline"),
-    "best": Table("report", "Today's best architecture", (
-        ((CANDIDATE, "milestones/m2026_hybrid"), NAMES[CANDIDATE]),
-        (("factorial/r1v1k0f0p0s0", "milestones/m2026_hybrid"), NAMES["factorial/r1v1k0f0p0s0"]),
+    "best": Table("report", BEST, (
+        ((CANDIDATE, HYBRID), NAMES[CANDIDATE]),
+        (("factorial/r1v1k0f0p0s0", HYBRID), NAMES["factorial/r1v1k0f0p0s0"]),
+        (("factorial_mhc", HYBRID), "hybrid + mHC, value residual, key-value conv"),
+        (("audit/attnres_vk", HYBRID), "hybrid + AttnRes, value residual, key-value conv"),
         ((CANDIDATE, "baseline"), NAMES[CANDIDATE] + ", against 2020"),
     ), (
         Col("paired Δ by rung %", "measured, paired by seed"), Col("× per parameter", "× per parameter"),
         Col("(a) speedup to vs's 1T loss", "GPU-hours, speedup"), Col("(b) Δ 130B %", "130B tokens"),
-        Col("(b) Δ 1T %", "1T tokens"), Col("(b) Δ 1T, E fit %", "1T tokens, E free"),
+        Col("(b) Δ 1T %", "1T tokens"), Col("(b) Δ 10T %", "10T tokens"),
+        Col("(b) Δ 1T range %", "1T tokens, range", True),
     ), key=2),
+    "stacks": Table("report", BEST, (
+        (("newlayers_cplm/nl_cplm", CANDIDATE), "candidate + copy pointer"),
+        (("newlayers_cplm/nl_cplm_w4k", CANDIDATE), "candidate + copy pointer, window of 4096"),
+        (("stack5", CANDIDATE), "candidate + copy pointer + GatedNorm (`stack5`)"),
+        (("stack5_d0", CANDIDATE), "`stack5`, first layer routed"),
+        (("stack5_dl", CANDIDATE), "`stack5`, the dense layer last"),
+        (("stack6", CANDIDATE), "`stack5` + value embeddings, XSA, differential attention (`stack6`)"),
+        (("stack4/s4_gvxd", CANDIDATE), "candidate + GatedNorm, value embeddings, XSA, differential attention"),
+        (("dense0", CANDIDATE), "candidate, first layer routed (`dense0`)"),
+        (("dense_last", CANDIDATE), "candidate, the dense layer last (`dense_last`)"),
+    ), (
+        Col("rungs", "rungs"), Col("× per parameter", "× per parameter"),
+        Col("(a) speedup to vs's 1T loss", "GPU-hours, speedup"), Col("(b) Δ 1T %", "1T tokens"),
+        Col("(b) Δ 1T range %", "1T tokens, range", True),
+    ), key=2),
+    "sparse-candidate": Table("report", BEST, (
+        (("sparse_native/dsa_c", CANDIDATE), "candidate + DSA"),
+        (("sparse_native/qsa_c", CANDIDATE), "candidate + QSA"),
+        (("sparse_native/msa_c", CANDIDATE), "candidate + MSA"),
+        (("indexshare/is2_c", CANDIDATE), "candidate + DSA, an indexer in 1 global layer of 2"),
+        (("indexshare/is4_c", CANDIDATE), "candidate + DSA, an indexer in 1 global layer of 4"),
+        (("indexshare/is4x_c", CANDIDATE), "the same, with the cross-layer loss"),
+    ), (
+        Col("rungs", "rungs"), Col("× per parameter", "× per parameter"),
+        Col("(b) Δ 1T %", "1T tokens"), Col("(b) Δ 1T range %", "1T tokens, range", True),
+    ), key=2),
+    "by-context": Table("report", BY_CONTEXT, (
+        (HYBRID, "2026 linear-attention hybrid"), (CANDIDATE, NAMES[CANDIDATE]),
+        ("factorial_mhc", "hybrid + mHC, value residual, key-value conv"),
+        ("audit/attnres_vk", "hybrid + AttnRes, value residual, key-value conv"),
+        ("milestones/m2026_frontier", "2026 sliding-window frontier"),
+        ("swa/swa_hv1k", "frontier + hc, value residual in every layer, key-value conv"),
+        ("swa/lean", "frontier, windows of 128 with sinks"),
+        ("milestones/m2024_dsv3", "2024 DeepSeek-V3, DeepSeek's dims"),
+        ("milestones/m2024_llama3", "2024 Llama 3"), ("positions/rope", "2021 reference"),
+        ("newlayers_cplm/nl_cplm", "candidate + copy pointer"),
+        ("stack5", "candidate + copy pointer + GatedNorm"),
+        ("dense_last", "candidate, the dense layer last"),
+    ), tuple(
+        Col(f"{c}: 1T", c, offset=1) for c in ("16-24k", "64k", "128k", "256k")
+    )),
+    "long-targets": Table("longctx", "#1", (
+        ("2021 reference (rope MHA)", "2021 reference"), ("llama3 (GQA)", "2024 Llama 3"),
+        ("dsv3 (DS dims)", "2024 DeepSeek-V3, DeepSeek's dims"),
+        ("frontier", "2026 sliding-window frontier"), ("lean SWA", "frontier, windows of 128 with sinks"),
+        ("hybrid", "2026 linear-attention hybrid"), ("candidate", NAMES[CANDIDATE]),
+        ("nl_cplm", "candidate + copy pointer"), ("stack5 cplm_gn", "candidate + copy pointer + GatedNorm"),
+        ("dense_last (the dense layer last)", "candidate, the dense layer last"),
+        ("nl_diff", "candidate + differential attention"),
+        ("dsa_c (candidate, DSA globals)", "candidate + DSA"),
+        ("is2_c (dsa_c, 1 indexer in 2 globals)", "candidate + DSA, an indexer in 1 global layer of 2"),
+        ("is4_c (dsa_c, 1 indexer in 4 globals)", "candidate + DSA, an indexer in 1 global layer of 4"),
+        ("qsa_c (candidate, QSA globals)", "candidate + QSA"),
+        ("msa_c (candidate, MSA globals)", "candidate + MSA"),
+    ), tuple(Col(c, c, fmt=target) for c in ("16-24k", "64k", "128k", "256k"))),
+    "long-changes": Table("changes", "", (
+        ("newlayers_cplm/nl_cplm+fp8", "copy pointer", "the candidate"),
+        ("newlayers_cplm/nl_cplm_w4k+fp8", "copy pointer, window of 4096", "the candidate"),
+        ("stack5/cplm_gn+fp8", "copy pointer + GatedNorm", "the candidate"),
+        ("audit/hc2_vk+fp8", "hc with 2 copies", "the candidate"),
+        ("ideas/kvshare+fp8", "one KV cache for every global layer", "the candidate"),
+        ("newlayers/nl_diff+fp8", "differential attention", "the candidate"),
+        ("stack4/s4_v1x1d1+fp8", "value embeddings, XSA, differential attention", "the candidate"),
+        ("stack4/s4_gvxd+fp8", "the same + GatedNorm", "the candidate"),
+        ("ideas/ghead128+fp8", "global heads of 128", "the candidate"),
+        ("attention/head128+fp8", "heads of 128", "the 2021 reference"),
+        ("attention/swa+fp8", "`swa`", "the 2021 reference's target"),
+        ("mixers/kda+fp8", "`kda`", "the 2021 reference's target"),
+        ("mixers/mamba2+fp8", "`mamba2`", "the 2021 reference's target"),
+        ("attention/gqa4+fp8", "`gqa4`", "the 2021 reference's target"),
+        ("attention/mqa+fp8", "`mqa`", "the 2021 reference's target"),
+    ), (
+        Col("16-24k ratio to its reference", "16-24k", fmt=first), Col("64k", "64k"),
+        Col("128k", "128k"), Col("256k", "256k"),
+    ), note="against"),
     "factorial": Table("factorial", "objective", (
         ("hc", "hyper-connections (R = hc)"), ("attnres", "AttnRes (R = AttnRes)"),
         ("K", "key-value conv (K)"), ("V", "value residual (V)"), ("F", "ReLU² experts (F)"),
@@ -128,9 +229,8 @@ TABLES = {
         ("residuals/hc", "`hc`"), ("milestones/m2026_hybrid", "2026 hybrid"), ("moe/moe_latent", "`moe_latent`"),
     ), (Col("learning rates", "scanned"), Col("best", "best"), Col("vertex", "vertex"),
         Col("best at the scan's edge", "at the edge"), Col("at the next lr up %", "one step up, %"))),
-    "serving": Table("serving", "", SERVING_ROWS, SERVING_COLS),
-    "serving-fp8": Table("fp8", "", SERVING_ROWS, SERVING_COLS),
-    "swa": Table("serving", "", SWA_ROWS, SERVING_COLS),
+    "serving-fp8": Table("fp8", "", SERVING_ROWS, SERVING_COLS, suffix="+fp8"),
+    "swa": Table("fp8", "", SWA_ROWS, SERVING_COLS, suffix="+fp8"),
     "long": Table("report", "Long context", (
         ("baseline", "2020 baseline"), ("positions/rope_noyarn", "`rope_noyarn`"), ("norms/qknorm", "`qknorm`"),
         ("attention/mla", "`mla`"), ("attention/swa", "`swa`"), ("zoo/swa_2048", "`swa_2048`"),
@@ -163,6 +263,22 @@ def report_tables(text: str) -> dict[str, list[list[str]]]:
     return out
 
 
+def numbered_tables(text: str) -> dict[str, list[list[str]]]:
+    """Every table of a page without headings, as ``#0``, ``#1``, ...; ``""`` is the first."""
+    tables: list[list[list[str]]] = []
+    inside = False
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            inside = False
+        elif not set(line.strip()) <= set("|-: "):
+            if not inside:
+                tables.append([])
+            inside = True
+            tables[-1].append([c.strip() for c in line.strip().strip("|").split("|")])
+    out = {f"#{i}": t for i, t in enumerate(tables)}
+    return {"": tables[0], **out} if tables else out
+
+
 def factorial_tables(text: str) -> dict[str, list[list[str]]]:
     """factorial.py's main effects of each metric: term, effect, se, t."""
     out: dict[str, list[list[str]]] = {}
@@ -182,8 +298,8 @@ def factorial_tables(text: str) -> dict[str, list[list[str]]]:
 
 def section(tables: dict, prefix: str) -> list[list[str]]:
     """The table of the first section whose heading starts with `prefix`."""
-    if not prefix:
-        return next(iter(tables.values()))
+    if not prefix or prefix in tables:
+        return tables[prefix] if prefix in tables else next(iter(tables.values()))
     for title, rows in tables.items():
         if title.startswith(prefix):
             return rows
@@ -204,21 +320,24 @@ def cell(header: list[str], row: list[str] | None, c: Col, where: str) -> str:
     if c.header not in header:
         print(f"warning: no column {c.header!r} in {where!r}", file=sys.stderr)
         return ""
-    v = row[header.index(c.header)]
+    v = row[header.index(c.header) + c.offset]
     v = NAMES.get(v, v) if c.header == "vs" else v
-    return v if c.ranges else RANGE.sub("", v)
+    v = v if c.ranges else RANGE.sub("", v)
+    return c.fmt(v) if c.fmt else v
 
 
 def render(t: Table, tables: dict) -> str:
     """`t` as Markdown, from the sections of its source."""
     names = {t.section, *(c.section for c in t.columns if c.section)}
     sections = {s: by_key(section(tables, s), t.key) for s in names}
+    notes = [t.note] if t.note else []
     lines = [
-        "| | " + " | ".join(c.label for c in t.columns) + " |",
-        "|---" * (len(t.columns) + 1) + "|",
+        "| | " + " | ".join(notes + [c.label for c in t.columns]) + " |",
+        "|---" * (len(t.columns) + len(notes) + 1) + "|",
     ]
-    for key, name in t.rows:
-        cells = []
+    for key, name, *note in t.rows:
+        key = key + t.suffix if isinstance(key, str) else key
+        cells = list(note[:1]) if t.note else []
         for c in t.columns:
             header, found = sections[c.section or t.section]
             row = found.get(key)
@@ -251,26 +370,35 @@ def board(tables: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-PENDING = ":::{note}\nThe FP8 targets are not measured yet.\n:::\n"
+PENDING = ":::{note}\nThis table's source is not measured yet.\n:::\n"
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("report", type=Path, help="fit.py's report.md")
-    p.add_argument(
-        "serving", type=Path, help="sweep_fit.py's serving-measured.md, bf16"
-    )
     p.add_argument("factorial", type=Path, help="factorial.py's output")
-    p.add_argument("--fp8", type=Path, help="sweep_fit.py's serving-measured.md, FP8")
+    p.add_argument(
+        "--fp8", type=Path, help="sweep_fit.py's serving-measured.md, with +fp8 rows"
+    )
+    p.add_argument(
+        "--longctx", type=Path, help="the long-context sweeps' serving-longctx-table.md"
+    )
+    p.add_argument(
+        "--changes",
+        type=Path,
+        help="the long-context sweeps' serving-longctx-changes.md",
+    )
     p.add_argument("--out", type=Path, default=OUT)
     a = p.parse_args()
     sources = {
         "report": report_tables(a.report.read_text()),
-        "serving": report_tables(a.serving.read_text()),
         "factorial": factorial_tables(a.factorial.read_text()),
     }
     if a.fp8:
         sources["fp8"] = report_tables(a.fp8.read_text())
+    for name in ("longctx", "changes"):
+        if path := getattr(a, name):
+            sources[name] = numbered_tables(path.read_text())
     a.out.mkdir(parents=True, exist_ok=True)
     for name, t in TABLES.items():
         text = render(t, sources[t.source]) if t.source in sources else PENDING

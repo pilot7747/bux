@@ -2,14 +2,14 @@
 
 | | against | first 2k, % | past 8k, % | difference, points | difference by rung |
 |---|---|---|---|---|---|
-| 2020 baseline | the 2021 reference | +2.91 | +8.62 | +5.71 | d512 +9.3 d768 +9.3 d1024 +3.3 d1280 +0.9 |
-| `rope_noyarn` | the 2020 baseline | -3.87 | -0.79 | +3.08 | d512 +1.1 d768 +5.0 |
-| `qknorm` | the 2021 reference | -1.28 | -1.80 | -0.53 | d512 -1.3 d768 +1.2 d1024 -0.9 d1280 -1.0 |
-| `mla` | the 2021 reference | +0.20 | +0.13 | -0.07 | d512 -1.7 d768 +4.1 d1024 -1.2 d1280 -1.5 |
-| `swa` | the 2021 reference | +0.42 | +2.52 | +2.10 | d512 +0.9 d768 +6.7 d1024 +0.4 d1280 +0.4 |
-| `swa_2048` | the 2021 reference | +0.45 | +11.20 | +10.75 | d512 +5.2 d768 +16.3 |
-| `kda` | the 2021 reference | -3.97 | -3.10 | +0.86 | d512 -0.7 d768 +4.6 d1024 -0.1 d1280 -0.3 |
-| `msa` | the 2021 reference | -1.39 | +3.91 | +5.30 | d512 +5.3 |
-| `csa` | the 2021 reference | +9.85 | +17.22 | +7.37 | d512 +7.4 |
-| 2026 hybrid | the 2020 baseline | -12.49 | -18.07 | -5.59 | d512 -8.5 d768 -6.8 d1024 -4.5 d1280 -2.6 |
-| hybrid + hc, value residual, key-value conv | the 2026 hybrid | -2.45 | -2.06 | +0.38 | d512 -1.4 d768 +2.2 |
+| 2020 baseline | the 2021 reference | +3.93 | +7.54 | +3.61 | d512 +6.1 d768 +4.2 d1024 +3.3 d1280 +0.9 |
+| `rope_noyarn` | the 2020 baseline | -5.25 | -0.60 | +4.66 | d512 +4.3 d768 +5.0 |
+| `qknorm` | the 2021 reference | -1.12 | -2.03 | -0.90 | d512 -1.0 d768 -0.7 d1024 -0.9 d1280 -1.0 |
+| `mla` | the 2021 reference | +0.43 | -0.75 | -1.18 | d512 -1.4 d768 -0.7 d1024 -1.2 d1280 -1.5 |
+| `swa` | the 2021 reference | +0.64 | +1.60 | +0.96 | d512 +1.3 d768 +1.8 d1024 +0.4 d1280 +0.4 |
+| `swa_2048` | the 2021 reference | +0.89 | +9.25 | +8.36 | d512 +5.6 d768 +11.1 |
+| `kda` | the 2021 reference | -3.75 | -3.95 | -0.20 | d512 -0.4 d768 +0.0 d1024 -0.1 d1280 -0.3 |
+| `msa` | the 2021 reference | +0.10 | +0.56 | +0.46 | d512 +0.5 |
+| `csa` | the 2021 reference | +8.62 | +16.29 | +7.67 | d512 +7.7 |
+| 2026 hybrid | the 2020 baseline | -13.15 | -17.50 | -4.35 | d512 -5.7 d768 -4.4 d1024 -4.5 d1280 -2.7 |
+| hybrid + hc, value residual, key-value conv | the 2026 hybrid | -2.02 | -2.89 | -0.86 | d512 -1.4 d768 -1.2 d1024 -0.4 d1280 -0.5 |
