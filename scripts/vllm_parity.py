@@ -229,6 +229,29 @@ CASES = {
     " activation=situ, up_softcap=0.5))\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Zero experts: on the timeline's experts (a shared one, sigmoid, aux-free),
+    # LongCat-Flash's (softmax, unnormalized, scaled, no bias), and beside an expert
+    # norm, which routes apart.
+    "moe-zero": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, num_shared_experts=1,"
+    " router=sigmoid, routed_scaling_factor=2.5, load_balancing=aux_free,"
+    " expert=dense)\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-zero-longcat": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-zero-norm": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " load_balancing=aux_free, expert_norm=rmsnorm, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
     "moe-norm": HEAD
     + ATTN
