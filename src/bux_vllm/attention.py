@@ -251,7 +251,9 @@ class Attention(Layer):
         heads whose single keys vLLM's DSA kernels pick; else 0, for the plugin's
         kernels."""
         w, dtype = site.index_writer, site.vllm_config.model_config.dtype
-        ix = w["indexer"] if self.reads_index and w and w["type"] == "gqa" else None
+        if w is None or not self.reads_index or w["type"] != "gqa":
+            return 0
+        ix = w["indexer"]
         if not ix or ix["block_size"] != 1:
             return 0
         same = (w["num_kv_heads"], *kv.head_dims(w, width)) == (
