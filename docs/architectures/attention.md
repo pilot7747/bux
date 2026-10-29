@@ -847,12 +847,18 @@ of d_model 3584 with DSA's indexer (4 heads of 64, top 2048) on its 14 global la
 serves 1.43 times as many 256k-token sessions an hour within 30 ms a token when 4 of
 them run it and the other 10 reuse their picks, and its time to first token falls from
 3.9 s to 2.2 s. Under 16-24k-token sessions it serves 1.03 times as many: there the
-sparse attention itself, not the indexer, costs most.
+sparse attention itself, not the indexer, costs most. Training skips the readers' scoring
+too: at 16k tokens a row on two B300s, the same hybrid at d_model 768, one indexer for its
+three global layers, steps in 1.3 s instead of 2.3 s.
 
-With `indexer(loss_over=served)`, every layer that reads the picks also distills the
-writer's indexer towards its own attention over them, IndexCache's multi-layer
-distillation ([The indexer's loss](#indexer-loss)). The writer's indexer then learns to
-pick keys for the layers it serves, not for its own alone:
+One indexer for two sparse layers cost no quality in these runs. One for four can lose the
+far context: trained on code at d_model 512 and 768 (8 runs, 2026-10-29), it lost
+5-10% bits per byte at positions past 8k in 3 of them, against an indexer in every layer.
+IndexCache's multi-layer distillation prevents it. With `indexer(loss_over=served)`,
+every layer that reads the picks also distills the writer's indexer towards its own
+attention over them ([The indexer's loss](#indexer-loss)), so that it picks keys for the
+layers it serves, not for its own alone. None of the 8 runs then lost more than 2.2%, at
+a cost of up to 1% elsewhere in a model sparse in every layer:
 
 ```bux
 F = layer(attn(indexer=indexer(top_k=2048, loss_over=served), index=@topk))
