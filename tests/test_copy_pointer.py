@@ -15,9 +15,11 @@ import pytest
 from flax import nnx
 from jaxtyping import Array, Float, Int
 
+from bux import parallel
 from bux.architecture import Model
 from bux.architecture.copy import Pointer, _mixture_sums, log_probs, mixture_nll
-from bux.architecture.logits import Projection, Scores
+from bux.architecture.layers.embedding import Head
+from bux.architecture.logits import HeadOutput, Projection, Scores
 from bux.export.hf import basic as hf_basic
 from bux.export.huggingface import save
 from bux.lang import compile, compile_runs, ir
@@ -304,9 +306,12 @@ def test_dense_log_probs_are_the_mixture_the_loss_scores():
     assert jnp.isneginf(dense[..., 63]).all()
 
 
-def test_a_run_without_a_pointer_trains_as_before():
-    """smoke.bux's id, losses and eval losses, as main computed them before the
-    pointer (04f1159; CPU, float32)."""
+def test_a_run_without_a_pointer_trains_as_before(monkeypatch):
+    """smoke.bux keeps its id, and a pointer gives it another; and on this machine,
+    without a pointer it trains to the bit as with the head and its loss as they
+    were before the pointer (04f1159), both runs in one process, so that the
+    comparison holds on any CPU. (A closed gate is no stand-in here: smoke.bux's
+    tied head has no row whose logit can be -inf.)"""
     sets = [
         "schedule.warmup = 1",
         "steps = 4",
@@ -321,21 +326,35 @@ def test_a_run_without_a_pointer_trains_as_before():
         SMOKE.read_text(), filename=str(SMOKE), overrides=[*sets, on]
     )
     assert pointed_run.id != run.id
-    seen: list[tuple[int, str, float]] = []
 
-    class Seen(Sink):
-        def write(self, step: int, scalars: Scalars) -> None:
-            seen.extend((step, k, float(v)) for k, v in scalars.items() if "loss" in k)
+    def losses() -> list[tuple[int, str, float]]:
+        seen: list[tuple[int, str, float]] = []
 
-    train(run, tempfile.mkdtemp(), echo=lambda _: None, sinks=[Seen()])
-    want = [
-        (1, "loss", 6.256721496582031),
-        (2, "loss", 6.250439643859863),
-        (2, "eval_loss", 6.25772942437066),
-        (3, "loss", 6.242168426513672),
-        (4, "loss", 6.254068851470947),
-        (4, "eval_loss", 6.257589431036086),
+        class Seen(Sink):
+            def write(self, step: int, scalars: Scalars) -> None:
+                kept = [(k, float(v)) for k, v in scalars.items() if "loss" in k]
+                seen.extend((step, k, v) for k, v in kept)
+
+        train(run, tempfile.mkdtemp(), echo=lambda _: None, sinks=[Seen()])
+        return seen
+
+    now = losses()
+
+    def head_before(self: Head, x: Any, taps: Any) -> Any:
+        taps.heads.append(HeadOutput(x, self.projection()))
+        return x
+
+    def sums_before(self: HeadOutput, targets: Any, weights: Any, z: bool) -> Any:
+        return parallel.method("loss")(self, targets, weights, z)
+
+    monkeypatch.setattr(Head, "__call__", head_before)
+    monkeypatch.setattr(HeadOutput, "sums", sums_before)
+    assert losses() == now
+    assert [(s, k) for s, k, _ in now] == [
+        (1, "loss"),
+        (2, "loss"),
+        (2, "eval_loss"),
+        (3, "loss"),
+        (4, "loss"),
+        (4, "eval_loss"),
     ]
-    assert [(s, k) for s, k, _ in seen] == [(s, k) for s, k, _ in want]
-    for (_, _, got), (_, _, value) in zip(seen, want, strict=True):
-        assert got == pytest.approx(value, rel=1e-6)
