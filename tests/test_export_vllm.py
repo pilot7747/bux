@@ -1116,6 +1116,18 @@ def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
 
 
+def test_differential_attention_pairs_heads_as_bux() -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, differential=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.lambda_proj is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    maps = jax.random.normal(jax.random.key(2), (1, 8, 8, 16))
+    want = attn._difference(x, maps)[0]
+    lam = torch.from_numpy(np.array(attn.lambda_proj(x)[0]))
+    got = outputs.differential(torch.from_numpy(np.array(maps[0])), lam)
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), atol=1e-6)
+
+
 def test_hyga_s_gate_is_bux_s() -> None:
     c = cfg.GQAConfig(
         num_heads=4,
@@ -2687,10 +2699,10 @@ def built(
 def kept(model: Any, path: str) -> bool:
     """Whether the plugin keeps the vLLM linear layer at `path` in the model's
     dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's,
-    HyGA's cross-head gate of an output a head, and a sparse MLA's ``kv_b``, whose
-    weight the sparse ops read."""
+    HyGA's cross-head gate and differential attention's weights, of an output a
+    head, and a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name in ("shared_gate", "cross_gate"):
+    if name in ("shared_gate", "cross_gate", "lambda_proj"):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 

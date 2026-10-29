@@ -480,6 +480,26 @@ CASES = {
     + "residual = hc(expansion=4)\n"
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
     " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
+    # DIFF V2: two query heads to an output head, a pair in one kv head's group, with
+    # sinks for each query head and a window; and with a gate, QK-norm of all heads
+    # and fused projections.
+    "diff": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, differential=true, rope=rope())\n"
+    + "local = attn(sliding_window_size=8, sinks=true)\n"
+    + "fused = attn(gated=true, qk_norm=rmsnorm, qk_norm_all_heads=true,"
+    " fused_qkv=true)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " [rmsnorm fused] [rmsnorm ffn] rmsnorm head",
+    # xsa-hybrid's global layers differential, without XSA.
+    "diff-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4, differential=true)\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
     "dsa": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
     + "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"

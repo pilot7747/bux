@@ -98,6 +98,13 @@ GQA_SETTINGS = {
     " gate_output_rank=4, gate_head_bias=true, gate_activation=softplus)",
     "hyga, xsa, output norm": GQA + ", gated=true, gate_input_rank=4,"
     " gate_cross_head=true, exclusive=learned, output_norm=rmsnorm)",
+    "differential": GQA + ", differential=true)",
+    "differential, sinks, window, fused, all heads": GQA + ", differential=true,"
+    " sinks=true, sliding_window_size=3, fused_qkv=true, qk_norm=rmsnorm,"
+    " qk_norm_all_heads=true)",
+    "differential, mqa, xsa, hyga, log scale": "gqa(num_heads=4, num_kv_heads=1,"
+    " differential=true, exclusive=learned, gated=true, gate_output_rank=4,"
+    " gate_cross_head=true, log_scale=0.5, log_scale_floor=2)",
     "xsa, learned, mqa, window, sinks": "gqa(num_heads=4, num_kv_heads=1,"
     " exclusive=learned, sliding_window_size=3, sinks=true, rope=rope())",
     "xsa, relative bias": GQA + ", exclusive=true, relative_bias=relbias(rank=2,"
@@ -145,6 +152,15 @@ PORTS = {
     ),
     # The timeline's global layer: no positions, QK-norm, a gate, a conv on keys
     # and values, the value residual, and XSA over the values it mixed.
+    "value residual, differential, xsa": wired(
+        "gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
+        " differential=true, exclusive=true)",
+        "attn(v=@v1)",
+        "attn(v=$v1)",
+    ),
+    "kv sharing, differential": wired(
+        GQA + ", differential=true)", "attn(kv=@kv)", "attn(kv=$kv!)"
+    ),
     "value residual, xsa": wired(
         "gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
         " exclusive=learned)",
