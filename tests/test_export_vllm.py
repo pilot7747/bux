@@ -31,6 +31,7 @@ from bux.architecture import Model
 from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
+from bux.architecture.experts import moe as bux_moe
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
 from bux.architecture.registry import Taps
@@ -555,6 +556,12 @@ ROUTERS = {
     " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5, expert=e)",
     "unnormalized sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
     " shared_expert_sink=true, normalize_top_k=false, expert=e)",
+    "zero experts": "moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
+    "zero experts, longcat": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=e)",
+    "zero experts, sinks": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " num_shared_experts=2, shared_expert_sink=true, router=sigmoid, expert=e)",
 }
 
 
@@ -571,7 +578,7 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     moe = MoE(c, 64, rngs=nnx.Rngs(0))
     router = routing.Router(c.model_dump(mode="json"))
     if moe.router_bias is not None and router.bias is not None:
-        bias = 0.1 * jax.random.normal(jax.random.key(1), (c.num_experts,))
+        bias = 0.1 * jax.random.normal(jax.random.key(1), moe.router_bias[...].shape)
         moe.router_bias[...] = bias
         router.bias.data = torch.from_numpy(np.array(bias))
     x = jax.random.normal(jax.random.key(2), (1, 32, 64))
@@ -583,6 +590,81 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     got_sinks = router.route(logits, c.top_k)[2].numpy()
     want = np.zeros((32, 0)) if sinks is None else np.asarray(sinks)[0]
     np.testing.assert_allclose(got_sinks, want, rtol=1e-6)
+
+
+def test_zero_experts_split_as_bux_runs_them() -> None:
+    """The zero experts' output (`zero_split`) is bux's, and the picks the fused MoE
+    keeps of `given_logits` (`pick_given`), or `zero_split`'s for `apart`, weigh the
+    routed experts as bux's do; every zero pick is the phantom expert, which the
+    expert map skips, so that a token's GEMM slots are its FFN experts'."""
+    c = cfg.MoEConfig.model_validate(
+        {
+            "num_experts": 4,
+            "top_k": 3,
+            "num_zero_experts": 2,
+            "router": "sigmoid",
+            "expert": {
+                "type": "gated_mlp",
+                "intermediate_size": 8,
+                "activation": "swish",
+            },
+        }
+    )
+    moe = MoE(c, 16, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(2), (1, 32, 16))
+    idx, weights, _ = moe._route(x)
+    zeros = np.asarray(idx)[0] >= 4
+    assert zeros.any() and not zeros.all()
+    as_torch = (torch.from_numpy(np.array(a)[0]) for a in (x, weights, idx))
+    zero, w, picks = routing.zero_split(*as_torch, 4)
+    want = bux_moe.zero_experts(x, idx, weights, 4)[0]
+    np.testing.assert_allclose(zero.numpy(), np.asarray(want), rtol=1e-6)
+    emap = routing.phantom_map(4)
+    assert emap.tolist() == [0, 1, 2, 3, -1]
+    dense = bux_moe.dense_weights(idx, weights, 4)[0]
+    w_, i_ = (torch.from_numpy(np.array(a)[0]) for a in (weights, idx))
+    given = routing.given_logits(w_, i_, 4)
+    assert given.shape == (32, 5) and torch.isinf(given[:, 4]).all()
+    for got_w, got_ids in (
+        (w, picks),
+        routing.pick_given(torch.zeros(32, 16), given, 3, True),
+    ):
+        skipped = emap[got_ids.long()] == -1  # the slots the kernels skip
+        np.testing.assert_array_equal(skipped.sum(-1).numpy(), zeros.sum(-1))
+        assert (got_w[skipped] == 0).all()
+        kept = bux_moe.dense_weights(jnp.asarray(got_ids), jnp.asarray(got_w), 4)
+        np.testing.assert_allclose(np.asarray(kept), np.asarray(dense), rtol=1e-6)
+
+
+def test_zero_experts_route_in_one_graph() -> None:
+    """The routing with zero experts traces whole, as torch.compile takes the
+    model's forward, where vLLM's ZeroExpertRouter's assertion fails."""
+    c = {
+        "num_experts": 8,
+        "num_zero_experts": 4,
+        "top_k": 3,
+        "router": "sigmoid",
+        "router_logit_scale": 1.0,
+        "num_groups": 1,
+        "normalize_top_k": True,
+        "routed_scaling_factor": 2.5,
+        "load_balancing": "aux_free",
+    }
+    router = routing.Router(c)
+
+    def routed(z: torch.Tensor, logits: torch.Tensor) -> tuple:
+        weights, idx, _ = router.route(logits, 3)
+        zero = routing.zero_split(z, weights, idx, 8)[0]
+        return zero, routing.pick_given(
+            z, routing.given_logits(weights, idx, 8), 3, True
+        )
+
+    z, logits = torch.randn(5, 16), torch.randn(5, 12)
+    traced = torch.compile(routed, fullgraph=True, backend="eager")
+    for a, b in zip(
+        jax.tree.leaves(traced(z, logits)), jax.tree.leaves(routed(z, logits))
+    ):
+        assert torch.equal(a, b)
 
 
 ROPES = {
@@ -1033,6 +1115,18 @@ def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
         *(torch.from_numpy(np.array(a)[0]) for a in (y, v)), strength
     )
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
+
+
+def test_differential_attention_pairs_heads_as_bux() -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, differential=True)
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.lambda_proj is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    maps = jax.random.normal(jax.random.key(2), (1, 8, 8, 16))
+    want = attn._difference(x, maps)[0]
+    lam = torch.from_numpy(np.array(attn.lambda_proj(x)[0]))
+    got = outputs.differential(torch.from_numpy(np.array(maps[0])), lam)
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), atol=1e-6)
 
 
 def test_hyga_s_gate_is_bux_s() -> None:
@@ -2433,6 +2527,8 @@ class StubExperts(torch.nn.Module):
     """vLLM's routed experts (`FusedMoEFactory`'s): their stacked weights, whose
     loaders count, and their quantization config."""
 
+    use_ep = False  # one rank's every expert
+
     def __init__(self, num_experts, hidden_size, intermediate_size, **kwargs):
         super().__init__()
         self.quant_config = kwargs.get("quant_config")
@@ -2605,10 +2701,12 @@ def built(
 def kept(model: Any, path: str) -> bool:
     """Whether the plugin keeps the vLLM linear layer at `path` in the model's
     dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's,
-    HyGA's cross-head gate of an output a head, and a sparse MLA's ``kv_b``, whose
-    weight the sparse ops read."""
+    HyGA's cross-head gate and differential attention's weights, of an output a
+    head, and a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name in ("shared_gate", "cross_gate") or owner.endswith(".pointer"):
+    if name in ("shared_gate", "cross_gate", "lambda_proj") or owner.endswith(
+        ".pointer"
+    ):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 

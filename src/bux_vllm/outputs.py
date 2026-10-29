@@ -1,6 +1,6 @@
 """What a ``gqa`` layer does to its heads' outputs between attending and its output
-projection, in plain PyTorch: exclusive self-attention (XSA), and the logits of
-HyGA's gates. The model's forward runs them under torch.compile, which fuses them
+projection, in plain PyTorch: differential attention's pairs of query heads
+(DIFF V2), exclusive self-attention (XSA), and the logits of HyGA's gates. The model's forward runs them under torch.compile, which fuses them
 into the kernels around them."""
 
 from __future__ import annotations
@@ -68,3 +68,19 @@ def hybrid_logits(
     if down is not None and own_up is not None:
         logits = logits + by_head(F.silu(by_head(out, down)), own_up)
     return logits
+
+
+def differential(out: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
+    """Each output head's ``a1 - sigmoid(lam) a2`` of its pair of query heads, as
+    bux's ``differential`` (DIFF V2), in the outputs' dtype.
+
+    Args:
+        out: The query heads' outputs, (T, 2h, dv), each pair side by side.
+        lam: The input's projection to a weight a head, (T, h).
+
+    Returns:
+        The output heads, (T, h, dv).
+    """
+    t, hq, dv = out.shape
+    pairs = out.view(t, hq // 2, 2, dv)
+    return pairs[:, :, 0] - torch.sigmoid(lam).to(out.dtype)[..., None] * pairs[:, :, 1]

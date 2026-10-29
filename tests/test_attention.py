@@ -1200,6 +1200,11 @@ SPLIT = {
     # XSA, learned: each query head takes its group's value, which on tensor=4 stays
     # whole
     "xsa": "gqa(num_heads=4, num_kv_heads=2, gated=true, exclusive=learned)",
+    # DIFF V2: pairs of query heads, which tensor=4 keeps together
+    "differential": (
+        "gqa(num_heads=4, num_kv_heads=2, differential=true, sinks=true, gated=true,"
+        " exclusive=true)"
+    ),
     # HyGA: per-head matrices of the gate, and a gate of each head from all of them
     "hyga": (
         "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_input_rank=4,"
@@ -1254,7 +1259,7 @@ def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
 
 
 @pytest.mark.parametrize(
-    "layer", ["gqa", "power_scale", "xsa", "hyga", "mla", "msa", "csa"]
+    "layer", ["gqa", "power_scale", "xsa", "hyga", "differential", "mla", "msa", "csa"]
 )
 def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
     trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)

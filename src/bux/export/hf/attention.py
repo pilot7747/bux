@@ -508,7 +508,7 @@ class SoftmaxAttention(nn.Module):
             return softmax_attention(
                 q, kv.k, kv.v, keep, self.scale, self.softcap, self.sinks, bias, gain
             )
-        self.num_key_value_groups = self.h // kv.k.shape[1]
+        self.num_key_value_groups = q.shape[1] // kv.k.shape[1]
         attend = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention
         )
@@ -599,6 +599,17 @@ class SoftmaxAttention(nn.Module):
         return self.o(out.flatten(2))
 
 
+def differential(out: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
+    """Each output head's ``a1 - sigmoid(lam) a2``, b t h dv, of its pair of query
+    heads' outputs side by side in out, b t 2h dv (DIFF V2), lam b t h."""
+    b, t, _, dv = out.shape
+    pairs = out.view(b, t, -1, 2, dv)
+    return (
+        pairs[..., 0, :]
+        - torch.sigmoid(lam).to(out.dtype)[..., None] * pairs[..., 1, :]
+    )
+
+
 def by_head(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Each head's x, b t h i, times its own matrix of w, h i o."""
     return torch.einsum("bthi,hio->btho", x, w.to(x.dtype))
@@ -645,8 +656,9 @@ class Attention(SoftmaxAttention):
     causal conv on k and v, QK-norm (of each head, or of all heads together under
     ``qk_norm_all_heads``) then RoPE, and its ports: ``ve`` (value embeddings, added
     to the values first), ``v`` (value residual), ``kv`` (cross-layer KV sharing) and
-    ``index`` (an indexer's kept keys); and XSA, each head's output less its part
-    along the query's own value (`exclusive`).
+    ``index`` (an indexer's kept keys); differential attention, two query heads an
+    output head (`differential`); and XSA, each head's output less its part along
+    the query's own value (`exclusive`).
 
     A layer that reads ``kv`` attends to the writer's keys and values as the writer's
     cache layer keeps them, all of them while decoding, and keeps none of its own; it
@@ -661,13 +673,13 @@ class Attention(SoftmaxAttention):
         dk = c["head_dim"] or width // h
         dv = c["v_head_dim"] or dk
         super().__init__(c, width, site, h, dk, dv, c["bias"])
-        self.g, self.dk = g, dk
+        self.g, self.dk, self.hq = g, dk, 2 * h if c["differential"] else h
         self.reads_kv = reads(site.ports, "kv")
         if self.reads_kv:
             check_reader(c, site.ports)
         self._projections(c, width, h, g, dk, dv)
         qk, self.all_heads = c["qk_norm"], c["qk_norm_all_heads"]
-        q_width, k_width = (h * dk, g * dk) if self.all_heads else (dk, dk)
+        q_width, k_width = (self.hq * dk, g * dk) if self.all_heads else (dk, dk)
         self.q_norm = Norm(qk, q_width) if qk else None
         self.k_norm = Norm(qk, k_width) if qk and not self.reads_kv else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
@@ -687,6 +699,21 @@ class Attention(SoftmaxAttention):
         self.exclusive = c["exclusive"]
         learned = self.exclusive == "learned"
         self.xsa_alpha = nn.Parameter(torch.zeros(h)) if learned else None
+        self._differential(c, width, site)
+
+    def _differential(self, c: dict, width: int, site: Site) -> None:
+        """Make differential attention's projection to each output head's weight
+        on its second map, and a sink for each query head.
+
+        Raises:
+            NotImplementedError: Differential attention reading the ``index`` port.
+        """
+        on = c["differential"]
+        if on and reads(site.ports, "index"):
+            raise NotImplementedError("gqa: differential with the index port")
+        self.lambda_proj = nn.Linear(width, self.h, bias=False) if on else None
+        if on and c["sinks"]:
+            self.sinks = nn.Parameter(torch.zeros(self.hq))
 
     def _projections(
         self, c: dict, width: int, h: int, g: int, dk: int, dv: int
@@ -698,10 +725,11 @@ class Attention(SoftmaxAttention):
         fused = c["fused_qkv"] and not self.reads_kv
         split = not (fused or self.reads_kv)
         own_v = 0 if c["k_eq_v"] else g * dv  # k_eq_v: values from the keys
+        hq = self.hq
         self.qkv = (
-            nn.Linear(width, h * dk + g * dk + own_v, bias=bias) if fused else None
+            nn.Linear(width, hq * dk + g * dk + own_v, bias=bias) if fused else None
         )
-        self.q = None if fused else nn.Linear(width, h * dk, bias=bias)
+        self.q = None if fused else nn.Linear(width, hq * dk, bias=bias)
         self.k = nn.Linear(width, g * dk, bias=bias) if split else None
         self.v = nn.Linear(width, own_v, bias=bias) if split and own_v else None
         self.o = nn.Linear(h * dv, width, bias=out_bias)
@@ -726,6 +754,8 @@ class Attention(SoftmaxAttention):
         self.write(ctx, "kv", kv)
         kept = self.kept(x, x, ctx, kv)
         out = self.attend(x, q, kv, ctx, kept)
+        if self.lambda_proj is not None:
+            out = differential(out, self.lambda_proj(x))
         if self.exclusive:
             strength = None if self.xsa_alpha is None else self.xsa_alpha.tanh()
             out = exclusive(out, v, strength)
@@ -734,7 +764,7 @@ class Attention(SoftmaxAttention):
     def _project(self, x: torch.Tensor) -> list[Any]:
         """Project x to q, k and v, b t _; k and v are None if the layer reads kv."""
         if self.qkv is not None:
-            q, k = self.h * self.dk, self.g * self.dk
+            q, k = self.hq * self.dk, self.g * self.dk
             if self.v_norm is not None:
                 q, k = self.qkv(x).split([q, k], -1)
                 return [q, k, k]
@@ -748,7 +778,7 @@ class Attention(SoftmaxAttention):
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """Split the projected queries into heads with QK-norm (`_split_normed`),
         then apply RoPE and the power scale."""
-        q = self._split_normed(q, self.h, self.q_norm)
+        q = self._split_normed(q, self.hq, self.q_norm)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
         power, length = self.power_scale

@@ -60,6 +60,7 @@ model = embed block^12 norm head(tied=true)
 | `exclusive` | `false` | each head's output less its part along the token's own value: `true` or `learned` ([below](#exclusive-self-attention-xsa)) (XSA) |
 | `value_embed_gate` | `6` | the channels the gate of a layer that reads the `ve` port takes ([Value embeddings](#value-embeddings)) |
 | `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
+| `differential` | `false` | two query heads for each output head, the second's map subtracted from the first's ([below](#differential-attention-diff-v2)) (DIFF V2) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):
@@ -460,6 +461,33 @@ global = attn(exclusive=learned)
 
 XSA reads the values the layer attends to: those its `v` port mixed in, under a value
 residual. A layer that reads the `kv` port has no values of its own, and raises.
+
+### Differential attention (DIFF V2)
+
+`differential=true`, a setting of `gqa`, gives the layer two query heads for each of
+its `num_heads` output heads, both in the group of one kv head, and makes each output
+the difference of their attention (Ye et al., 2026, Differential Transformer V2):
+
+$$
+o_i = a_{i,1} - \sigma(x W_\lambda)_i\, a_{i,2},
+$$
+
+$a_{i,1}$ and $a_{i,2}$ the outputs of the pair's query heads, and $W_\lambda$ a
+projection of the input to a weight for each head and token, without a bias. The kv
+heads, their cache and the output projection are as without it; the queries and the
+attention's FLOPs double. The subtraction lets a head's output shrink to nothing,
+which a softmax alone cannot, and the post finds it stabler than DIFF V1, which had a
+norm of each head after it. Sinks, if set, are one a query head.
+
+```bux
+global = attn(differential=true)
+```
+
+It composes with the gate (on the output heads), QK-norm, RoPE, the conv on keys and
+values, and both ports. With XSA, the pair shares one value, so removing the part
+along it from the difference is removing it from each map: `exclusive` takes the
+output heads. An indexer and a relative bias, which see each query head alone, are
+not yet supported with it.
 
 ## Positions
 

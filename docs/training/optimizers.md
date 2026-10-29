@@ -1,7 +1,8 @@
 # Optimizers, schedules and the loss
 
 Four settings turn a gradient into an update: the optimizer, the learning-rate
-schedule, gradient clipping, and the loss the gradient comes from.
+schedule, gradient clipping, and the loss the gradient comes from. A fifth, `ema`,
+sets the weights a run ends on ([The tail EMA](#the-tail-ema)).
 
 ```bux
 optimizer = muon(lr=0.02)
@@ -12,12 +13,13 @@ loss      = loss(z=1e-4)
 
 | Setting | Takes | Default |
 |---------|-------|---------|
-| `optimizer` | {bux}`adamw` or {bux}`muon` | required |
+| `optimizer` | {bux}`adamw`, {bux}`muon` or {bux}`normuon` | required |
 | `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` |
 | `clip` | a global norm, or `none` | `1.0` |
 | `loss` | {bux}`loss` | `loss(z=0, mtp=0.3)` |
+| `ema` | {bux}`ema`, or `none` | `none` |
 
-Both optimizers are optax transformations built from their configs
+The optimizers are optax transformations built from their configs
 ({py:mod}`bux.train.optim`). A variant of either is a function registered under its
 name ([Registries](extending.md#registries)).
 
@@ -36,6 +38,7 @@ optimizer = adamw(lr=3e-4, b1=0.9, b2=0.95, weight_decay=0.1)
 | `b2` | `0.95` | the decay of the second moment |
 | `eps` | `1e-8` | added to the square root of the second moment |
 | `weight_decay` | `0.1` | decoupled weight decay, times the learning rate |
+| `cautious_weight_decay` | `false` | decay only where the update has the weight's sign ([below](#cautious-weight-decay)) |
 
 **What decays.** Weight decay applies only to matrices and stacks of them. It skips
 every vector (biases, norm scales) and anything a layer lists in its
@@ -45,6 +48,26 @@ token shift and `r_k`, and hyper-connections' static maps, which start at
 $[e_k, I]$ and 1 rather than at 0. The stacked dimension of a scanned repeat does not
 count, so the norm scales that `methods(repeat=scan)` stacks are still vectors and
 do not decay ({py:func}`bux.train.optim.weight_decay_mask`).
+
+(cautious-weight-decay)=
+### Cautious weight decay
+
+With `cautious_weight_decay=true`, an entry decays only where the step and the decay
+pull the same way: where the optimizer's update $u$ (Adam's $\hat m / (\sqrt{\hat
+v} + \epsilon)$, Muon's orthogonalized update) has the weight's sign, or either is 0
+(Chen et al., 2025):
+
+$$
+x \leftarrow x - \eta \left(u + \lambda\, \mathbb{I}(u \odot x \ge 0) \odot x\right).
+$$
+
+Elsewhere the step alone moves the weight. It needs no setting of its own: the same
+`weight_decay` and learning rate. `adamw` and `muon` both take it, and Muon's `adam`
+takes its own.
+
+```bux
+optimizer = adamw(lr=2e-3, weight_decay=0.1, cautious_weight_decay=true)
+```
 
 ## Muon
 
@@ -67,6 +90,7 @@ iterations, for the matrices inside the blocks, and AdamW for every other parame
 | `ns_restarts` | `none` | the iterations after which `gram` restarts; `none` is 2, 5, 8, ... |
 | `ns_dtype` | `bfloat16` | the dtype Newton-Schulz runs in: `bfloat16` or `float32` |
 | `weight_decay` | `0.1` | decoupled weight decay of the matrices, times the learning rate |
+| `cautious_weight_decay` | `false` | decay only where the orthogonalized update has the weight's sign ([Cautious weight decay](#cautious-weight-decay)) |
 | `consistent_rms` | `0.2` | the RMS updates are scaled to, or `none` |
 | `adam` | `none` | the AdamW of every other parameter; `none` is `adamw(lr=lr)` |
 
@@ -179,6 +203,33 @@ at twice as wide. In bfloat16 it lands 6 to 8 times closer to float32's result t
 under `owner` Newton-Schulz is a few milliseconds of it. The authors' 2x speedup needs
 symmetric GEMM kernels with fused epilogues, which XLA does not have
 ([measurements](../parallelism/muon.md#gram-newton-schulz-on-b300s)).
+
+### NorMuon
+
+{bux}`normuon` is NorMuon (Li et al., 2025): Muon, its orthogonalized update then
+divided, for each output unit of a matrix (a neuron), by the root of a running
+average of the unit's mean square, and scaled back to the update's norm before. Units
+whose orthogonalized rows come out larger than others then move as much as the rest.
+It takes every field of `muon`, and two of its own:
+
+| Field | Default | What it is |
+|-------|---------|------------|
+| `b2` | `0.95` | the decay of each neuron's mean square's average, without a bias correction |
+| `eps` | `1e-10` | added to the average's root |
+
+```bux
+optimizer = normuon(lr=2e-3, weight_decay=0.1, adam=adamw(lr=2e-3, weight_decay=0.1))
+```
+
+It computes as the authors' code does: the mean square of each output's row of the
+update, the update over its root, then the whole matrix back to its Frobenius norm,
+before `consistent_rms` scales it. A stack of experts normalizes each expert's
+matrices on their own. Its state is one float32 average per output unit of every
+matrix Muon trains ({py:func}`bux.train.optim.neuron_normalized`).
+
+On a KDA hybrid of 680M parameters at a width of 512, the line above lowered the
+held-out bits per byte by 2.3% against AdamW at the same learning rate (503M tokens,
+3 seeds, B300s, 2026-10-29). Half and twice that learning rate came within 0.4% of it.
 
 ## Schedules
 
@@ -328,6 +379,40 @@ and Beam state no schedule.
 
 The log's `lr` is the learning rate of the step just taken. A new schedule is a
 function registered under its name ([Registries](extending.md#registries)).
+
+(the-tail-ema)=
+## The tail EMA
+
+```bux
+ema = ema(window=0.25, blend=0.65)
+```
+
+{bux}`ema` averages the weights over the run's last steps and ends the run on a blend
+of the average and the last step's weights (modded-nanogpt's TailEMA). The average
+starts at the first step of the window, as that step's weights, and every later step
+moves it toward its own by $2 / (\text{window} + 1)$. After the last step the weights
+become $w + \text{blend}\,(\bar w - w)$: `blend=1` ends on the average alone, `0` on
+the last step's.
+
+| Field | Default | What it is |
+|-------|---------|------------|
+| `window` | `0.25` | the steps it averages, the last of the run, or below 1 a share of them |
+| `blend` | `0.65` | how much of the average the weights end on |
+
+- **What reads it:** the final eval, the final checkpoint and an export of it, which
+  the blend replaces the weights for. Evals before the last step see the weights as
+  trained.
+- **Memory:** a float32 copy of the parameters in the optimizer's state, sharded as
+  they are, for the whole run.
+- **Resuming:** checkpoints keep the average, so a run resumes inside its window
+  and ends where it would have.
+- **Schedules:** an average helps most where the steps still move the weights. A
+  cooldown to 0, such as `wsd`'s, ends on steps that barely do; modded-nanogpt pairs
+  its EMA with a learning rate that decays to a floor above 0.
+
+modded-nanogpt averages over the last 298 of 1188 steps and blends 0.65 of the
+average into its embedding and head, with other averages for its other weights; bux
+takes one average of every parameter ({py:mod}`bux.train.ema`).
 
 ## Clipping
 
