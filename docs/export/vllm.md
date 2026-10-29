@@ -510,7 +510,10 @@ latent, which doubles the layer's cache.
   in head slots of the call's cache after its kv heads: each block's keys, then
   their scales, as DeepGEMM's paged kernel reads them. They page with the keys and
   values, one cache a call, so prefix caching hits as in a dense model. The cache
-  takes blocks of 64 tokens, which vLLM sets (or splits larger blocks into).
+  takes blocks of 64 tokens, which vLLM sets (or splits larger blocks into). One
+  Triton kernel writes a step's keys, values and indexer keys into the cache, and
+  another quantizes the indexer's queries, each in one launch and bit for bit as
+  PyTorch would.
 - **Scores.** A prompt chunk's queries score the keys of its request, as vLLM
   gathers them, by DeepGEMM's MQA logits (`fp8_fp4_mqa_logits`); decoded tokens
   score theirs in place, by its paged MQA logits. Queries are FP8 too, with a scale
@@ -523,12 +526,14 @@ latent, which doubles the layer's cache.
   complete blocks as DSA's keys. A query also keeps its own block while that is
   unfinished.
 - **Picks.** vLLM's top-k kernels keep each query's best `top_k` of the keys (or
-  blocks) it sees, as DeepSeek-V3.2's do.
+  blocks) it sees, as DeepSeek-V3.2's do. A prompt chunk's scores are float32, as
+  DeepGEMM's MQA logits give them: vLLM 0.32 has no bfloat16 scores or fused
+  scores and top-k for a prompt's dense indexer.
 - **Attention.** vLLM's own sparse GQA attention, the kernel it runs Qwen4's QSA
-  on, attends over the picks, reading the paged keys and values in place: in a
-  bfloat16 model, at heads of a power of two of dims, in groups of 4 query heads or
-  more, without sinks or a softcap. Other layers attend by the plugin's Triton
-  kernel, and MLA's latents by PyTorch.
+  on, attends over the picks, reading the paged keys and values in place, into
+  the op's output: in a bfloat16 model, at heads of a power of two of dims, in
+  groups of 4 query heads or more, without sinks or a softcap. Other layers attend
+  by the plugin's Triton kernel, and MLA's latents by PyTorch.
 - **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
   values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
   layer that reads its `index` port. The attention kernel reads them as they are,

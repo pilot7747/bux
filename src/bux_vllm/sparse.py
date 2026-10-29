@@ -50,7 +50,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from . import compressed, dsa, kernels, msa, picks
+from . import caching, compressed, dsa, kernels, msa, picks
 from .common import own_cache_dtype
 from .kv import reads, writes
 
@@ -352,9 +352,22 @@ class PagedCache(nn.Module, AttentionLayerBase):
         index keys, where its kernels do."""
         return dsa.Raw(self.kv_cache, self.heads, self.index_dims, self.model_dtype)
 
-    def write(self, slots: torch.Tensor, rows: torch.Tensor) -> None:
-        """Write the tokens' keys and values, (T, heads, channels), at vLLM's
-        `slots`, (T,): in FP8, divided by their scales, in an FP8 cache."""
+    def write(
+        self,
+        slots: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        keys: torch.Tensor | None = None,
+    ) -> None:
+        """Write the tokens' keys and values, (T, heads, dk) and (T, heads, dv), at
+        vLLM's `slots`, (T,): in FP8, divided by their scales, in an FP8 cache; and
+        their indexer keys for vLLM's DSA kernels, (T, i), into the `region`. On a
+        GPU in one launch (`bux_vllm.caching.write`), bit for bit."""
+        if k.is_cuda:
+            first = self.heads + self.raw_slots
+            caching.write(self.kv, slots, k, v, keys, first, self.scales)
+            return
+        rows = torch.cat([k, v], -1)
         if self.fp8 is not None:  # its bytes, as indexing writes them
             most = torch.finfo(self.fp8).max
             dk = self.sparse.dk
@@ -362,6 +375,8 @@ class PagedCache(nn.Module, AttentionLayerBase):
             rows = torch.cat([k, v], -1).float().clamp(-most, most)
             rows = rows.to(self.fp8).view(torch.uint8)
         picks.write(self.rows.kv, slots, rows)
+        if keys is not None:
+            self.region.write(slots, keys)
 
 
 def cache_dtype(
@@ -441,7 +456,7 @@ def attend(
     step's tokens, or by the picks its ``index`` port reads (None), over the call's
     `PagedCache` `cache`; the picks go on to the taps of the port it writes. Returns
     `out`."""
-    q, k, v = (t.contiguous() for t in tensors)
+    q, k, v = tensors[0].contiguous(), tensors[1], tensors[2]  # writes take strides
     taps = writes(ports, "index")
     if index is None:
         read = reads(ports, "index")
@@ -452,11 +467,12 @@ def attend(
         )
     else:
         kept = _no_picks(cache.sparse, q, len(taps))
+        native = cache.native  # the native ops take each row's strides
         torch.ops.vllm.bux_sparse_attention(
             q,
             k,
             v,
-            *(t.contiguous() for t in index),
+            *(t if native else t.contiguous() for t in index),
             ctx.positions,
             out,
             *kept,
@@ -516,7 +532,7 @@ def sparse_attention(
     meta = metas[layer_name]
     n = meta.num_actual_tokens
     output[n:].zero_()
-    _written(cache, meta, torch.cat([k, v], -1)[:n], index_k[:n])
+    _written(cache, meta, k[:n], v[:n], index_k[:n])
     table, tensors = meta.block_table_tensor, (q, index_q, index_w, positions)
     if cache.native:
         _pooled(cache, meta, positions)
@@ -533,26 +549,35 @@ def sparse_attention(
             if picked_keys.numel():
                 picked_keys[at], picked_valid[at] = msa.as_picks(chosen, pos)
             continue
-        out, (kept, valid) = _segment(cache, meta, part, q_, (iq, iw), pos, rows)
-        output[at] = out.to(output.dtype)
-        if picked_keys.numel():
-            picked_keys[at], picked_valid[at] = kept, valid
+        wanted, into = picked_keys.numel() > 0, output[at]
+        args = (q_, (iq, iw), pos, rows, wanted, into)
+        out, kept = _segment(cache, meta, part, *args)
+        if out is not into:
+            into.copy_(out)
+        if kept is not None:
+            picked_keys[at], picked_valid[at] = kept
 
 
 def _written(
-    cache: PagedCache, meta: Batch, kv: torch.Tensor, index_k: torch.Tensor
+    cache: PagedCache,
+    meta: Batch,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_k: torch.Tensor,
 ) -> None:
-    """Write the step's keys and values, (n, g, C), and its indexer keys, (n, i),
-    into `cache`: in FP8 where vLLM's DSA kernels pick, else spread over the rows."""
-    slots = meta.slot_mapping[: kv.shape[0]]
+    """Write the step's keys and values, (n, g, dk) and (n, g, dv), and its indexer
+    keys, (n, i), into `cache`: in FP8 where vLLM's DSA kernels pick, as projected
+    for QSA's and MSA's, else spread over the rows."""
+    slots = meta.slot_mapping[: k.shape[0]]
     if not (cache.native or cache.blocked):
+        kv = torch.cat([k, v], -1)
         picks.write(cache.kv_cache, slots, picks.merged(kv, index_k))
         return
-    cache.write(slots, kv)
     if cache.sparse.mean or cache.blocked:
+        cache.write(slots, k, v)
         cache.raw.write(slots, index_k)
     else:
-        cache.region.write(slots, index_k)
+        cache.write(slots, k, v, index_k)
 
 
 def _blocked(
@@ -599,13 +624,17 @@ def _segment(
     index: tuple[torch.Tensor, torch.Tensor],
     positions: torch.Tensor,
     rows: torch.Tensor,
-) -> tuple[torch.Tensor, picks.Picked]:
-    """A segment's outputs, (Q, h, dv), and its picks: by vLLM's DSA kernels where
-    they pick (`_native`), else by the Triton kernels or PyTorch (`_segments`)."""
+    wanted: bool,
+    into: torch.Tensor,
+) -> tuple[torch.Tensor, picks.Picked | None]:
+    """A segment's outputs, (Q, h, dv), and its picks if `wanted`: by vLLM's DSA
+    kernels where they pick (`_native`, which may attend `into` the op's output),
+    else by the Triton kernels or PyTorch (`_segments`)."""
     if cache.native:
-        return _native(cache, meta, part, q, index, positions, rows)
+        return _native(cache, meta, part, q, index, positions, rows, wanted, into)
     run = _segments(cache)
-    return run(cache.sparse, q, index, positions, cache.rows, rows, part.keys)
+    out, kept = run(cache.sparse, q, index, positions, cache.rows, rows, part.keys)
+    return out, kept if wanted else None
 
 
 def _native(
@@ -616,13 +645,15 @@ def _native(
     index: tuple[torch.Tensor, torch.Tensor],
     positions: torch.Tensor,
     rows: torch.Tensor,
-) -> tuple[torch.Tensor, picks.Picked]:
+    wanted: bool,
+    into: torch.Tensor,
+) -> tuple[torch.Tensor, picks.Picked | None]:
     """A segment's picks by vLLM's DSA kernels (decoded tokens' over their paged
     keys, a prompt chunk's over its request's gathered ones; QSA's over its blocks,
-    and its own unfinished block), padded to `bux_vllm.picks.most`, and its
-    attention over them: by vLLM's own sparse GQA attention where it takes the
-    layer (`bux_vllm.dsa.attends`), else by the plugin's Triton kernel, or by
-    PyTorch over MLA's latents."""
+    and its own unfinished block), padded to `bux_vllm.picks.most` if `wanted`, and
+    its attention over them: by vLLM's own sparse GQA attention where it takes the
+    layer (`bux_vllm.dsa.attends`), `into` the op's output where it fits, else by
+    the plugin's Triton kernel, or by PyTorch over MLA's latents."""
     spec, region, size = cache.sparse, cache.region, cache.sparse.block_size
     top_k = spec.top_k // size
     if part.decoding:
@@ -632,20 +663,28 @@ def _native(
     else:
         ends = (positions + 1) // size  # the keys, or complete blocks, each sees
         chosen = dsa.prompt(region, index, rows, part.keys // size, ends, top_k)
+    attends = not spec.latent and dsa.attends(spec, q, cache.kv)
+    kept = None
     if spec.mean:
         kept = dsa.block_picks(chosen, positions, size)
-    else:
+    elif wanted or not attends:
         kept = dsa.as_picks(chosen)
     if spec.latent:
+        assert kept is not None
         kv = cache.rows.kv
-        return picks.attend_picked(spec, q, kept, positions, kv, rows, part.keys), kept
-    if dsa.attends(spec, q, cache.kv):
-        mine = torch.where(kept[1], kept[0], -1) if spec.mean else chosen
-        out = dsa.attend(spec, q, cache.kv, rows, mine, not part.decoding, cache.scales)
+        out = picks.attend_picked(spec, q, kept, positions, kv, rows, part.keys)
         return out, kept
+    if attends:
+        if spec.mean and kept is not None:  # QSA's picks, read whole
+            chosen = torch.where(kept[1], kept[0], -1)
+        fits = into.dtype == q.dtype and into.shape == q.shape
+        args = (not part.decoding, cache.scales, into if fits else None)
+        out = dsa.attend(spec, q, cache.kv, rows, chosen, *args)
+        return out, kept if wanted else None
+    assert kept is not None
     table = rows.expand(q.shape[0], -1)
     out = kernels.attend(spec, q.contiguous(), cache.kv, table, kept, cache.scales)
-    return out, kept
+    return out, kept if wanted else None
 
 
 def picked_attention(
@@ -671,7 +710,7 @@ def picked_attention(
     meta = metas[layer_name]
     n = meta.num_actual_tokens
     output[n:].zero_()
-    cache.write(meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
+    cache.write(meta.slot_mapping[:n], k[:n], v[:n])
     table = meta.block_table_tensor
     for part in meta.segments:
         at = part.tokens

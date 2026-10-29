@@ -24,7 +24,8 @@ the kernels score a request's blocks as DSA's keys.
 The keys live in the call's own cache (`bux_vllm.sparse.PagedCache`), in head slots
 after its kv heads' (`Region`): each block's FP8 keys, then their scales, so that
 they page with the keys and values, one cache a call, and prefix caching hits as
-often as in a dense model.
+often as in a dense model. On a GPU, Triton kernels write a step's keys, quantize
+its queries and pack its picks, each in one launch (`bux_vllm.caching`).
 """
 
 from __future__ import annotations
@@ -110,7 +111,12 @@ def queries(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The indexer's queries, (T, H, D), in FP8, and their heads' weights, (T, H),
     times each query head's scale in float32, as DeepGEMM takes them; both padded
-    with heads of no weight to `heads`."""
+    with heads of no weight to `heads`. On a GPU by one Triton kernel, bit for bit
+    (`bux_vllm.caching.queries`)."""
+    if q.is_cuda:
+        from . import caching
+
+        return caching.queries(q, w, heads)
     q8, scale = quantized(q)
     weights = w.float() * scale
     pad = heads - q.shape[1]
@@ -387,34 +393,30 @@ def attend(
     picked: torch.Tensor,
     prompt: bool,
     scales: tuple[float, float],
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Each query's heads' outputs, (Q, h, d), over its `picked` keys, (Q, K) int32
     positions with -1 for none, by vLLM's own sparse GQA attention (Qwen4's QSA
     kernel), which reads the paged `kv`, (blocks, g, block_size, 2 d), in place by
     the block table `rows`: one request's, (1, blocks), for a prompt's queries,
-    else each one's. DSA's picks have their valid ones first, as the kernel bounds
-    a query's tiles by their count; QSA's are read whole. Its output gate is passed
-    open, and a scale other than ``d ** -0.5`` goes on the queries."""
+    else each one's; into `out` where given. DSA's picks have their valid ones
+    first, as the kernel bounds a query's tiles by their count; QSA's are read
+    whole (`bux_vllm.caching.packed`). Its output gate is passed open, and a scale
+    other than ``d ** -0.5`` goes on the queries."""
     from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 
-    n, _, dk = q.shape
+    from . import caching
+
+    dk = q.shape[2]
     if spec.scale != dk**-0.5:
         q = (q.float() * (spec.scale * dk**0.5)).to(q.dtype)
-    if spec.mean:  # its own block's keys after the other blocks', some past it
-        count = picked.new_full((n, 1), picked.shape[1])
-    else:
-        count = (picked >= 0).sum(-1, keepdim=True, dtype=torch.int32)
-    indices = torch.cat([picked.to(torch.int32), count], -1).contiguous()
-    if prompt:
-        req = torch.zeros(n, dtype=torch.int32, device=q.device)
-    else:
-        req = torch.arange(n, dtype=torch.int32, device=q.device)
+    indices, req = caching.packed(picked.to(torch.int32), not prompt, spec.mean)
     nhd = kv.transpose(1, 2)
     k, v = nhd[..., :dk], nhd[..., dk:]
     fp8 = (scales[0], scales[1]) if kv.dtype == FP8 else (None, None)
     gate = torch.full_like(q, torch.inf)  # sigmoid(+inf) = 1: no gate
     return qsa_sparse_paged_attention(
-        q.contiguous(), k, v, indices, rows, req, prompt, None, *fp8, output_gate=gate
+        q.contiguous(), k, v, indices, rows, req, prompt, out, *fp8, output_gate=gate
     )
 
 
