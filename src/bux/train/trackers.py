@@ -59,7 +59,8 @@ class Wandb(Sink):
     keeps in wandb_id; a fresh one starts a W&B run of its own. Unlike metrics.jsonl
     and TensorBoard's events, the W&B run keeps the steps that a crash logged past the
     checkpoint: W&B ignores a step below one it has, so it takes the resumed run's
-    steps only from there on.
+    steps only from there on. Its ``mode``, unless the config sets one, is W&B's own:
+    ``WANDB_MODE``'s, online if it is unset.
 
     Args:
         config: The tracker's settings.
@@ -84,7 +85,7 @@ class Wandb(Sink):
             id=_run_id(folder / "wandb_id", start),
             resume="allow",
             dir=str(folder),
-            mode=config.mode,
+            mode=config.mode,  # None: W&B reads WANDB_MODE
             config=settings(run),
         )
 

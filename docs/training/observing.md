@@ -175,7 +175,10 @@ A run that resumes from a checkpoint goes on logging to the W&B run it started, 
 id it keeps in its directory's `wandb_id`. That W&B run keeps the steps a crash logged
 past the checkpoint: W&B ignores a step below one it has, so the resumed run's own
 steps reach it only from there on. `mode="offline"` writes into the run's directory,
-for `wandb sync` later.
+for `wandb sync` later, and `mode="disabled"` logs nowhere. Without a `mode`, W&B
+takes the one `WANDB_MODE` sets, or online if it is unset. So `WANDB_MODE=disabled`
+turns W&B off for a run without editing its file. A `mode` in the file wins over
+`WANDB_MODE`.
 
 The config's `axes` has what the run took on each axis of its sweep, by the axis's
 name: `{"variant": "rope", "d_model": "d768", "optimizer.lr": "2e-3"}`. An axis is
