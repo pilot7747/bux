@@ -227,7 +227,7 @@ class Attention(Layer):
         dtype = site.vllm_config.model_config.dtype
         dims, heads = (self.dk, self.dv), c["num_kv_heads"]
         native, blocked, fp8 = sparse.paths(spec, ix, dims, dtype, heads)
-        natively = ix is None and dsa.reads(spec, dims, self.hq // self.g, dtype)
+        theirs = self._natively_read(c, spec, width, site)
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -239,8 +239,32 @@ class Attention(Layer):
             native,
             fp8,
             blocked,
-            natively,
+            theirs,
         )
+
+    def _natively_read(
+        self, c: dict, spec: picks.Sparse, width: int, site: Site
+    ) -> int:
+        """The indexer key dims of the layer whose picks this one reads through its
+        ``index`` port, where vLLM's own sparse GQA attention attends over them, as
+        it does in that layer (`bux_vllm.dsa.reads`): a ``gqa`` writer of the same
+        heads whose single keys vLLM's DSA kernels pick; else 0, for the plugin's
+        kernels."""
+        w, dtype = site.index_writer, site.vllm_config.model_config.dtype
+        ix = w["indexer"] if self.reads_index and w and w["type"] == "gqa" else None
+        if not ix or ix["block_size"] != 1:
+            return 0
+        same = (w["num_kv_heads"], *kv.head_dims(w, width)) == (
+            c["num_kv_heads"],
+            self.dk,
+            self.dv,
+        )
+        if not (same and dsa.reads(spec, (self.dk, self.dv), self.hq // self.g, dtype)):
+            return 0
+        settings = (w["sliding_window_size"], 1.0, None, None)
+        picker = picks.layer_spec(ix, None, settings, self.dk, (0, 1))
+        native = dsa.takes(picker, ix["head_dim"], ix["num_heads"], dtype)
+        return ix["head_dim"] if native else 0
 
     def _biased_caches(
         self, c: dict, width: int, site: Site, names: dict[str, list[str]]

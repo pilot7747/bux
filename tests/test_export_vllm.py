@@ -3011,11 +3011,21 @@ def test_native_dsa_takes_an_fp8_kv_cache(
     source = vllm_parity.CASES["dsa-share-native"]
     model = built(source, tmp_path / "share", stood_in, None, "fp8")
     caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
-    want = [(True, False, 3), (False, True, 0), (False, True, 0)]  # 68 bytes of 32
+    # FP8 keys of 68 bytes in 3 slots of 32; the readers keep as many, unwritten, as
+    # vLLM pads their pages to the writer's
+    want = [(True, False, 3), (False, True, 3), (False, True, 3)]
     assert [(c.native, c.reads_natively, c.slots) for c in caches] == want
     assert all(c.fp8 is e4m3 for c in caches)
     backends = [c.get_attn_backend().get_name() for c in caches]
     assert backends == ["BUX_PAGED_DSA", "BUX_PAGED_PICKED", "BUX_PAGED_PICKED"]
+    assert (
+        len({(c.heads + c.slots, c.channels + c.share, c.dtype) for c in caches}) == 1
+    )
+    with monkeypatch.context() as mp:  # where the writer's picks are not vLLM's
+        mp.setattr(dsa, "takes", lambda *_: False)
+        model = built(source, tmp_path / "plain", stood_in, None)
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    assert [(c.reads_natively, c.slots) for c in caches] == [(False, 0)] * 3
     model = built(
         vllm_parity.CASES["qsa-native"], tmp_path / "qsa", stood_in, None, "fp8"
     )

@@ -139,6 +139,18 @@ def kv_shares(
     return out
 
 
+def index_writers(calls: list[Call]) -> dict[str, dict]:
+    """The config of the layer whose picks each layer reads through its ``index``
+    port, by the layer's path: its first call's writer (`bux_vllm.kv.sources`)."""
+    out: dict[str, dict] = {}
+    for call, source in zip(
+        calls, kv.sources([ports(c.layer) for c in calls], "index")
+    ):
+        if source is not None:
+            out.setdefault(call.path, calls[source].layer["config"])
+    return out
+
+
 def _check_shared(reader: Node, writer: Node) -> None:
     """Raise for what `reader`, a layer's IR node, cannot read of `writer`'s through
     its ``kv`` port: a ``gqa``'s keys and values, or a ``csa``'s compressed
@@ -160,7 +172,7 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
     config = vllm_config.model_config.hf_config
     calls = live(p.calls)
     states, count = state_names(calls), Counter(c.path for c in calls)
-    shares = kv_shares(calls, states)
+    shares, writers = kv_shares(calls, states), index_writers(calls)
     layers: dict[str, nn.Module] = {}
     embedding = None
     for call in (c for c in p.calls if c.first):
@@ -178,6 +190,7 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
             embedding,
             ports(node),
             shares.get(call.path, []),
+            writers.get(call.path),
         )
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":

@@ -61,6 +61,8 @@ class Site:
         shares: The KV cache each of its calls attends to instead of its own, by
             vLLM's layer name: the writer's, for a call that reads the ``kv`` port
             (`bux_vllm.kv.sources`); None for its own.
+        index_writer: The config of the layer whose picks it reads through its
+            ``index`` port (its first call's); None for a layer that reads none.
     """
 
     path: str
@@ -70,6 +72,7 @@ class Site:
     embedding: Any = None
     ports: list = field(default_factory=list)
     shares: list[str | None] = field(default_factory=list)
+    index_writer: dict | None = None
 
     @property
     def quant(self) -> Any:
