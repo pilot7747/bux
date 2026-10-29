@@ -65,6 +65,7 @@ LAYER_MODULES = (
     "rwkv7",
     "residual",
     "engram",
+    "doc_copy",
 )
 
 

@@ -1188,9 +1188,9 @@ def test_doc_copy_vectors_are_buxs() -> None:
         list(first.lengths),
         3,
     )
-    table = torch.from_numpy(np.asarray(first.embedding.tokens.embedding[...]))
+    table = torch.from_numpy(np.array(first.embedding.tokens.embedding[...]))
     scale, embed = (
-        torch.from_numpy(np.asarray(p[...])) for p in (first.scale, first.bucket_embed)
+        torch.from_numpy(np.array(p[...])) for p in (first.scale, first.bucket_embed)
     )
     got = docmatch.vector(table[c], b, scale, embed)
     np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
