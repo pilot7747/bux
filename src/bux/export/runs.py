@@ -52,9 +52,9 @@ class Restored:
     Attributes:
         run: The run, from its ``run.json``.
         model: Its model, built with ``methods.repeat`` ``unroll``, in eval mode, its
-            state the checkpoint's, on this process's CPU, as it computes at `step`
+            state the checkpoint's, on this process's CPU, as its weights trained
             (`arch`).
-        step: The checkpoint's step.
+        step: The checkpoint's step: the steps its weights took.
     """
 
     run: ir.Run
@@ -63,9 +63,16 @@ class Restored:
 
     @property
     def arch(self) -> ir.Architecture:
-        """The model as it computes at `step`: with the RoPE a curriculum's phase
-        sets from then on (`bux.lang.ir.Run.arch_at`)."""
-        return self.run.arch_at(self.step)
+        """The model as its weights trained: with the RoPE of the curriculum's phase
+        of the last step they took (`last_step`, `bux.lang.ir.Run.arch_at`)."""
+        return self.run.arch_at(last_step(self.step))
+
+
+def last_step(step: int) -> int:
+    """Return the last step the weights of a checkpoint of `step` took, from 0: a
+    checkpoint of a phase's first step holds weights the phase before trained; step
+    0's, for the weights a run starts from."""
+    return max(step, 1) - 1
 
 
 @dataclass(frozen=True)
@@ -117,7 +124,7 @@ def restore(folder: Path | str, step: int | None = None) -> Restored:
     with jax.default_device(cpu), _manager(folder / "checkpoints") as manager:
         step = _step(manager, step, folder)
         layout = _layout(run, manager.metadata(step).custom_metadata or {})
-        at = run.model_copy(update={"arch": run.arch_at(step)})
+        at = run.model_copy(update={"arch": run.arch_at(last_step(step))})
         trained = as_trained(at, layout)
         nnx.update(trained, _read(manager, step, nnx.state(trained), cpu))
         model = unrolled(at, trained, layout)
@@ -311,9 +318,10 @@ def export(
     check: bool = False,
 ) -> Exported:
     """Write the model of the run in `folder`, from its checkpoint of `step`, to `out`
-    as a transformers model directory that loads as it is: the model as it computes
-    at that step (`Restored.arch`), its ``max_position_embeddings`` the longest rows
-    the run trained on by then, the run's tokenizer and generation config
+    as a transformers model directory that loads as it is: the model as its weights
+    trained (`Restored.arch`), its ``max_position_embeddings`` the longest rows the
+    run trained on by then, both by the phase of the last step the weights took
+    (`last_step`), the run's tokenizer and generation config
     (`bux.export.tokenizer.save`), and a model card, ``README.md``.
 
     With `check`, the export is compared with bux (`bux.export.check.compare`) on the
@@ -357,8 +365,11 @@ def export(
 
 
 def _longest(t: TrainConfig, step: int) -> int:
-    """Return the longest rows a run of `t` trained on in its first `step` steps."""
-    return max(c.seq_len for start, c in curriculum.phases(t) if start < max(step, 1))
+    """Return the longest rows a run of `t` trained on in its first `step` steps:
+    those of the phases up to that of their last (`last_step`)."""
+    return max(
+        c.seq_len for start, c in curriculum.phases(t) if start <= last_step(step)
+    )
 
 
 def _source(folder: Path | str) -> str:

@@ -154,20 +154,55 @@ def test_an_earlier_step_restores_and_a_missing_one_is_named(trained):
         runs.restore(folder, step=1)
 
 
-def test_a_run_exports_with_the_rope_its_last_phase_set(trained, tmp_path):
-    phase = "phase(at=2, seq_len=32, rope_scaling=yarn(factor=4, original_max_len=16))"
-    folder, trained_loss = trained(ARCH, curriculum=phase)
-    done = runs.export(folder, tmp_path / "out", check=True)
-    arch = done.restored.arch
-    yarn = cfg.RoPEConfig(scaling=cfg.YaRNConfig(factor=4, original_max_len=16))
-    configs = [layer.config for layer in arch.layers()]
+PHASE = "phase(at=2, seq_len=32, rope_scaling=yarn(factor=4, original_max_len=16))"
+YARN = cfg.RoPEConfig(scaling=cfg.YaRNConfig(factor=4, original_max_len=16))
+
+
+def exported_rope(done: runs.Exported) -> tuple[list[cfg.RoPEConfig | None], int]:
+    """The RoPE of each attention layer of an export's model, and its length."""
+    configs = [layer.config for layer in done.restored.arch.layers()]
     ropes = [c.rope for c in configs if isinstance(c, cfg.GQAConfig)]
-    assert ropes == [yarn] * 4
+    config = json.loads((done.out / "config.json").read_text())
+    return ropes, config["max_position_embeddings"]
+
+
+def test_a_run_exports_with_the_rope_its_last_phase_set(trained, tmp_path):
+    folder, trained_loss = trained(ARCH, curriculum=PHASE)
+    done = runs.export(folder, tmp_path / "out", check=True)
+    assert exported_rope(done) == ([YARN] * 4, 32)  # the phase's RoPE and seq_len
     assert loss(done.restored) == pytest.approx(trained_loss, rel=1e-5)
     assert done.report is not None
     done.report.check()
-    config = json.loads((done.out / "config.json").read_text())
-    assert config["max_position_embeddings"] == 32  # the phase's seq_len
+
+
+def test_an_export_at_a_phase_s_first_step_is_the_phase_before_s(trained, tmp_path):
+    # The checkpoint of step 2 holds the weights of steps 0 and 1, at seq_len 16.
+    folder, _ = trained(ARCH, curriculum=PHASE)
+    done = runs.export(folder, tmp_path / "out", step=2, check=True)
+    assert done.restored.step == 2
+    assert exported_rope(done) == ([cfg.RoPEConfig()] * 4, 16)
+    assert done.report is not None
+    done.report.check()
+
+
+LONG = """
+seq_len = 2048
+batch = 8
+steps = 100
+data = synthetic
+optimizer = adamw(lr=1e-3)
+curriculum = phase(at=90, seq_len=16384, batch=1,
+                   rope_scaling=yarn(factor=8, original_max_len=2048))
+"""
+
+
+def test_the_weights_of_a_checkpoint_trained_up_to_the_step_before_it():
+    # A 16k phase from step 90: the checkpoint of step 90 is the 2k phase's.
+    [run] = compile_runs(ARCH + LONG)
+    lengths = [runs._longest(run.train, step) for step in (0, 1, 90, 91, 100)]
+    assert lengths == [2048, 2048, 2048, 16384, 16384]
+    scaled = [run.arch_at(runs.last_step(s)) != run.arch for s in (0, 90, 91, 100)]
+    assert scaled == [False, False, True, True]
 
 
 def test_bux_export_writes_a_directory_that_loads_and_checks(trained, tmp_path, capsys):

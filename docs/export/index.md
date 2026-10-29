@@ -66,10 +66,13 @@ holds:
 A run that trains without a tokenizer, on `synthetic` data or on ids it is given,
 exports without one. The export's `config.json` sets `max_position_embeddings` to the
 longest rows the run trained on by the checkpoint's step, the longest sequence the
-model is known to handle: a long-context phase's `seq_len`, once it has started. vLLM
-serves up to that length unless `--max-model-len` says otherwise. The model computes
-as it did at that step, with the RoPE scaling a phase switched to
+model is known to handle: a long-context phase's `seq_len`, once its weights have
+trained in it. vLLM serves up to that length unless `--max-model-len` says otherwise.
+The model computes with the RoPE of the phase its weights last trained in
 ([Long-context extension](../training/curriculum.md#long-context-extension)).
+A checkpoint of step N holds the weights after N steps. So the checkpoint of the step
+a phase starts at exports with the length and RoPE of the phase before it, and every
+later one with the phase's own.
 
 The weights keep the parameters' dtype, which is float32 whatever precision the run
 computed in, unless `--dtype` picks `bfloat16` or `float16`. In Python:
