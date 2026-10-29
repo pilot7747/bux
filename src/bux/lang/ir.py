@@ -318,6 +318,8 @@ _NEWER_FIELDS = {
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
 # Fields of a layer's settings, or of the model's init, newer than run ids, by its
 # type, at what they computed before them.
+# HyGA's gates (QuadraticAttentionConfig's gate_input_rank, ...), unset.
+_HYGA = {"gate_input_rank": None, "gate_output_rank": None, "gate_cross_head": False}
 _NEWER_LAYER_FIELDS = {
     "mlp": {"up_offset": 0.0},
     "gated_mlp": {"up_offset": 0.0},
@@ -333,9 +335,11 @@ _NEWER_LAYER_FIELDS = {
         "power_scale": None,
         "power_scale_length": 2048,
         "qk_norm_all_heads": False,
+        "exclusive": False,
+        **_HYGA,
     },
-    "mla": {"gate_head_bias": False},
-    "csa": {"gate_head_bias": False},
+    "mla": {"gate_head_bias": False, **_HYGA},
+    "csa": {"gate_head_bias": False, **_HYGA},
     "indexer": {"pool": "mean", "per_group": False, "relu": True},
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
