@@ -12,6 +12,18 @@ With ``--slo``, a concurrency whose median time per output token passes it ends 
 list, and ``--refine`` more concurrencies are timed between the one of the most
 sessions per hour within it and the next one timed.
 
+``--long-context T`` times sessions that grow to ``T`` tokens, a coding agent deep in
+a large repository. A session starts at 2/3 of ``T``: the shared system prompt, a
+repository's files (``--repo``, up to ``T/4`` with the system prompt) and its own
+files and task. The repository is one of ``--repos`` (4), session ``i`` on repository
+``i mod 4``, so sessions on one repository share its prefix, as a team's agents on a
+monorepo do. Its 4 turns write 512 tokens each, and each tool result is sized so that
+the last turn ends at ``T``: at 64k a session starts at 43.7k with tool results of
+6.6k, at 128k at 87.4k with 13.9k, at 256k at 174.8k with 28.4k. The default load is
+this shape at 24k (16k to start, tool results of 2k), without the repository.
+At long context prefill dominates, so each line also has the first turns' time to
+the first token (``ttft_first_*``), the prefill of a cold session.
+
 Tokens are random ids: the weights are too (``load_format="dummy"``), so only the
 time counts. It prints a JSON line of the totals. The tutorial "Old against new at
 the same serving cost" (docs/tutorials/old-vs-new.md) runs it on exports of
@@ -38,6 +50,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 class Turn:
     """What one turn of a session took."""
 
+    turn: int  # its index in the session, 0 for the first
     prompt: int  # tokens of its prompt
     cached: int  # of them, those the prefix cache served
     ttft: float  # seconds to its first token
@@ -55,7 +68,19 @@ class Totals:
 
 def main() -> None:
     a = parser().parse_args()
+    if a.long_context:
+        long_context(a, a.long_context)
     asyncio.run(run(a))
+
+
+def long_context(a: argparse.Namespace, total: int) -> None:
+    """Set `a`'s load to sessions that start at 2/3 of `total` tokens, a quarter of it
+    the system prompt and a repository's files, and end at `total` (the docstring's)."""
+    start = round(2 * total / 3)
+    a.repo = total // 4 - a.system
+    a.context = start - a.system - a.repo
+    a.tool = (total - start - a.output) // (a.turns - 1) - a.output
+    a.max_model_len = max(a.max_model_len, total)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -71,7 +96,20 @@ def parser() -> argparse.ArgumentParser:
         "--sessions", type=int, default=2, help="sessions in all, a multiple of each"
     )
     p.add_argument("--system", type=int, default=2048, help="shared prompt tokens")
+    p.add_argument(
+        "--repo", type=int, default=0, help="a repository's tokens, after the system's"
+    )
+    p.add_argument(
+        "--repos", type=int, default=4, help="repositories, sessions in turn"
+    )
     p.add_argument("--context", type=int, default=14336, help="a session's own tokens")
+    p.add_argument(
+        "--long-context",
+        type=int,
+        metavar="T",
+        help="sessions grown to T tokens: sets --repo, --context, --tool and "
+        "--max-model-len",
+    )
     p.add_argument("--turns", type=int, default=4)
     p.add_argument("--output", type=int, default=512, help="tokens written a turn")
     p.add_argument("--tool", type=int, default=2048, help="tokens a tool adds a turn")
@@ -114,24 +152,36 @@ async def run(a: argparse.Namespace) -> None:
         )
     )
     vocab = engine.model_config.get_vocab_size()
-    system = _tokens(random.Random(a.seed), vocab, a.system)
-    await _session(engine, a, system, random.Random(-1), vocab, "warmup", Totals(), 1)
+    shared = _shared(a, vocab)
+    await _session(
+        engine, a, shared[0], random.Random(-1), vocab, "warmup", Totals(), 1
+    )
     done: dict[int, dict] = {}
     for c in a.concurrency:
-        done[c] = await _timed(engine, a, system, vocab, c)
+        done[c] = await _timed(engine, a, shared, vocab, c)
         if a.slo is not None and done[c]["tpot_p50_ms"] > a.slo:
             break
     for c in _between(done, a.slo, a.refine):
-        done[c] = await _timed(engine, a, system, vocab, c)
+        done[c] = await _timed(engine, a, shared, vocab, c)
     engine.shutdown()
 
 
+def _shared(a: argparse.Namespace, vocab: int) -> list[list[int]]:
+    """The prompts' shared starts: the system prompt, then one of `a.repos`
+    repositories' files (all one start without them)."""
+    system = _tokens(random.Random(a.seed), vocab, a.system)
+    if not a.repo:
+        return [system]
+    repo = (random.Random(f"{a.seed}-repo-{r}") for r in range(a.repos))
+    return [system + _tokens(rng, vocab, a.repo) for rng in repo]
+
+
 async def _timed(
-    engine: AsyncLLM, a: argparse.Namespace, system: list[int], vocab: int, c: int
+    engine: AsyncLLM, a: argparse.Namespace, shared: list[list[int]], vocab: int, c: int
 ) -> dict:
     """Time `c` sessions at once from an empty prefix cache, and print the line."""
     await engine.reset_prefix_cache()
-    line = _summary(a, engine, await _load(engine, a, system, vocab, c), c)
+    line = _summary(a, engine, await _load(engine, a, shared, vocab, c), c)
     print(json.dumps(line), flush=True)
     return line
 
@@ -153,16 +203,18 @@ def _between(done: dict[int, dict], slo: float | None, n: int) -> list[int]:
 
 
 async def _load(
-    engine: AsyncLLM, a: argparse.Namespace, system: list[int], vocab: int, c: int
+    engine: AsyncLLM, a: argparse.Namespace, shared: list[list[int]], vocab: int, c: int
 ) -> Totals:
-    """Run `a.sessions` times `c` sessions, `c` at a time, each of its own tokens."""
+    """Run `a.sessions` times `c` sessions, `c` at a time, each of its own tokens
+    after a shared start, session `i`'s the `i`-th of `shared` in turn."""
     totals, todo = Totals(), list(range(a.sessions * c))
 
     async def worker() -> None:
         while todo:
             i = todo.pop(0)
             rng = random.Random(f"{a.seed}-{c}-{i}")
-            await _session(engine, a, system, rng, vocab, f"c{c}-s{i}", totals)
+            head = shared[i % len(shared)]
+            await _session(engine, a, head, rng, vocab, f"c{c}-s{i}", totals)
 
     start = time.perf_counter()
     await asyncio.gather(*(worker() for _ in range(c)))
@@ -177,15 +229,16 @@ def _tokens(rng: random.Random, vocab: int, n: int) -> list[int]:
 async def _session(
     engine: AsyncLLM,
     a: argparse.Namespace,
-    system: list[int],
+    head: list[int],
     rng: random.Random,
     vocab: int,
     name: str,
     totals: Totals,
     turns: int | None = None,
 ) -> None:
-    """Run one session's turns, each prompt the last one, its output and a tool's."""
-    prompt = system + _tokens(rng, vocab, a.context)
+    """Run one session's turns, each prompt the last one, its output and a tool's;
+    the first is the shared `head` and the session's own tokens."""
+    prompt = head + _tokens(rng, vocab, a.context)
     params = SamplingParams(
         max_tokens=a.output,
         ignore_eos=True,
@@ -202,7 +255,7 @@ async def _session(
             cached = o.num_cached_tokens or cached
         now = time.perf_counter()
         ttft = (first or now) - start
-        totals.turns.append(Turn(len(prompt), cached, ttft, now - start, len(out)))
+        totals.turns.append(Turn(t, len(prompt), cached, ttft, now - start, len(out)))
         prompt = prompt + out + _tokens(rng, vocab, a.tool)
 
 
@@ -211,6 +264,7 @@ def _summary(a: argparse.Namespace, engine: AsyncLLM, totals: Totals, c: int) ->
     prompts = sum(t.prompt for t in turns)
     cached = sum(t.cached for t in turns)
     decode = [(t.seconds - t.ttft) / max(t.output - 1, 1) for t in turns]
+    first = [t for t in turns if t.turn == 0]
     return {
         "tag": a.tag,
         "model": a.model,
@@ -223,11 +277,25 @@ def _summary(a: argparse.Namespace, engine: AsyncLLM, totals: Totals, c: int) ->
         "prefilled_tok_s": round((prompts - cached) / s, 1),
         "cache_hit": round(cached / prompts, 4),
         "ttft_p50": round(statistics.median(t.ttft for t in turns), 3),
-        "ttft_p90": round(statistics.quantiles([t.ttft for t in turns], n=10)[-1], 3),
+        "ttft_p90": round(_p90([t.ttft for t in turns]), 3),
+        "ttft_first_p50": round(statistics.median(t.ttft for t in first), 3),
+        "ttft_first_p90": round(_p90([t.ttft for t in first]), 3),
         "tpot_p50_ms": round(statistics.median(decode) * 1e3, 2),
+        "tpot_p90_ms": round(_p90(decode) * 1e3, 2),
+        "load": _load_shape(a),
         "kv_blocks": engine.vllm_config.cache_config.num_gpu_blocks,
         "block_size": engine.vllm_config.cache_config.block_size,
     }
+
+
+def _p90(values: list[float]) -> float:
+    return statistics.quantiles(values, n=10)[-1] if len(values) > 1 else values[0]
+
+
+def _load_shape(a: argparse.Namespace) -> dict:
+    """The session's shape: its tokens to start, shared and own, and each turn's."""
+    keys = ("long_context", "system", "repo", "repos", "context", "turns", "output")
+    return {k: getattr(a, k) for k in (*keys, "tool", "max_model_len")}
 
 
 if __name__ == "__main__":

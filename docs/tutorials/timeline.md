@@ -434,6 +434,19 @@ Every family passes by twice or more. The frontier's row is the highest, from it
 KV cache: its weights alone cost what the others' do. Weights per channel or by block
 cost the same within 0.03 points, so per tensor stays the measurement.
 
+`scripts/timeline/fp8_quality.py` takes this measurement in three steps, since bux
+and vLLM have environments of their own. `prepare` exports the run and writes its
+eval rows, in bux's environment. `run` scores them in vLLM's, once per configuration.
+`report` prints each configuration's change from bf16, and checks bf16 against the
+run's logged eval:
+
+```sh
+JAX_PLATFORMS=cpu python scripts/timeline/fp8_quality.py prepare runs/<run> fp8q/<run>
+python scripts/timeline/fp8_quality.py run fp8q/<run>
+python scripts/timeline/fp8_quality.py run fp8q/<run> --quantization fp8 --kv-cache-dtype fp8
+python scripts/timeline/fp8_quality.py report fp8q/<run>
+```
+
 ### The targets
 
 ```{include} timeline/tables/serving-fp8.md
@@ -456,6 +469,16 @@ same context:
   write 512 tokens each, and its tool results take it to T.
 - **The budget** falls with context: 634, 290 and 121 sessions per hour per GPU at
   64k, 128k and 256k.
+
+`agentic.py --long-context T` runs this load, on `--repos` repositories (4 by
+default). Each line also has the first turns' time to the first token,
+`ttft_first_p50` and `ttft_first_p90`: the prefill of a cold session. At 64k:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 python scripts/old_vs_new/agentic.py exported/llama3-4608 \
+  --long-context 65536 --concurrency 8,16,32,64,128 --slo 30 \
+  --engine 'quantization="fp8"' --engine 'kv_cache_dtype="fp8"'
+```
 
 Each family's target at each context, in parameters per token and its width:
 
