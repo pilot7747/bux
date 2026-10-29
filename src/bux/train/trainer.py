@@ -703,7 +703,8 @@ class Trainer:
     def _train_step_on_shards(
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
     ) -> Metrics:
-        metrics = self.train_step(model, optimizer, batch)
+        with self.objective.at(optimizer.step[...]):
+            metrics = self.train_step(model, optimizer, batch)
         parallel.shard_state(model, optimizer)
         return metrics
 
@@ -1304,7 +1305,12 @@ def train(
         trainer = Trainer(
             model,
             tx,
-            objective(config.loss, run.arch),
+            objective(
+                config.loss,
+                run.arch,
+                steps=config.steps,
+                prefixes=_prefix_tokens(config),
+            ),
             compute=precision.compute,
             matmuls=precision,
             switch=matmuls.late(precision, config.steps),
@@ -1566,6 +1572,14 @@ def _token_bytes(
         return None
     lengths = tokenizer.load(config.tokenizer).token_bytes()
     return np.pad(lengths, (0, max(0, (vocab_size or 0) - len(lengths))))
+
+
+def _prefix_tokens(config: TrainConfig) -> Int32[np.ndarray, " vocab"] | None:
+    """Return each id's prefix token by the run's tokenizer, for
+    ``loss(prefix=...)``; None without it."""
+    if config.loss.prefix is None or config.tokenizer is None:
+        return None
+    return tokenizer.load(config.tokenizer).prefix_tokens()
 
 
 def _formats(config: TrainConfig) -> dict[str, str]:
