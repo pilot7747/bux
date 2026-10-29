@@ -47,25 +47,31 @@ def weak(model: nnx.Module) -> list[str]:
 
 
 # Models of the layers and residual algebras that no example has, and of settings that
-# add parameters of their own (gqa's learned value residual).
+# add parameters of their own (gqa's learned value residual and learned XSA).
 OTHERS = [
     f"""
 d_model = {D}
 vocab_size = {V}
 norm = rmsnorm
 attn = gqa(num_heads=4, num_kv_heads=2)
-mix = gqa(num_heads=4, num_kv_heads=2, value_residual=learned)
+mix = gqa(num_heads=4, num_kv_heads=2, value_residual=learned, exclusive=learned)
+ve = value_embed(features={D // 2})
 gla = gla(num_heads=2, head_dim=8, gate_rank=4)
 delta = deltanet(num_heads=2, head_dim=8)
 rwkv = rwkv7(num_heads=2, head_dim=8, decay_rank=4, a_rank=4, v_rank=4, gate_rank=4)
 mixers = [norm gla] [norm delta] [norm rwkv] [norm short_conv]
-model = embed [dyt attn(v=@v1)] [norm mix(v=$v1) dropout(rate=0.1)] mixers norm head
+model = embed ve(ve=@e) [dyt attn(v=@v1, ve=$e!)] [norm mix(v=$v1) dropout(rate=0.1)] mixers
+        norm head
 """,
     f"d_model = {D}\nvocab_size = {V}\nresidual = hc()\nmodel = embed [rmsnorm] head",
+    (
+        f"d_model = {D}\nvocab_size = {V}\nresidual = msar(block_size=1)\n"
+        "model = embed [rmsnorm] [rmsnorm] head"
+    ),
 ]
 
 
-@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc"])
+@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc", "msar"])
 def test_no_parameter_of_another_model_is_weakly_typed(source):
     arch = compile(source)
     assert not weak(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))
