@@ -755,8 +755,8 @@ PyTorch 2.13.0 (CUDA 13.0), flash-linear-attention 0.6.0 and Python 3.12; bux's
 reference ran on the CPU in float32. vLLM ran with CUDA graphs and `torch.compile` (its default), its own pick of attention backend, Triton's MoE kernels (`--moe-backend triton`), and, in float32, Triton's dots in IEEE float32 (`TRITON_F32_DEFAULT=ieee`).
 The rows of XSA, HyGA, value embeddings, values from the keys and differential
 attention (`xsa`, `hyga`, `diff`, their `-hybrid` cases, `value-embed`,
-`value-embed-shared`, `k-eq-v` and `k-eq-v-nope`) were measured the same way on
-2026-10-29.
+`value-embed-shared`, `k-eq-v` and `k-eq-v-nope`) and of zero experts (`moe-zero`,
+`moe-zero-longcat`, `moe-zero-norm`) were measured the same way on 2026-10-29.
 
 The table gives the largest difference of a log-probability, over every position of
 4 prompts with 16 decoding steps each, across the whole vocabulary of 256. In
@@ -820,9 +820,9 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `moe-latent` | LatentMoE with its norms, a sigmoid router | 3.8e-6 | 1.9 (1.9) | 0.054 |
 | `moe-sink` | shared experts the router scores (`shared_expert_sink`) | 8.6e-6 | 2.3 (1.7) | 3.2, differs |
 | `moe-norm` | Muse Spark's experts: each one's output normalized before its weight, in a latent of 32 | 9.1e-6 | 1.7 (2.1) | 2.0 |
-| `moe-zero` | zero experts: 4 beside 8 FFN experts, a top 3, a shared expert, a sigmoid router, the aux-free bias | - | - | - |
-| `moe-zero-longcat` | LongCat-Flash's zero experts: a softmax router, unnormalized, scaled by 6, no bias | - | - | - |
-| `moe-zero-norm` | zero experts beside an expert norm, routed by bux's rule | - | - | - |
+| `moe-zero` | zero experts: 4 beside 8 FFN experts, a top 3, a shared expert, a sigmoid router, the aux-free bias | 4.8e-6 | 1.1 (1.5) | 1.1 |
+| `moe-zero-longcat` | LongCat-Flash's zero experts: a softmax router, unnormalized, scaled by 6, no bias | 7.2e-6 | 2.7 (1.3), differs | 2.7, differs |
+| `moe-zero-norm` | zero experts beside an expert norm, routed by bux's rule | 4.3e-6 | 1.3 (2.0) | 1.4 |
 | `mamba` | Jamba's Mamba beside attention | 9.5e-6 | 0.11 (0.14) | 0.096 |
 | `mamba2` | Mamba-2 of 16 heads in 2 groups, beside attention | 7.6e-6 | 0.078 (0.13) | 0.076 |
 | `gdn` | Gated DeltaNet of 2 q/k heads and 4 value heads, beside gated attention | - | 0.27 (0.23) | 0.28 |
@@ -855,6 +855,9 @@ keys' scores are within bfloat16's rounding of each other, a token's picks chang
 and so does its output. Two cases differ: `moe-sink` at TP=2 picks a token 1.8
 below the best, at bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where
 bux's own bfloat16 run is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
+`moe-zero-longcat` differs too, off by 2.7 against bux's own 1.3 on one GPU and at
+TP=2, though it decodes bux's greedy tokens: LongCat-Flash's unnormalized softmax
+router ties as the others do, and in float32 it agrees within 7.2e-6.
 The `-native` cases run vLLM's sparse kernels, in bfloat16 alone. Those on its DSA
 kernels are compared with bux's indexer scoring in FP8 too (`--fp8-indexer`). In
 float32, with the kernels forced (`BUX_VLLM_SPARSE_KERNELS=native`), they differ
