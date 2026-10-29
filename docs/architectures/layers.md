@@ -189,8 +189,15 @@ model = embed(norm=norm) "DD" "LLLG" "LLLLLG"^10 norm @h logits ...
 
 With `max_positions`, the compiler checks that the run's `seq_len` fits, and those
 of its curriculum's phases and of its evals. Under a
-residual algebra that widens the stream (`hc`, `mhc`, `gr`, `attnres`), `embed` widens
+residual algebra that widens the stream (`hc`, `mhc`, `gr`, `attnres`, `msar`), `embed` widens
 its output ([Residual algebras](../language/residual-algebras.md)).
+
+### `value_embed`
+
+`value_embed(features=n)` is a second table of `vocab_size` rows, `n` wide
+({bux}`value_embed`), whose rows the attention layers that read its `ve` port add to
+their values (modded-nanogpt). It leaves the stream as it is
+([Value embeddings](attention.md#value-embeddings)).
 
 ### `head`
 
@@ -331,7 +338,7 @@ block = [(attn unit - _) step] unit [(ffn unit - _) step] unit
 
 ## `merge`
 
-`merge` reads a widened residual stream (`hc`, `mhc`, `gr`, `attnres`) back into one:
+`merge` reads a widened residual stream (`hc`, `mhc`, `gr`, `attnres`, `msar`) back into one:
 the read the algebra does for a branch, without the write ({bux}`merge`). You rarely
 write it: the compiler puts one before the first layer outside a branch that needs
 a single stream, such as the final norm, and `bux fmt` prints it. See

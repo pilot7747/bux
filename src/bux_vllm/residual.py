@@ -6,8 +6,9 @@ tokens side by side.
 A branch's module runs around the branch's body: ``h, kept = branch.read(x, ctx)``
 gives the body its input, and ``branch.write_back(kept, f(h))`` the stream after the
 branch. hc, mhc and gr widen the stream into n copies, (T, n, d); attnres holds the
-embedding and the branch outputs so far as `Sources`; vpgate keeps one stream. All of
-it is per token, so decoding keeps no state of its own. Plain PyTorch, which
+embedding and the branch outputs so far as `Sources`, msar their streams as
+`Streams`; vpgate keeps one stream. All of it is per token, so decoding keeps no
+state of its own, but msar's convs' last inputs (`bux_vllm.msar`). Plain PyTorch, which
 `bux_vllm.model` runs and a CPU test checks against the export; in a 16-bit model
 hc's, mhc's and attnres's reads and writes run `bux_vllm.streams`' fused kernels
 instead (`fused`), which read and write a branch's streams once each.
@@ -430,6 +431,179 @@ class AttentionResidual(Branch):
         return kept.add(y, self.block_size)
 
 
+@dataclass
+class Streams:
+    """msar's state: the finished sources' streams side by side, (T, n, m, d) (the
+    embedding and each finished block, each as it is and expanded), the newest
+    source, (T, d), which the next branch expands (the embedding, a finished block,
+    or the block under way's partial sum, in float32), how many outputs it sums
+    (`count`), and the last branch's input plus its output, which the head reads.
+
+    It is what the export's state reads as (`bux.export.hf.residual.msar_sources`),
+    kept as it grows: a finished source's streams once, the block under way's sum.
+    """
+
+    done: torch.Tensor
+    newest: torch.Tensor
+    count: int
+    finished: bool
+    head: torch.Tensor | None = None
+
+    def __add__(self, other: Any) -> Any:
+        raise NotImplementedError("msar: a sum of its states in vLLM")
+
+    __mul__ = __rmul__ = __add__
+
+
+def causal_convs(v: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
+    """The causal depthwise convs of v, (T, d), one sequence from its start, by each
+    of `taps`, (k, d) with the token's own last: (T, len(taps), d)."""
+    t, out = v.shape[0], []
+    for w in taps:
+        k = w.shape[0]
+        padded = F.pad(v.float(), (0, 0, k - 1, 0))
+        out.append(sum(w[i].float() * padded[i : i + t] for i in range(k)))
+    return torch.stack(out, 1).to(v.dtype)
+
+
+def stacked_taps(taps: list[torch.Tensor], k: int) -> torch.Tensor:
+    """The taps of each conv, (k_r, d), as one weight, (r, k, d): each right-aligned,
+    the token's own last, zeros before."""
+    return torch.stack([F.pad(w, (0, 0, k - w.shape[0], 0)) for w in taps])
+
+
+def decode_convs(
+    v: torch.Tensor,
+    weight: torch.Tensor,
+    states: torch.Tensor,
+    slots: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """A decoding token a sequence: its window, the k - 1 kept values and itself,
+    by the taps, and the window's last k - 1 kept."""
+    # A padded row's slot is -1: it reads and writes vLLM's null block, 0, instead.
+    slots = slots.reshape(-1)[: v.shape[0]].clamp(min=0)
+    window = torch.cat([states[slots].transpose(1, 2), v[:, None]], 1)  # n, k, d
+    out.copy_(torch.einsum("nkd,rkd->nrd", window.float(), weight.float()))
+    states[slots] = window[:, 1:].transpose(1, 2).to(states.dtype)
+
+
+def prefill_convs(
+    v: torch.Tensor,
+    weight: torch.Tensor,
+    states: torch.Tensor,
+    meta: Any,
+    out: torch.Tensor,
+) -> None:
+    """The prompts' chunks: each token's window over its sequence's kept values (zero
+    for a sequence with none) and its chunk, tap by tap, and each sequence's last
+    k - 1 values kept."""
+    k, (t, d) = weight.shape[1], v.shape
+    starts = meta.query_start_loc_p  # n + 1, from the step's first prompt token
+    slots = meta.state_indices_tensor_p.reshape(-1)[: starts.shape[0] - 1]
+    kept = states[slots].transpose(1, 2).float()  # n, k - 1, d
+    kept = kept * meta.has_initial_states_p.view(-1, 1, 1).float()
+    values = torch.cat([kept.reshape(-1, d), v.float()])  # the kept, then the chunks
+    token = torch.arange(t, device=v.device, dtype=starts.dtype)
+    seq = torch.searchsorted(starts[1:], token, right=True)
+    pos = token - starts[seq]
+    acc = out.new_zeros(t, weight.shape[0], d, dtype=torch.float32)
+    for lag in range(k):  # the value lag tokens before each token
+        own = pos >= lag
+        at = torch.where(
+            own, len(kept) * (k - 1) + token - lag, seq * (k - 1) + k - 1 + pos - lag
+        )
+        acc += values[at][:, None] * weight[:, k - 1 - lag].float()
+    out.copy_(acc)
+    lens = starts[1:] - starts[:-1]
+    j = torch.arange(k - 1, device=v.device)
+    c = lens[:, None] - (k - 1) + j  # each kept value's place in its chunk
+    at = torch.where(
+        c >= 0,
+        len(kept) * (k - 1) + starts[:-1, None] + c,
+        torch.arange(len(kept), device=v.device)[:, None] * (k - 1) + k - 1 + c,
+    )
+    states[slots] = values[at].transpose(1, 2).to(states.dtype)
+
+
+class MultiStreamAttentionResidual(Branch):
+    """bux's ``msar``: f reads, in each stream, the softmax over the sources of
+    ``dot(w_r, rmsnorm(v_r))``, mixed by ``sigmoid(a rmsnorm(Z) W + b)``; each
+    source's streams are itself and its causal convs over the tokens, by the bank of
+    the branch that first reads it (`Streams`). The convs read the newest source's
+    last inputs before the step from the call's state in vLLM's Mamba cache
+    (`bux_vllm.msar`); without one, the step's tokens are one sequence from its
+    start, as a CPU test runs it. Without a body, it is the head's read."""
+
+    bux_residuals = ("msar",)
+
+    def __init__(self, c: dict, d: int, body: bool = True):
+        super().__init__()
+        self.block, self.eps = c["block_size"] or 1, c["norm_eps"]
+        self.sizes, self.body = list(c["kernel_sizes"]), body
+        self.histories: list[Any] = []  # each call's, where vLLM keeps them
+        self.path = ""  # the module's, which counts its calls
+        if not body:
+            return
+        m = 1 + len(self.sizes)
+        self.convs = nn.ModuleList(_Taps(k, d) for k in self.sizes)
+        self.query = _param(m, d)
+        self.proj = _param(m * d, m)
+        self.scale = _param()
+        self.bias = _param(m)
+
+    def _expand(self, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        """The source v's streams, (T, m, d): itself, then its convs."""
+        taps: list[torch.Tensor] = [conv.weight for conv in self.convs]  # ty: ignore[invalid-assignment]
+        if self.histories:
+            history = self.histories[ctx.call(self.path)]
+            convs = history.convolve(v, taps)
+        else:
+            convs = causal_convs(v, taps)
+        return torch.cat([v[:, None], convs], 1)
+
+    def _mix(self, sources: torch.Tensor) -> torch.Tensor:
+        """What f reads of the sources, (T, n, m, d): each stream's softmax over
+        depth, mixed by the streams' sigmoid weights, in float32."""
+        t, _, m, d = sources.shape
+        v = sources.float()
+        keys = v * torch.rsqrt(v.square().mean(-1, keepdim=True) + self.eps)
+        scores = torch.einsum("tnmd,md->tnm", keys, self.query.float())
+        z = torch.einsum("tnm,tnmd->tmd", scores.softmax(1), v)
+        flat = z.reshape(t, m * d)
+        rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.eps)
+        logits = (flat @ self.proj.float()) * rms * self.scale + self.bias
+        h = torch.einsum("tm,tmd->td", torch.sigmoid(logits), z)
+        return h.to(sources.dtype)
+
+    def read(self, x: Streams, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """Return what f reads of the state x, and what `write_back` needs; the
+        head's read, without a body."""
+        if not self.body:
+            return (x.newest if x.head is None else x.head), None
+        newest = x.newest.to(x.done.dtype)
+        expanded = self._expand(newest, ctx)
+        h = self._mix(torch.cat([x.done, expanded[:, None]], 1))
+        return h, (x, expanded, h)
+
+    def write_back(self, kept: Any, y: torch.Tensor) -> Streams:
+        """Return the state after the branch, with f's output y."""
+        x, expanded, h = kept
+        if x.finished:  # its streams join the finished ones; y starts a block
+            done, newest, count = torch.cat([x.done, expanded[:, None]], 1), y, 1
+        else:
+            done, newest, count = x.done, x.newest + y.float(), x.count + 1
+        return Streams(done, newest.float(), count, count == self.block, h + y)
+
+
+class _Taps(nn.Module):
+    """A conv's taps, (k, d), bux's as they are: the token's own last."""
+
+    def __init__(self, k: int, d: int):
+        super().__init__()
+        self.weight = _param(k, d)
+
+
 class ResidualGate(Branch):
     """bux's ``vpgate``: x becomes ``a x + b f(x)`` per channel, for
     ``b = sigmoid(g / temperature)`` and ``a = sqrt(max(1 - b^2, eps))``."""
@@ -462,6 +636,7 @@ ALGEBRAS: dict[str, type[Branch]] = {
         ManifoldHyperConnections,
         GatedResidual,
         AttentionResidual,
+        MultiStreamAttentionResidual,
         ResidualGate,
     )
     for kind in cls.bux_residuals
@@ -487,6 +662,10 @@ def widen(residual: dict | None, x: torch.Tensor) -> Any:
     kind = None if residual is None else residual["type"]
     if residual is not None and kind in ("hc", "mhc", "gr"):
         return x[..., None, :].expand(*x.shape[:-1], residual["expansion"], -1)
+    if residual is not None and kind == "msar":
+        m = 1 + len(residual["kernel_sizes"])
+        done = x.new_zeros(x.shape[0], 0, m, x.shape[-1])
+        return Streams(done, x.float(), 0, True)
     return Sources(x[:, None]) if kind == "attnres" else x
 
 

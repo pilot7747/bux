@@ -294,7 +294,7 @@ _UNCOMPUTED |= {"objective", "search"}  # how a search ranks and proposes runs
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
 # Settings newer than run ids that are not configs, at the values runs computed with
 # before them, dumped.
-_NEWER_VALUES = {"batch_ramp": None, "curriculum": []}
+_NEWER_VALUES = {"batch_ramp": None, "curriculum": [], "ema": None}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
     "precision": {
@@ -311,6 +311,7 @@ _NEWER_FIELDS = {
         "ns_dtype": "float32",
         "ns_algorithm": "standard",
         "ns_restarts": None,
+        "cautious_weight_decay": False,
     },
     "schedule": {"horizon": 1.0},
 }
@@ -318,6 +319,8 @@ _NEWER_FIELDS = {
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
 # Fields of a layer's settings, or of the model's init, newer than run ids, by its
 # type, at what they computed before them.
+# HyGA's gates (QuadraticAttentionConfig's gate_input_rank, ...), unset.
+_HYGA = {"gate_input_rank": None, "gate_output_rank": None, "gate_cross_head": False}
 _NEWER_LAYER_FIELDS = {
     "mlp": {"up_offset": 0.0},
     "gated_mlp": {"up_offset": 0.0},
@@ -326,6 +329,8 @@ _NEWER_LAYER_FIELDS = {
         "center_bias": False,
         "bias_softclamp": 2.0,
         "bias_momentum": 0.5,
+        "num_zero_experts": 0,
+        "ffn_experts_per_token": None,
     },
     "mamba2": {"num_heads": None},
     "gqa": {
@@ -333,11 +338,16 @@ _NEWER_LAYER_FIELDS = {
         "power_scale": None,
         "power_scale_length": 2048,
         "qk_norm_all_heads": False,
+        "exclusive": False,
+        "differential": False,
+        **_HYGA,
+        "value_embed_gate": 6,
+        "k_eq_v": False,
         "mimetic_vo": None,
         "mimetic_noise": 0.01,
     },
-    "mla": {"gate_head_bias": False},
-    "csa": {"gate_head_bias": False},
+    "mla": {"gate_head_bias": False, **_HYGA},
+    "csa": {"gate_head_bias": False, **_HYGA},
     "indexer": {"pool": "mean", "per_group": False, "relu": True},
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
@@ -375,9 +385,10 @@ def _without_newer_fields(train: dict) -> dict:
     nor the `_UNCOMPUTED_FIELDS`."""
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
-        for field, before in fields.items():
-            if field in given and given[field] == before:
-                del given[field]
+        for part in (given, given.get("adam") or {}):  # and Muon's own AdamW
+            for field, before in fields.items():
+                if field in part and part[field] == before:
+                    del part[field]
     for setting, names in _UNCOMPUTED_FIELDS.items():
         for name in names:
             (train.get(setting) or {}).pop(name, None)

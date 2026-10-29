@@ -104,7 +104,7 @@ from bux.architecture.experts.moe import MoE
 from bux.architecture.graph import build_node
 from bux.architecture.layers.conv import CausalConv
 from bux.architecture.layers.elementwise import Activation, Dropout, Linear, Scale
-from bux.architecture.layers.embedding import Embedding, Head, NextN
+from bux.architecture.layers.embedding import Embedding, Head, NextN, ValueEmbedding
 from bux.architecture.layers.engram import Engram
 from bux.architecture.layers.mlp import MLP
 from bux.architecture.layers.norm import DyT, Norm
@@ -137,6 +137,7 @@ from bux.architecture.residual import (
     HyperConnections,
     ManifoldHyperConnections,
     Merge,
+    MultiStreamAttentionResidual,
     ResidualGate,
 )
 
@@ -173,6 +174,7 @@ __all__ = [
     "Merge",
     "MoE",
     "Model",
+    "MultiStreamAttentionResidual",
     "NextN",
     "Norm",
     "ResidualGate",
@@ -182,6 +184,7 @@ __all__ = [
     "ShortConv",
     "SoftmaxAttention",
     "Taps",
+    "ValueEmbedding",
     "build_node",
     "num_params",
     "positions",

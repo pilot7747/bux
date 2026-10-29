@@ -94,13 +94,14 @@ class Passes(Sequence):
 def scannable(passes: list[nnx.Module]) -> bool:
     """Return whether `passes` stack into one: they have one graphdef and the same
     variable shapes, share no module or variable (a `shared` definition, nextn's
-    embedding), and leave the stream as wide as they found it, which attnres's grow."""
+    embedding), and leave the stream as wide as they found it, which attnres's and msar's grow."""
     if len(passes) < 2:
         return False
     first = passes[0]
     kind = nnx.graphdef(first), _shapes(first)
     same = all((nnx.graphdef(p), _shapes(p)) == kind for p in passes[1:])
-    grows = any(isinstance(n, residual.AttentionResidual) for n in _nodes(first))
+    growing = residual.AttentionResidual | residual.MultiStreamAttentionResidual
+    grows = any(isinstance(n, growing) for n in _nodes(first))
     return same and not grows and not _shares(passes)
 
 

@@ -58,6 +58,9 @@ GQA_SETTINGS = {
     "mqa": "gqa(num_heads=4, num_kv_heads=1, rope=rope())",
     "no rope": "gqa(num_heads=4, num_kv_heads=2)",
     "window": GQA + ", sliding_window_size=4)",
+    "keys as values": GQA + ", k_eq_v=true, qk_norm=rmsnorm(eps=1e-5))",
+    "keys as values, the hybrid's global layer": "gqa(num_heads=4, num_kv_heads=2, k_eq_v=true,"
+    " qk_norm=rmsnorm, gated=true, kv_conv_size=3, fused_qkv=true)",
     "sinks": GQA + ", sinks=true)",
     "sinks, window": GQA + ", sinks=true, sliding_window_size=3)",
     "softcap": GQA + ", softcap=2.0)",
@@ -89,6 +92,23 @@ GQA_SETTINGS = {
     " layout=interleaved, base=500))",
     "head dims": GQA + ", head_dim=12, v_head_dim=8)",
     "kv conv": GQA + ", kv_conv_size=3)",
+    "xsa": GQA + ", exclusive=true)",
+    "hyga": GQA + ", gated=true, gate_output_rank=8, gate_cross_head=true, sinks=true)",
+    "hyga, low-rank, head bias, softplus": GQA + ", gated=true, gate_input_rank=4,"
+    " gate_output_rank=4, gate_head_bias=true, gate_activation=softplus)",
+    "hyga, xsa, output norm": GQA + ", gated=true, gate_input_rank=4,"
+    " gate_cross_head=true, exclusive=learned, output_norm=rmsnorm)",
+    "differential": GQA + ", differential=true)",
+    "differential, sinks, window, fused, all heads": GQA + ", differential=true,"
+    " sinks=true, sliding_window_size=3, fused_qkv=true, qk_norm=rmsnorm,"
+    " qk_norm_all_heads=true)",
+    "differential, mqa, xsa, hyga, log scale": "gqa(num_heads=4, num_kv_heads=1,"
+    " differential=true, exclusive=learned, gated=true, gate_output_rank=4,"
+    " gate_cross_head=true, log_scale=0.5, log_scale_floor=2)",
+    "xsa, learned, mqa, window, sinks": "gqa(num_heads=4, num_kv_heads=1,"
+    " exclusive=learned, sliding_window_size=3, sinks=true, rope=rope())",
+    "xsa, relative bias": GQA + ", exclusive=true, relative_bias=relbias(rank=2,"
+    " extent=4))",
     "kv conv, window": GQA + ", kv_conv_size=3, sliding_window_size=4)",
     "dropouts": GQA + ", attention_dropout=0.1, output_dropout=0.1)",
     "mimetic init": GQA + ", mimetic_vo=0.05, mimetic_noise=0.02, gated=true,"
@@ -132,6 +152,28 @@ PORTS = {
     "value residual, convex": wired(
         GQA + ", value_residual=convex, kv_conv_size=2)", "attn(v=@v1)", "attn(v=$v1!)"
     ),
+    # The timeline's global layer: no positions, QK-norm, a gate, a conv on keys
+    # and values, the value residual, and XSA over the values it mixed.
+    "value residual, differential, xsa": wired(
+        "gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
+        " differential=true, exclusive=true)",
+        "attn(v=@v1)",
+        "attn(v=$v1)",
+    ),
+    "kv sharing, differential": wired(
+        GQA + ", differential=true)", "attn(kv=@kv)", "attn(kv=$kv!)"
+    ),
+    "value residual, xsa": wired(
+        "gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
+        " exclusive=learned)",
+        "attn(v=@v1)",
+        "attn(v=$v1)",
+    ),
+    "keys as values, value residual": wired(
+        "gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm, kv_conv_size=2)",
+        "attn(v=@v1)",
+        "attn(v=$v1!)",
+    ),
     "kv sharing": wired(
         GQA + ", qk_norm=rmsnorm)",
         "attn(kv=@kv)",
@@ -155,6 +197,23 @@ PORTS = {
         "attn(kv=@kv, kv_conv_size=3)",
         "attn(kv=$kv!, sliding_window_size=3)",
     ),
+}
+
+
+#: The hybrid's global layer, beside value embeddings of its 2 kv heads of 16.
+VALUE_EMBED = (
+    HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=2)\nve = value_embed(features=32)\n"
+    + "block(mixer) = [rmsnorm mixer] [rmsnorm ffn]\n"
+)
+PORTS |= {
+    "value embeddings": VALUE_EMBED
+    + "model = embed ve(ve=@t) block(attn(v=@v1, ve=$t))"
+    " [rmsnorm ve(ve=@u) attn(v=$v1, ve=$u!)] [rmsnorm ffn] rmsnorm head",
+    "value embeddings, one table, no gate, hc": "residual = hc(expansion=2)\n"
+    + VALUE_EMBED
+    + "model = embed ve(ve=@t) block(attn(ve=$t, value_embed_gate=none))"
+    " block(attn(ve=$t!, value_embed_gate=none)) rmsnorm head",
 }
 
 
@@ -182,6 +241,8 @@ MLA_SETTINGS = {
     " original_max_len=8, attention_factor_on=softmax)))",
     "partial rope": MLA + ", rope=rope(fraction=0.5))",
     "qk norm, gated": MLA + ", qk_norm=rmsnorm, gated=true, gate_per_head=true)",
+    "hyga": MLA + ", gated=true, gate_input_rank=4, gate_output_rank=4,"
+    " gate_cross_head=true)",
     "window, sinks": MLA + ", sliding_window_size=4, sinks=true)",
     "softcap, scale": MLA + ", softcap=2.0, scale=0.2)",
     "relative bias, log scale": MLA
@@ -204,6 +265,7 @@ SPARSE = {
     "blocks, plain sum": GQA
     + f", {INDEXER}, block_size=3, weighted=false, norm=rmsnorm))",
     "window, sinks": GQA + f", sliding_window_size=5, sinks=true, {INDEXER}))",
+    "xsa": GQA + f", exclusive=true, {INDEXER}))",
     "relative bias": GQA + f", relative_bias=relbias(rank=2, extent=4), {INDEXER}))",
     "plain dots": GQA + f", {INDEXER}, relu=false))",
     "plain dots, plain sum": GQA + f", {INDEXER}, relu=false, weighted=false))",
@@ -313,6 +375,8 @@ CSA_SETTINGS = {
     "no window, low-rank queries and output": "csa(num_heads=4, head_dim=16,"
     " q_lora_rank=8, o_lora_rank=4, o_groups=2, rope=rope(fraction=0.5))",
     "compressed": CSA + ", compress_ratio=2)",
+    "compressed, hyga": CSA + ", compress_ratio=2, gated=true, gate_output_rank=4,"
+    " gate_cross_head=true)",
     "compressed, indexer": CSA + f", compress_ratio=2, {SMALL_INDEXER}))",
     "single, indexer": CSA + f", compress_ratio=1, {SMALL_INDEXER}, weighted=false))",
     "compressed, indexer of plain dots": CSA
