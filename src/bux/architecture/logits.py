@@ -29,7 +29,7 @@ z-loss, that returns their `Sums`::
 import math
 from collections.abc import Callable
 from functools import partial
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,9 @@ from jaxtyping import Array, Bool, Float, Int, Shaped
 from bux import parallel
 from bux.architecture import observe
 from bux.parallel import methods
+
+if TYPE_CHECKING:
+    from bux.architecture.copy import Pointer
 
 #: The most bytes of float32 logits a device makes at once by ``chunks``, 2 GiB.
 CHUNK_BYTES = 2**31
@@ -153,15 +156,18 @@ class Scores(NamedTuple):
 
 
 class HeadOutput(NamedTuple):
-    """What a head leaves the objective: the stream it reads, and its projection.
+    """What a head leaves the objective: the stream it reads, and its projection;
+    and a copy pointer's view of it, for a head with one.
 
     The objective takes the loss of it by `sums`, which never needs the logits whole
     under ``methods.loss = chunks``; `logits` makes them all, for evaluation and
-    sampling.
+    sampling: the head's own, without a pointer's.
     """
 
     hidden: Float[Array, "b t d"]  #: The stream the head reads.
     projection: Projection  #: The head's map from the stream to logits.
+    #: A copy pointer's queries, keys and sources (`bux.architecture.copy`), or None.
+    pointer: "Pointer | None" = None
 
     def logits(self) -> Float[Array, "b t vocab"]:
         """Return the logits, all at once, in the stream's dtype."""
@@ -181,8 +187,12 @@ class HeadOutput(NamedTuple):
             z: Whether to sum the z-loss too.
 
         Returns:
-            The sums; ``z`` is 0 unless asked for.
+            The sums; ``z`` is 0 unless asked for. With a copy pointer, ``ce`` is the
+            mixture's negative log-likelihood (`~bux.architecture.copy.Pointer.sums`),
+            whatever the method.
         """
+        if self.pointer is not None:
+            return self.pointer.sums(self, targets, weights, z)
         return parallel.method("loss")(self, targets, weights, z)
 
 

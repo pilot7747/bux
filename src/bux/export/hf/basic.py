@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .common import ACTIVATIONS, Ctx, Norm, Site
+from .common import ACTIVATIONS, Ctx, Norm, Site, unsupported
 
 
 class TokenEmbedding(nn.Module):
@@ -64,6 +64,9 @@ class Head(nn.Module):
 
     def __init__(self, c: dict, width: Any, site: Site):
         super().__init__()
+        # A copy pointer's mixture, which generation would sample by a cache of the
+        # pointer's keys: the export holds its weights, which vLLM's plugin serves.
+        unsupported(c, "pointer")
         vocab = site.config.vocab_size
         self.tied, self.softcap = c["tied"], c["softcap"]
         self.proj = None if self.tied else nn.Linear(width, vocab, bias=c["bias"])

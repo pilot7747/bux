@@ -27,7 +27,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
-from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
+from . import copying
+from .common import ACTIVATIONS, Ctx, Layer, Norm, Site, unsupported
 
 
 class Embedding(Layer):
@@ -99,13 +100,21 @@ class ValueEmbedding(Layer):
 class Head(Layer):
     """bux's ``head``: ``softcap(x W + b)``, split by vocabulary. The model's first
     head is its output: the model returns its input, and vLLM takes its logits
-    (`logits`) of the tokens it samples."""
+    (`logits`) of the tokens it samples.
+
+    With a copy pointer (CPLM), its logits are the log of the mixture of its
+    softmax and the pointer (`bux_vllm.copying.mixed`), which its forward computes
+    for each request's last token of the step (`bux_vllm.pointer`): its queries and
+    keys whole on every rank, in the model's dtype."""
 
     bux_types = ("head",)
 
     def __init__(self, c: dict, width: Any, site: Site):
         super().__init__()
         vocab = site.config.vocab_size
+        self.pointer = None
+        if c["pointer"] is not None:
+            self.pointer = Pointer(c["pointer"], width, vocab, site)
         self.tied = c["tied"]
         lm_head = ParallelLMHead(
             vocab, width, bias=c["bias"], prefix=f"{site.path}.lm_head"
@@ -120,16 +129,90 @@ class Head(Layer):
         out = {} if self.tied else {"proj.weight": (self.lm_head.weight, ())}
         if self.lm_head.bias is not None:
             out["bias" if self.tied else "proj.bias"] = (self.lm_head.bias, ())
+        if self.pointer is not None:
+            out |= {f"pointer.{k}": v for k, v in self.pointer.targets().items()}
         return out
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         if ctx.hidden is None:
             ctx.hidden = x
+            if self.pointer is not None:
+                self.pointer(x, ctx)
         return x
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor | None:
-        """The logits of `hidden`, the head's input, gathered over the ranks."""
-        return self.processor(self.lm_head, hidden, self.lm_head.bias)
+        """The logits of `hidden`, the head's input, gathered over the ranks: with a
+        copy pointer, the log of its mixture, of the requests' rows the forward
+        pointed for, in order, as vLLM samples one a request."""
+        logits = self.processor(self.lm_head, hidden, self.lm_head.bias)
+        if self.pointer is None or logits is None:
+            return logits
+        return self.pointer.mixed(logits)
+
+
+class Pointer(Layer):
+    """A head's copy pointer: its query and key projections, the query's gain, the
+    sink's key, its paged cache (`bux_vllm.pointer.PointerCache`), and the buffers
+    of each request's p_copy and a_sink, which its forward fills and `mixed` reads.
+
+    Raises:
+        NotImplementedError: A ``window``, which the cache's op does not cap yet, or
+            speculative decoding, which samples more than one row a request.
+    """
+
+    p_copy: torch.Tensor
+    a_sink: torch.Tensor
+
+    def __init__(self, c: dict, width: int, vocab: int, site: Site):
+        super().__init__()
+        from .pointer import PointerCache
+
+        unsupported(c, "window")
+        if site.vllm_config.num_speculative_tokens:
+            raise NotImplementedError("head: a copy pointer with speculative decoding")
+        dim, self.dim = c["dim"], c["dim"]
+        self.copy = vocab - 1 if c["token"] is None else c["token"]
+        self.q = ReplicatedLinear(width, dim, bias=False, return_bias=False)
+        self.k = ReplicatedLinear(width, dim, bias=False, return_bias=False)
+        self.gain = nn.Parameter(torch.ones(()), requires_grad=False)
+        self.sink = nn.Parameter(torch.zeros(dim), requires_grad=False)
+        self.cache = PointerCache(dim, site.vllm_config, site.caches[0])
+        rows = site.vllm_config.scheduler_config.max_num_seqs
+        copy = torch.zeros(rows, vocab, dtype=torch.float32)
+        self.register_buffer("p_copy", copy, persistent=False)
+        self.register_buffer("a_sink", torch.ones(rows), persistent=False)
+
+    def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
+        return {
+            "q.weight": (self.q.weight, ()),
+            "k.weight": (self.k.weight, ()),
+            "gain": (self.gain, ()),
+            "sink": (self.sink, ()),
+        }
+
+    def forward(self, x: torch.Tensor, ctx: Ctx) -> None:
+        """Point for the step's tokens `x`, the head's input: write their keys and
+        tokens, and each request's p_copy and a_sink for its last token."""
+        assert ctx.input_ids is not None, "a copy pointer copies the step's tokens"
+        q = _rms_normed(self.q(x)) * self.gain.to(x.dtype)
+        k = _rms_normed(self.k(x))
+        sink = (q.float() @ self.sink.float()) * self.dim**-0.5
+        torch.ops.vllm.bux_copy_pointer(
+            q, k, ctx.input_ids, sink, self.p_copy, self.a_sink, self.cache.prefix
+        )
+
+    def mixed(self, logits: torch.Tensor) -> torch.Tensor:
+        """The log of the mixture, of the head's `logits` of each request's row."""
+        p_copy, a_sink = copying.rows_of(self.p_copy, self.a_sink, logits.shape[0])
+        return copying.mixed(logits, p_copy, a_sink, self.copy).to(logits.dtype)
+
+
+def _rms_normed(x: torch.Tensor) -> torch.Tensor:
+    """x over its RMS, in float32, as bux's pointer normalizes its queries and keys,
+    an epsilon of float32's."""
+    y = x.float()
+    y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + torch.finfo(y.dtype).eps)
+    return y.to(x.dtype)
 
 
 class MLP(Layer):
