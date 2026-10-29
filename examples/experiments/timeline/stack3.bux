@@ -1,0 +1,67 @@
+# The winners of ideas.bux and ideas2.bux stacked on the factorial's candidate
+# (factorial.bux's r1v1k1f0p0s0: the late-2026 hybrid with hyper-connections, the
+# value residual and the key-value conv on its global layers), to see whether their
+# gains add up. A winner beat the candidate paired by seed at d512 (3 seeds, t > 2),
+# repo_bpb_8k no worse, as architecture; Muon, zero_out and lr_floor train the model
+# differently and stay out. Four did, each a factor:
+#
+#   E  the embedding times sqrt(d_model) (ideas2.bux's emb_sqrt, -0.73%)
+#   G  GatedNorm on every branch's norm (ideas.bux's gnorm, -0.71%; it serves at 8%
+#      fewer active parameters in FP8, and still wins there)
+#   O  a norm of each global head's output before its gate (ideas.bux's onorm, -0.30%)
+#   L  the value residual's two weights learned (ideas.bux's vres_learned, -0.13%)
+#
+# A half of the 2^4, of resolution IV, L = E + G + O (mod 2), so I = EGOL: no main
+# effect is aliased with an interaction of two; EG = OL, EO = GL, EL = GO. Its first
+# cell is the candidate itself, which factorial.bux ran. ideas.bux and ideas2.bux ran
+# the four singles, in the other half; with them and s3_e1g0o1l1, every factor is
+# also seen alone on the candidate. s3_e1g1o1l1 is all four, s3_e1g0o1l1 the three
+# that cost nothing to serve.
+#
+#   arm          E G O L
+#   (candidate)  0 0 0 0   factorial.bux's r1v1k1f0p0s0
+#   s3_e1g0o0l1  1 0 0 1
+#   s3_e0g1o0l1  0 1 0 1
+#   s3_e0g0o1l1  0 0 1 1
+#   s3_e1g1o0l0  1 1 0 0
+#   s3_e1g0o1l0  1 0 1 0
+#   s3_e0g1o1l0  0 1 1 0
+#   s3_e1g1o1l1  1 1 1 1   all four
+#   s3_e1g0o1l1  1 0 1 1   off the design: those cheap to serve
+#
+# The residual is hc in every arm, every branch's, the MTP module's too; the MTP
+# module keeps the hybrid's layer, as each winner's own arm did.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+emb_s      = embed(scale_by_sqrt_dim=true)
+gated_norm = fr_norm (_ * (linear(features=16) swish linear(features=d_model) sigmoid))
+g_l        = fr_global(kv_conv_size=4, value_residual=learned)
+g_o        = fr_global(kv_conv_size=4, output_norm=fr_norm)
+g_ol       = fr_global(kv_conv_size=4, output_norm=fr_norm, value_residual=learned)
+
+# The candidate with x as its embedding, n as its branches' norm and g as its global
+# layers, the first of which gives its values to the rest.
+lay(n, mixer, ffn=fr_experts) = [n mixer] [n ffn]
+stack(x, n, g) = x
+                 lay(n, hy_delta, fr_dense) lay(n, hy_delta)^2 lay(n, g(v=@v1))
+                 (lay(n, hy_delta)^3 lay(n, g(v=$v1)))^(layers // 4 - 1)
+                 fr_norm @h fr_out hy_mtp
+
+model = s3_e1g0o0l1: stack(emb_s, fr_norm, g_l)
+      | s3_e0g1o0l1: stack(embed, gated_norm, g_l)
+      | s3_e0g0o1l1: stack(embed, fr_norm, g_ol)
+      | s3_e1g1o0l0: stack(emb_s, gated_norm, fr_global(kv_conv_size=4))
+      | s3_e1g0o1l0: stack(emb_s, fr_norm, g_o)
+      | s3_e0g1o1l0: stack(embed, gated_norm, g_o)
+      | s3_e1g1o1l1: stack(emb_s, gated_norm, g_ol)
+      | s3_e1g0o1l1: stack(emb_s, fr_norm, g_ol)
+
+residual = s3_e1g0o0l1: hc(expansion=4) | s3_e0g1o0l1: hc(expansion=4)
+         | s3_e0g0o1l1: hc(expansion=4) | s3_e1g1o0l0: hc(expansion=4)
+         | s3_e1g0o1l0: hc(expansion=4) | s3_e0g1o1l0: hc(expansion=4)
+         | s3_e1g1o1l1: hc(expansion=4) | s3_e1g0o1l1: hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3
