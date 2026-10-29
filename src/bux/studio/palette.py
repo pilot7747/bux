@@ -69,6 +69,7 @@ names: dict[str, str] = {
     "head": "Linear output layer",
     "nextn": "Multi-token prediction",
     "engram": "Engram memory",
+    "value_embed": "Value embedding",
     "rmsnorm": "RMSNorm",
     "layernorm": "LayerNorm",
     "dyt": "Dynamic Tanh",
@@ -114,6 +115,7 @@ _BASES: tuple[tuple[type[cfg.Config], Category], ...] = (
     (cfg.EmbeddingConfig, "io"),
     (cfg.LMHeadConfig, "io"),
     (cfg.NextNConfig, "io"),
+    (cfg.ValueEmbeddingConfig, "io"),
     (cfg.NormalizationConfig, "norm"),
     (cfg.DyTConfig, "norm"),
     (cfg.QuadraticAttentionConfig, "attention"),
@@ -440,6 +442,12 @@ def _(c: cfg.DropoutConfig, ctx: Context) -> list[str]:
     return [f"rate {c.rate:g}"]
 
 
+@chips.register("value_embed")
+def _(c: cfg.ValueEmbeddingConfig, ctx: Context) -> list[str]:
+    """How wide a row is."""
+    return [f"{c.features} wide"]
+
+
 @chips.register("engram")
 def _(c: cfg.EngramConfig, ctx: Context) -> list[str]:
     """Hash heads and the n-grams they hash."""
@@ -502,6 +510,12 @@ def _(tag: str, ctx: Context) -> str:
 def _(tag: str, ctx: Context) -> str:
     """The width of the stream."""
     return f"linear(features={ctx.d_model})"
+
+
+@templates.register("value_embed")
+def _(tag: str, ctx: Context) -> str:
+    """A row a quarter of the stream: the kv heads of the gqa template."""
+    return f"value_embed(features={max(1, ctx.d_model // 4)})"
 
 
 @templates.register("act")

@@ -1063,6 +1063,33 @@ def test_hyga_s_gate_is_bux_s() -> None:
     np.testing.assert_allclose((gate * cross).numpy(), np.asarray(want), atol=1e-6)
 
 
+@pytest.mark.parametrize("gate", [6, None], ids=["gated", "plain"])
+@pytest.mark.parametrize(("kv_heads", "tp"), [(2, 1), (2, 2), (1, 2)])
+def test_value_embeddings_add_to_each_ranks_values_as_bux(
+    gate: int | None, kv_heads: int, tp: int
+) -> None:
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=kv_heads, value_embed_gate=gate)
+    port = ir.Port(name="ve", tap="ve1", mode="read")
+    attn = BuxAttention(c, 64, (port,), rngs=nnx.Rngs(0))
+    w = None
+    if attn.ve_gate is not None:
+        kernel = jax.random.normal(jax.random.key(1), attn.ve_gate.kernel[...].shape)
+        attn.ve_gate.kernel[...] = kernel
+        w = torch.from_numpy(np.array(kernel)).T.contiguous()
+    x = jax.random.normal(jax.random.key(2), (1, 8, 64))
+    v = jax.random.normal(jax.random.key(3), (1, 8, kv_heads, 16))
+    e = jax.random.normal(jax.random.key(4), (1, 8, kv_heads * 16))
+    want = np.asarray(attn._add_value_embedding(x, v, e)[0])
+    xt, et = (torch.from_numpy(np.array(a)[0]) for a in (x, e))
+    for rank in range(tp):
+        first, g = kv.kv_heads(kv_heads, tp, rank)
+        mine = torch.from_numpy(np.array(v)[0, :, first : first + g].reshape(8, -1))
+        got = kv.add_value_embedding(xt, mine, et, w, (first, g))
+        np.testing.assert_allclose(
+            got.numpy(), want[:, first : first + g].reshape(8, -1), rtol=1e-5, atol=1e-6
+        )
+
+
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
     ports = [["v", "v1", "pop"], ["v", "v2", "write"], ["v", "v3", "write"]]
     assert kv.reads(ports, "v") == ("v1", True)

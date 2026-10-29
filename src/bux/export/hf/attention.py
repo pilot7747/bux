@@ -633,9 +633,10 @@ def check_reader(c: dict, ports: list) -> None:
 class Attention(SoftmaxAttention):
     """bux's ``gqa``, every setting: q, k and v projections (one each, or fused), a
     causal conv on k and v, QK-norm (of each head, or of all heads together under
-    ``qk_norm_all_heads``) then RoPE, and its ports: ``v`` (value residual), ``kv``
-    (cross-layer KV sharing) and ``index`` (an indexer's kept keys); and XSA, each
-    head's output less its part along the query's own value (`exclusive`).
+    ``qk_norm_all_heads``) then RoPE, and its ports: ``ve`` (value embeddings, added
+    to the values first), ``v`` (value residual), ``kv`` (cross-layer KV sharing) and
+    ``index`` (an indexer's kept keys); and XSA, each head's output less its part
+    along the query's own value (`exclusive`).
 
     A layer that reads ``kv`` attends to the writer's keys and values as the writer's
     cache layer keeps them, all of them while decoding, and keeps none of its own; it
@@ -665,6 +666,8 @@ class Attention(SoftmaxAttention):
         trained = reads(site.ports, "v") and self.value_residual != "fixed"
         shape = (2,) if self.value_residual == "learned" else ()
         self.v_mix = nn.Parameter(torch.full(shape, 0.5)) if trained else None
+        n = c["value_embed_gate"] if reads(site.ports, "ve") else None
+        self.ve_gate = nn.Linear(2 * n, g, bias=False) if n else None
         index = c["indexer"] and not reads(site.ports, "index")
         rotated = rotated_dims(dk, c["rope"])
         self.indexer = (
@@ -702,6 +705,8 @@ class Attention(SoftmaxAttention):
         else:
             slot = ctx.cache_slot()
             k, v = self._keys_and_values(k, v, ctx, slot)
+            if reads(self.ports, "ve"):
+                v = self._add_value_embedding(x, v, self.read(ctx, "ve"))
             if reads(self.ports, "v"):
                 v = self._mix_values(v, self.read(ctx, "v"))
             self.write(ctx, "v", v)
@@ -761,6 +766,18 @@ class Attention(SoftmaxAttention):
             x, norm = norm(x), None
         x = x.view(b, t, heads, self.dk)
         return x if norm is None else norm(x)
+
+    def _add_value_embedding(
+        self, x: torch.Tensor, v: torch.Tensor, e: torch.Tensor
+    ) -> torch.Tensor:
+        """The values, b t g dv, plus the ve port's rows e, b t g dv flat, by a gate
+        per kv head: v + 2 sigmoid(W [x[:n], e[:n]]) e."""
+        rows = e.to(v.dtype).view(v.shape)
+        if self.ve_gate is None:
+            return v + rows
+        n = self.ve_gate.in_features // 2
+        gate = self.ve_gate(torch.cat([x[..., :n], e[..., :n].to(x.dtype)], -1))
+        return v + 2 * torch.sigmoid(gate)[..., None].to(v.dtype) * rows
 
     def _mix_values(self, v: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
         """The value residual a v + b v1: a = b = 0.5 fixed, both learned, or a learned

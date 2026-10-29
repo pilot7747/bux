@@ -85,6 +85,7 @@
   "softcap",
   "type",
   "v_head_dim",
+  "value_embed_gate",
   "value_residual"
  ],
  "MLAConfig": [
@@ -281,6 +282,11 @@
   "max_positions",
   "norm",
   "scale_by_sqrt_dim",
+  "type"
+ ],
+ "ValueEmbeddingConfig": [
+  "features",
+  "std",
   "type"
  ],
  "LMHeadConfig": [

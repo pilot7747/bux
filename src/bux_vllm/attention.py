@@ -41,8 +41,9 @@ from .indexer import Indexer, rotated
 
 class Attention(Layer):
     """bux's ``gqa``: q, k and v by one column-parallel projection, the causal conv
-    on k and v added to them (``kv_conv_size``), the values mixed with those of its
-    ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
+    on k and v added to them (``kv_conv_size``), the ``ve`` port's value embeddings
+    added to the values by their gate, the values mixed with those of its ``v``
+    port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
     as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
     causal softmax attention with its sliding window, soft-capping and sinks by
     vLLM's attention layer, XSA on each head's output (``exclusive``,
@@ -87,6 +88,7 @@ class Attention(Layer):
         self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
+        self._value_embed_gate(c, site.ports)
         self.sinks = sink_logits(self.h) if c["sinks"] else None
         self._exclusion(c)
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
@@ -320,6 +322,15 @@ class Attention(Layer):
             w = torch.full(shape, 0.5, dtype=torch.float32)
             self.v_mix = nn.Parameter(w, requires_grad=False)
 
+    def _value_embed_gate(self, c: dict, layer_ports: list) -> None:
+        """Keep the gate of the ``ve`` port's rows, every kv head's, where the layer
+        reads the port and gates them (``value_embed_gate``)."""
+        n = c["value_embed_gate"] if kv.reads(layer_ports, "ve") else None
+        self.ve_gate = None
+        if n:
+            w = torch.zeros(c["num_kv_heads"], 2 * n)
+            self.ve_gate = nn.Parameter(w, requires_grad=False)
+
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
         for kind in ("weight", "bias"):
@@ -337,6 +348,8 @@ class Attention(Layer):
             out["sinks"] = (self.sinks, ())
         if self.v_mix is not None:
             out["v_mix"] = (self.v_mix, ())
+        if self.ve_gate is not None:
+            out["ve_gate.weight"] = (self.ve_gate, ())
         if self.gate_bias is not None:
             out["gate_bias"] = (self.gate_bias, ())
         if self.xsa_alpha is not None:
@@ -375,7 +388,7 @@ class Attention(Layer):
             out = self.caches[call](q, None, None).view(t, self.h, self.dv)
             return self.o(self._gated(x, out).reshape(t, -1))
         q, k, v = self._project(x, call)
-        v = self._v_port(v, ctx)
+        v = self._v_port(self._ve_port(x, v, ctx), ctx)
         q, k = self._queries(q, ctx), self._normed(k, self.k_norm, self.g)
         if self.rope is not None:
             k = self.rope(k, ctx.positions)
@@ -477,6 +490,15 @@ class Attention(Layer):
         if self.convs is not None:
             keys_values = keys_values + self.convs[call](keys_values)
         return [q, *keys_values.split([self.g * self.dk, self.g * self.dv], -1)]
+
+    def _ve_port(self, x: torch.Tensor, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        """The values, (T, g dv), with the ``ve`` port's rows added by their gate,
+        as bux adds them, before the value residual."""
+        read = kv.reads(self.ports, "ve")
+        if read is None:
+            return v
+        heads = (self.kv_first, self.g)
+        return kv.add_value_embedding(x, v, ctx.read(*read), self.ve_gate, heads)
 
     def _v_port(self, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The values, (T, g dv), with those the ``v`` port reads mixed in, pushed
