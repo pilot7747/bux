@@ -2,8 +2,8 @@
 
 | | measured, paired by seed | × per parameter | GPU-hours, speedup | 130B tokens | 1T tokens | 10T tokens | 1T tokens, range |
 |---|---|---|---|---|---|---|---|
-| hybrid + hc, value residual, key-value conv | d512 -2.61 ± 0.20 (seeds 0,1,2); d768 -2.16 ± 0.22 (seeds 0,1); d1024 -1.88 ± 0.16 (seeds 0,1); d1280 -1.84 ± 0.02 (seeds 0,1) | 3.43 | 1.46 | -0.41 | -0.44 | -0.46 | [-0.57, -0.44] |
-| hybrid + hc, value residual | d512 -1.96 ± 0.13 (seeds 0,1,2); d768 -1.69 ± 0.42 (seeds 0,1); d1024 -1.51 ± 0.18 (seeds 0,1); d1280 -1.54 (seed 0) | 2.86 | 1.7 | -0.77 | -0.82 | -0.86 | [-0.92, -0.58] |
-| hybrid + mHC, value residual, key-value conv | d512 -2.84 ± 0.25 (seeds 0,1,2); d768 -2.10 ± 0.12 (seeds 0,1); d1024 -1.78 ± 0.06 (seeds 0,1); d1280 -1.72 (seed 0) | 3.36 | 2 | -0.66 | -0.70 | -0.73 | [-0.92, -0.51] |
-| hybrid + AttnRes, value residual, key-value conv | d512 -1.98 ± 0.61 (seeds 0,1,2); d768 -1.44 ± 0.14 (seeds 0,1); d1024 -0.77 ± 0.15 (seeds 0,1); d1280 -1.31 (seed 0) | 2.43 | 1.22 | -0.38 | -0.41 | -0.43 | [-0.43, -0.32] |
-| hybrid + hc, value residual, key-value conv, against 2020 | d512 -17.76 ± 0.30 (seeds 0,1,2); d768 -15.06 (seed 0); d1024 -13.68 (seed 0); d1280 -13.10 (seed 0) | 107.94 | 1.82 | -8.42 | -8.95 | -9.29 | [-9.34, -8.95] |
+| hybrid + hc, value residual, key-value conv | d512 -2.61 ± 0.20 (seeds 0,1,2); d768 -2.16 ± 0.22 (seeds 0,1); d1024 -1.88 ± 0.16 (seeds 0,1); d1280 -1.84 ± 0.02 (seeds 0,1) | 3.36 | 1.46 | -0.41 | -0.44 | -0.46 | [-0.57, -0.44] |
+| hybrid + hc, value residual | d512 -1.96 ± 0.13 (seeds 0,1,2); d768 -1.69 ± 0.42 (seeds 0,1); d1024 -1.51 ± 0.18 (seeds 0,1); d1280 -1.54 (seed 0) | 2.82 | 1.71 | -0.78 | -0.83 | -0.86 | [-0.93, -0.57] |
+| hybrid + mHC, value residual, key-value conv | d512 -2.84 ± 0.25 (seeds 0,1,2); d768 -2.10 ± 0.12 (seeds 0,1); d1024 -1.78 ± 0.06 (seeds 0,1); d1280 -1.72 (seed 0) | 3.30 | 2 | -0.66 | -0.71 | -0.74 | [-0.93, -0.50] |
+| hybrid + AttnRes, value residual, key-value conv | d512 -1.98 ± 0.61 (seeds 0,1,2); d768 -1.44 ± 0.14 (seeds 0,1); d1024 -0.77 ± 0.15 (seeds 0,1); d1280 -1.31 (seed 0) | 2.40 | 1.22 | -0.38 | -0.41 | -0.43 | [-0.43, -0.32] |
+| hybrid + hc, value residual, key-value conv, against 2020 | d512 -17.76 ± 0.30 (seeds 0,1,2); d768 -15.06 (seed 0); d1024 -13.68 (seed 0); d1280 -13.10 (seed 0) | 101.18 | 1.84 | -8.42 | -8.95 | -9.30 | [-9.38, -8.95] |

@@ -12,7 +12,7 @@ the milestones of each year, a factorial screen looks for what the late-2026 hyb
 still lacks, and the new layers of 2026 go on top of its best.
 
 By the end you will have the answer. At the serving cost of a GPT-3 6.7B and on the
-same 1T tokens, the late-2026 linear-attention hybrid predicts 8.5% fewer bits per
+same 1T tokens, the late-2026 linear-attention hybrid predicts 8.6% fewer bits per
 byte than the 2020 baseline. The mixtures of experts since 2024 land within about 0.3
 points of it: Qwen3-Next's layout of 2025 predicts 8.5% fewer, DeepSeek-V3's of 2024
 8.4%, and the late-2026 sliding-window frontier 8.2%. With unlimited data, the
@@ -29,32 +29,30 @@ the rungs. Then, at the targets: the objective on 1T tokens, its change against
 2020's, and the speedup to 2020's loss on 1T tokens with unlimited data. Ranges are
 in brackets ([step 6](#what-the-fit-says)).
 
-**Today's best architecture**, the candidate, is the 2026 hybrid with hyper-connections,
-the value residual and a key-value conv. Paired by seed, it measures 2.6%, 2.2%, 1.9%
-and 1.8% fewer bits per byte than the hybrid at `d512`, `d768`, `d1024` and `d1280`. Per
-parameter it is worth 3.4 times the hybrid. At equal serving cost the fit predicts 0.4%
-to 1.0% fewer bits per byte on 1T tokens than the hybrid, as it ties the short ladders,
-and 9.0% fewer than 2020 ([step 8](#8-todays-best-architecture)). The new layers of 2026
-gain more at `d512`, and lose most of it by `d1024`. The largest, a copy pointer in the
-head, falls from 4.1% to 1.4% against the candidate. With GatedNorm it is the contender,
-`stack5`: ahead of the candidate at every rung so far, its lead shrinking by more than a
-third a rung, and within the fit's spread of it at the target. One change improves the
-candidate for free: its one dense layer moved from the first layer to the last gains
-0.27% to 0.42% at every rung to `d1024`, in 7 of 7 seeds, at the same serving cost, and
-0.5% at the target. Build the candidate that way.
+**Today's best architecture** is the candidate with its dense layer moved last. The
+candidate is the 2026 hybrid with hyper-connections, the value residual and a key-value
+conv. Paired by seed, it measures 2.6%, 2.2%, 1.9% and 1.8% fewer bits per byte than the
+hybrid at `d512`, `d768`, `d1024` and `d1280`. Per parameter it is worth 3.4 times the
+hybrid. At equal serving cost the fit predicts 0.4% to 1.0% fewer bits per byte on 1T
+tokens than the hybrid, as it ties the short ladders, and 9.0% fewer than 2020
+([step 8](#8-todays-best-architecture)).
 
-:::{note}
-Two sets of runs are still training, and their rows here are interim: `stack5` at
-`d1280`, and the third seed at `d768` of index sharing with one indexer in two.
-:::
+Moving the candidate's one dense layer from the first layer to the last gains 0.27% to
+0.42% at every rung to `d1024`, in 7 of 7 seeds, and 0.54% at the target. It costs
+nothing: the same serving cost, and a calmer gradient. Tied with it at the target is
+`stack5`, the candidate with a copy pointer in the head and GatedNorm, 0.51% ahead of
+the candidate there. Its gain is larger at small scale, and it held at `d1280`: 1.6%
+ahead of the candidate on both seeds. But it needs the copy pointer's kernels, and its
+target is 14% smaller, 7.86B parameters per token against 9.13B. The two do not stack:
+moving `stack5`'s dense layer last makes no measurable difference.
 
 Of the single changes, two kinds win:
 
-- **Better per parameter.** Fine-grained mixtures of experts are worth 4.4 to 5.1
+- **Better per parameter.** Fine-grained mixtures of experts are worth 4.4 to 5.0
   times the parameters a token goes through: 4.2% to 5.7% fewer bits per byte on 1T
   tokens. Gated attention with QK-norm, KDA and the other linear-attention mixers,
   hyper-connections, the gated residual stream and the value residual follow, at 1.2
-  to 2.2 times.
+  to 2.1 times.
 - **Cheaper to serve.** The changes that shrink the KV cache are no better per
   parameter, and some are worse. At equal serving cost their targets hold 3.7 to 9
   times the reference's parameters per token: on 1T tokens, multi-head latent
@@ -195,9 +193,9 @@ A seed sets the model's init and the data's order, and every family's run of a s
 reads the same data in the same order. So a seed shifts every family alike: seed 2's
 objective is 1.4% above seed 0's in every arm. `fit.py` treats the seeds as
 blocks, and puts every point on seed 0's scale. A run's own noise is 0.33% of
-the objective, and the seeds' shifts 0.69% (412 degrees of freedom). The repository
+the objective, and the seeds' shifts 0.69% (415 degrees of freedom). The repository
 eval reads 128 rows of 16k, the fewest of the three, and is the noisiest: 0.64% own
-and 2.06% by seed.
+and 2.05% by seed.
 
 `fit.py` gives every change a verdict against its parent:
 
@@ -550,7 +548,7 @@ Engram's tables and the MTP module (an MoE's routed experts count `top_k` of
   fits at once ([step 8](#the-candidate-at-equal-serving-cost)).
 - **E is shared by every family**: the data's entropy. `--fix-e` holds it at the
   values Old against new's ladders fit on the same data: 0.3204 bits per byte for
-  the objective. These rungs do not pin E down: fit free, it lands at 0.2849, and
+  the objective. These rungs do not pin E down: fit free, it lands at 0.2828, and
   the points cannot tell it from lower values. So the main numbers hold E, and the
   candidates' ranges reach to E fit.
 
@@ -624,7 +622,7 @@ results lead this page; read them with the unlimited-data plot:
 
 - **With unlimited data, MFU decides as much as bits do.** Llama 3 trains at 0.65
   MFU and the 2026 families at 0.16, so Llama 3's dense target reaches 2020's loss in
-  1.9 times fewer GPU-hours, against their 1.28 to 1.37. Qwen3-Next at 0.11 needs 1.2
+  1.9 times fewer GPU-hours, against their 1.29 to 1.38. Qwen3-Next at 0.11 needs 1.2
   times fewer. GPT-NeoX, whose parallel blocks cost what its RoPE gains, is about
   even with 2020, and PaLM's 36B target needs 1.8 times more GPU-hours.
 - **The dense milestones' gains shrink with width**: the baseline's learned
@@ -658,9 +656,9 @@ the hybrid.
   and MLA is worse, +0.68% with its decoupled RoPE and +1.29% without.
 
 At their targets on 1T tokens, the frontier predicts 0.33% more bits per byte than
-the hybrid, `swa_hv1k` 0.36% fewer, and the lean frontier 0.57% more. At 64k and
+the hybrid, `swa_hv1k` 0.37% fewer, and the lean frontier 0.57% more. At 64k and
 128k the frontier's targets hold more parameters per token than the hybrid's, 14.8B
-and 14.1B against 12.5B and 13.0B, and still it trails, by 0.17% and 0.25%
+and 14.1B against 12.5B and 13.0B, and still it trails, by 0.17% and 0.24%
 ([step 8](#the-candidate-at-equal-serving-cost)).
 
 ## 8. Today's best architecture
@@ -712,7 +710,7 @@ are the numbers this page quotes. `factorial.py`'s fit of the whole screen puts 
 ```{include} timeline/tables/best.md
 ```
 
-Per parameter the candidate is worth 3.43 times the hybrid. At equal serving cost in
+Per parameter the candidate is worth 3.36 times the hybrid. At equal serving cost in
 FP8 it predicts 0.44% fewer bits per byte on 1T tokens than the hybrid, 0.44% to
 0.57% over E and the serving cost, and 8.95% fewer than 2020. With unlimited data it
 reaches the hybrid's 1T-token loss in 1.46 times fewer GPU-hours. The predicted loss
@@ -721,16 +719,16 @@ is smaller than at the rungs:
 
 | Target | per token | loss | E | parameter term, A N^-α | data term, B D^-β |
 |--------|-----------|------|---|------------------------|-------------------|
-| the 2026 hybrid | 11.3B | 0.3560 | 0.3204 (90.0%) | 0.0064 (1.8%) | 0.0291 (8.2%) |
-| hybrid + hc, value residual, key-value conv | 9.13B | 0.3544 | 0.3204 (90.4%) | 0.0048 (1.4%) | 0.0291 (8.2%) |
+| the 2026 hybrid | 11.3B | 0.3560 | 0.3204 (90.0%) | 0.0066 (1.9%) | 0.0289 (8.1%) |
+| hybrid + hc, value residual, key-value conv | 9.13B | 0.3544 | 0.3204 (90.4%) | 0.0050 (1.4%) | 0.0289 (8.2%) |
 
 - **About 90% of the predicted loss is the floor E**, and 8% the data term on 1T
   tokens. Only the parameter term depends on the parameters, and it is all that a
   change in efficiency per parameter can move.
-- **The hybrid's fitted exponent is steep**: α = 0.44, against the reference's 0.25.
+- **The hybrid's fitted exponent is steep**: α = 0.43, against the reference's 0.25.
   So its parameter term is already small at its target: under 2% of the loss.
-- **The candidate's exponent is the hybrid's**, 0.44. Its parameter term at its
-  target is 25% smaller than the hybrid's, though it holds 20% fewer parameters per
+- **The candidate's exponent is about the hybrid's**, 0.44. Its parameter term at its
+  target is 24% smaller than the hybrid's, though it holds 20% fewer parameters per
   token.
 - **`hc` costs serving**: the candidate's target holds 9.13B parameters per token as
   measured, against the hybrid's 11.3B, which takes back part of the gain.
@@ -741,9 +739,9 @@ fit weighs their points in it. The changes whose gains shrink fastest pull it do
 to 0.44. With those changes on the hybrid's exponent instead, the candidate's is
 0.50, and it gains 0.96% at its target, not 0.44%. So its gain at the target is 0.4%
 to 1.0%. The candidate, the hybrid with `hc` and the value residual alone, and mHC
-in place of `hc` are within that spread of each other, and so are the copy pointer
-and `stack5` below. At every rung, measured, the candidate leads the first and ties
-the second.
+in place of `hc` are within that spread of each other. At every rung, measured, the
+candidate leads the first and ties the second. The changes built on it below are
+measured against it, in the same fit.
 
 The exponents rest on four rungs whose widest has 514M parameters per token. The result
 holds for this hybrid's shape: 256 experts with 7 routed, KDA in three layers of four,
@@ -765,8 +763,8 @@ hybrid's target there, in percent on 1T tokens:
 ```
 
 - **The candidate keeps its gain at every context**: 0.44% to 0.50% fewer bits per
-  byte than the hybrid. So do mHC and AttnRes in its place, the copy pointer, and
-  the dense layer last, at 0.94% to 1.00%.
+  byte than the hybrid. So do mHC and AttnRes in its place and the copy pointer, and
+  the dense layer last and `stack5` keep theirs, at 0.91% to 1.01%.
 - **The frontier stays behind the hybrid**, by 0.17% to 0.45%, though it serves more
   sessions at 64k and 128k: its parameters are worth less.
 - **Full attention loses ground with context**: Llama 3 goes from 4.2% behind the
@@ -834,7 +832,7 @@ candidate, in percent:
   does not grow with context (step 5), and its FP8 quality cost passes the gate.
 - **At its target the pointer is within the fit's spread of the candidate.** On three
   rungs it fits its own exponent, 0.39, below the candidate's, as its gain shrinks.
-  In this fit it predicts 0.38% fewer bits per byte than the candidate on 1T tokens.
+  In this fit it predicts 0.37% fewer bits per byte than the candidate on 1T tokens.
   With the short ladders on the hybrid's exponent, it predicts 0.18% more.
 - **The others lose or make no measurable difference at `d512`**: Canon convs in
   every placement, K=V, MSAR (also 2.1 times the step time, and 58% fewer sessions),
@@ -847,14 +845,14 @@ candidate, in percent:
 Each stack sets the winners on the candidate together, its arms paired with it by
 seed. The objective's change against the candidate, in percent:
 
-| Stack | Arm | `d512` | `d768` | `d1024` |
-|-------|------|--------|--------|---------|
-| √d embedding, GatedNorm, output norm, learned value residual | `stack3[s3_e1g1o1l1]` | -1.17 | -0.12 | |
-| the same without GatedNorm | `stack3[s3_e1g0o1l1]` | -0.73 | +0.74 | |
-| value embeddings, learned XSA, differential attention | `stack4[s4_v1x1d1]` | -0.37 | -0.53 | |
-| the same + GatedNorm | `stack4[s4_gvxd]` | | -0.84 | |
-| copy pointer + GatedNorm | `stack5` | -4.84 | -2.79 | -1.78 |
-| `stack5` + value embeddings, learned XSA, differential attention | `stack6` | -4.78 | -3.07 | |
+| Stack | Arm | `d512` | `d768` | `d1024` | `d1280` |
+|-------|-----|--------|--------|---------|---------|
+| √d embedding, GatedNorm, output norm, learned value residual | `stack3[s3_e1g1o1l1]` | -1.17 | -0.12 | | |
+| the same without GatedNorm | `stack3[s3_e1g0o1l1]` | -0.73 | +0.74 | | |
+| value embeddings, learned XSA, differential attention | `stack4[s4_v1x1d1]` | -0.37 | -0.53 | | |
+| the same + GatedNorm | `stack4[s4_gvxd]` | | -0.84 | | |
+| copy pointer + GatedNorm | `stack5` | -4.84 | -2.79 | -1.78 | -1.59 |
+| `stack5` + value embeddings, learned XSA, differential attention | `stack6` | -4.78 | -3.07 | | |
 
 - **The copy pointer and GatedNorm add up**: `stack5`'s -4.84% at `d512` is the sum
   of the two alone, and its -2.79% at `d768` 95% of it. It serves 7.86B parameters
@@ -868,17 +866,18 @@ At their targets, against the candidate's on 1T tokens:
 ```{include} timeline/tables/stacks.md
 ```
 
-- **`stack5` on three rungs** predicts 0.40% fewer bits per byte than the candidate
-  at its target, 0.18% more with the short ladders on the hybrid's exponent. Its own
-  exponent, 0.37, follows its shrinking gain. Its `d1280` runs decide.
+- **`stack5` holds at `d1280`**: -1.60% and -1.58% against the candidate on seeds 0
+  and 1. Its gain shrinks 11% from `d1024`, after 42% and 36% at the rungs before. On
+  four rungs, with an exponent of its own, 0.39, it predicts 0.51% fewer bits per byte
+  than the candidate at its target, 0.33% to 0.51% over E and the serving cost.
 - **The stacks on two rungs** take the candidate's exponent, so they cannot follow a
-  shrinking gain: `stack5`'s variants predict 0.71% each, though at the rungs
+  shrinking gain: `stack5`'s variants predict 0.73% each, though at the rungs
   they are within 0.15% of `stack5`. Read them as upper bounds.
 - **The dense layer at the end gains at the target too.** On three rungs, with an
-  exponent of its own, `dense_last` predicts 0.53% fewer bits per byte than the
-  candidate, 0.25% to 0.64% over E and the serving cost. Its gain grows from `d768`
-  to `d1024`, on two seeds each, so its own exponent, 0.53, is the steepest of any
-  candidate. Routing the first layer adds nothing: `dense0` +0.03%.
+  exponent of its own, `dense_last` predicts 0.54% fewer bits per byte than the
+  candidate, 0.24% to 0.65% over E and the serving cost: tied with `stack5`. Its gain
+  grows from `d768` to `d1024`, on two seeds each, so its own exponent, 0.52, is the
+  steepest of any candidate. Routing the first layer adds nothing: `dense0` +0.03%.
 
 ### Training options
 
@@ -926,6 +925,12 @@ candidate's active parameters, and pairs with it by seed:
   dense layer at the end makes no measurable difference on it either: -0.06% at
   `d512`, -0.05% at `d768`.
 
+So today's best architecture is the candidate with its dense layer last. At the
+target it ties `stack5`, 0.54% and 0.51% ahead of the candidate on 1T tokens.
+`stack5` gains more at every rung, but it needs the copy pointer's kernels, and its
+target holds 7.86B parameters per token against 9.12B. The dense layer last needs
+nothing new, serves at the candidate's cost, and calms the gradient.
+
 ### Sparse attention on the candidate
 
 `sparse_native.bux` puts each sparse attention on the candidate's global layers, in
@@ -959,28 +964,26 @@ the 2021 reference, all sparse, as GLM-5.2's are.
 - **Sharing trains faster**: a step of 16k at `d768` takes 1.3 s with one indexer in
   four, against 2.3 s for DSA in every global layer. The indexer is most of DSA's
   training cost at 16k.
-- **One indexer in two keeps quality**: +0.12% at `d768` over two seeds.
+- **One indexer in two keeps quality**: +0.03% at `d768` over three seeds.
 - **One in four with the plain indexer loss fails at long positions on some seeds.**
   At `d768` seed 0 it is 1.17% worse than the candidate, and 6.5% worse on
   repositories past 8k, while seeds 1 and 2 are +0.20% and -0.09%. The cross-layer
   loss removes the failure: +0.11% at `d768` over three seeds, +0.09% past 8k.
 - **On the reference, every layer sparse, the same holds.** One indexer in four is
   0.61% worse than DSA in every layer at `d512`, its seed 2 10.0% worse past 8k. At
-  `d768`, on seed 0, it is 0.32% worse, and 4.8% worse past 8k. With the
+  `d768` its seed 0 is 0.32% worse and 4.8% worse past 8k, its seed 1 even. With the
   cross-layer loss no seed fails: it costs 0.80% at `d512`, and nothing at `d768`
-  (-0.04%, and +0.49% past 8k).
+  (+0.00% over two seeds, +0.15% past 8k).
 
-These quality results are interim: one indexer in two has two seeds at `d768`, and
-the reference one at `d768`. At their targets of 16-24k, against the
-candidate's on 1T tokens:
+At their targets of 16-24k, against the candidate's on 1T tokens:
 
 ```{include} timeline/tables/sparse-candidate.md
 ```
 
-Sparse attention costs the candidate 0.14% to 0.27% at 16-24k, where it serves fewer
+Sparse attention costs the candidate 0.15% to 0.27% at 16-24k, where it serves fewer
 sessions, and nothing at 256k. There QSA predicts what the candidate does, 0.47%
 under the hybrid, and DSA 0.12% less. Index sharing matches the candidate from 64k
-on, and leads it by 0.12% at 128k, the noisiest point.
+on, and leads it by 0.13% to 0.15% at 128k, the noisiest point.
 
 ### A short conv in place of KDA
 
@@ -1031,18 +1034,18 @@ The appendix lists every change against its parent. Beyond the summary at the to
   parameter. The learned table catches up with width: the baseline is 7.5% worse
   than the reference at `d512`, 2.4% at `d1024`, and the fit puts it about even at
   the target.
-- **Linear-attention mixers gain both ways**: 1.2 to 2.2 times the parameters, and
+- **Linear-attention mixers gain both ways**: 1.2 to 2.1 times the parameters, and
   targets of 6B to 15B parameters per token, against the reference's 3.7B.
 - **The residual streams gain on the reference, and shrink with width.** Paired by
   seed, `hc` measures 2.44%, 2.20% and 1.27% fewer bits per byte at `d512`, `d768`
   and `d1024`, the gated residual stream 2.97% and 1.42% at `d512` and `d768`, and
-  mHC 2.82% at `d512`. At the target, `hc` alone ends at +0.19% on 1T tokens: its
+  mHC 2.82% at `d512`. At the target, `hc` alone ends at +0.20% on 1T tokens: its
   own exponent, from three rungs, follows its shrinking gain. The gated residual
   stream (-1.38%) and mHC (-1.99%) have two rungs and one, so they take the
   reference's exponent and keep their gain.
-- **RoPE at base 500k flips sign at the target** too, to +0.52% against the baseline
+- **RoPE at base 500k flips sign at the target** too, to +0.55% against the baseline
   on 1T tokens, and the value residual's gain on the reference fades to nothing
-  (+0.03%): both shrink fast with width.
+  (+0.04%): both shrink fast with width.
 
 ### Long context
 
@@ -1090,7 +1093,7 @@ untested.
   far below 1: DyT is 74% worse at `d512`, and 3.1% worse with the embedding scaled
   by √d.
 - **KDA in seven layers of eight is slightly worse than in three of four** (×1.70
-  against ×2.15 per parameter), and KDA in every other layer, ×1.72.
+  against ×2.14 per parameter), and KDA in every other layer, ×1.72.
 - **The routing choices of the frontier's experts make no measurable difference**:
   softmax, no shared expert, SMEBU, or a square-root softplus (`zoo_moe.bux`).
 
@@ -1144,11 +1147,11 @@ family measured ([step 5](#fp8)).
   they may sit off their optimum at wider rungs.
 - **Seeds are shared shifts.** Paired by seed, a difference is 2 to 3 times sharper
   than unpaired. Most points past `d512` are one run, on seed 0.
-- **Rungs differ by family.** 22 families have four rungs (the reference, the
-  baseline, four milestones and 16 arms), 21 three, 75 two, and 73 one, most of the
+- **Rungs differ by family.** 23 families have four rungs (the reference, the
+  baseline, four milestones and 17 arms), 20 three, 75 two, and 73 one, most of the
   factorial among them. A family with fewer than three takes its parent's exponent,
   so its gain is one multiplier at every scale.
-- **E is held at 0.3204.** Fit free, it lands at 0.2849, and moves the candidate's
+- **E is held at 0.3204.** Fit free, it lands at 0.2828, and moves the candidate's
   gain on the hybrid at 1T from 0.44% to 0.48%. The candidates' ranges carry it.
 - **The targets are far.** A dense target at the reference's cost has 3.7B parameters
   per token, 43 times `d768`'s; the 2026 families' have 9.1B to 11.3B. The ranges

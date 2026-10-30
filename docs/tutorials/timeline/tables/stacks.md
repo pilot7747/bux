@@ -2,12 +2,12 @@
 
 | | rungs | × per parameter | GPU-hours, speedup | 1T tokens | 1T tokens, range |
 |---|---|---|---|---|---|
-| candidate + copy pointer | 512×3/768×2/1024×2 | 3.62 | 1.25 | -0.38 | [-0.50, -0.26] |
-| candidate + copy pointer, window of 4096 | 512×3/768×2 | 3.30 | 1.33 | -0.59 | [-0.69, -0.42] |
-| candidate + copy pointer + GatedNorm (`stack5`) | 512×3/768×2/1024×2 | 4.83 | 1.36 | -0.40 | [-0.40, -0.26] |
-| `stack5`, first layer routed | 512×3/768×2 | 5.11 | 1.54 | -0.71 | [-0.71, -0.51] |
-| `stack5`, the dense layer last | 512×3/768×2 | 5.09 | 1.14 | -0.71 | [-0.71, -0.50] |
-| `stack5` + value embeddings, XSA, differential attention (`stack6`) | 512×3/768×2 | 4.03 | 1.46 | -0.60 | [-0.60, -0.47] |
-| candidate + GatedNorm, value embeddings, XSA, differential attention | 768×2 | 1.11 | 1.13 | -0.03 | [-0.04, +0.06] |
+| candidate + copy pointer | 512×3/768×2/1024×2 | 3.57 | 1.25 | -0.37 | [-0.50, -0.24] |
+| candidate + copy pointer, window of 4096 | 512×3/768×2 | 3.27 | 1.34 | -0.61 | [-0.71, -0.43] |
+| candidate + copy pointer + GatedNorm (`stack5`) | 512×3/768×2/1024×2/1280×2 | 9.45 | 1.42 | -0.51 | [-0.51, -0.33] |
+| `stack5`, first layer routed | 512×3/768×2 | 5.03 | 1.56 | -0.73 | [-0.73, -0.52] |
+| `stack5`, the dense layer last | 512×3/768×2 | 5.01 | 1.15 | -0.73 | [-0.73, -0.52] |
+| `stack5` + value embeddings, XSA, differential attention (`stack6`) | 512×3/768×2 | 3.96 | 1.47 | -0.62 | [-0.62, -0.48] |
+| candidate + GatedNorm, value embeddings, XSA, differential attention | 768×2 | 1.11 | 1.13 | -0.02 | [-0.04, +0.06] |
 | candidate, first layer routed (`dense0`) | 512×3/768×2 | 0.97 | 1 | +0.03 | [-0.13, +0.03] |
-| candidate, the dense layer last (`dense_last`) | 512×3/768×2/1024×2 | 1.26 | 0.917 | -0.53 | [-0.64, -0.25] |
+| candidate, the dense layer last (`dense_last`) | 512×3/768×2/1024×2 | 1.26 | 0.921 | -0.54 | [-0.65, -0.24] |

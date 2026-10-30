@@ -4,14 +4,14 @@
 |---|---|---|---|---|
 | 2026 linear-attention hybrid | +0.00 | +0.00 | +0.00 | +0.00 |
 | hybrid + hc, value residual, key-value conv | -0.44 | -0.50 | -0.44 | -0.47 |
-| hybrid + mHC, value residual, key-value conv | -0.70 | -0.81 | -0.68 | -0.74 |
+| hybrid + mHC, value residual, key-value conv | -0.71 | -0.81 | -0.69 | -0.75 |
 | hybrid + AttnRes, value residual, key-value conv | -0.41 | -0.40 | -0.40 | -0.37 |
-| 2026 sliding-window frontier | +0.33 | +0.17 | +0.25 | +0.45 |
-| frontier + hc, value residual in every layer, key-value conv | -0.36 | -0.36 | -0.34 | -0.24 |
+| 2026 sliding-window frontier | +0.33 | +0.17 | +0.24 | +0.45 |
+| frontier + hc, value residual in every layer, key-value conv | -0.37 | -0.36 | -0.34 | -0.24 |
 | frontier, windows of 128 with sinks | +0.57 | +0.22 | +0.23 | +0.41 |
-| 2024 DeepSeek-V3, DeepSeek's dims | +0.09 | +0.03 | +0.53 | +1.09 |
-| 2024 Llama 3 | +4.19 | +4.74 | +5.49 | +6.21 |
-| 2021 reference | +9.86 | +9.62 | +10.96 | +10.90 |
-| candidate + copy pointer | -0.82 | -0.85 | -0.80 | -0.79 |
-| candidate + copy pointer + GatedNorm | -0.85 | -0.89 | -0.84 | -0.81 |
-| candidate, the dense layer last | -0.97 | -1.00 | -0.94 | -0.95 |
+| 2024 DeepSeek-V3, DeepSeek's dims | +0.08 | +0.03 | +0.53 | +1.10 |
+| 2024 Llama 3 | +4.20 | +4.75 | +5.52 | +6.24 |
+| 2021 reference | +9.89 | +9.66 | +11.00 | +10.94 |
+| candidate + copy pointer | -0.81 | -0.84 | -0.79 | -0.78 |
+| candidate + copy pointer + GatedNorm | -0.95 | -0.98 | -0.93 | -0.91 |
+| candidate, the dense layer last | -0.98 | -1.01 | -0.95 | -0.96 |
