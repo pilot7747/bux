@@ -259,7 +259,7 @@ curriculum = base: yarn_phase | rope: yarn_phase | rope_500k: yarn_phase | ...
 | `stack5_dl.bux` | `stack5_d0.bux` | stack5's one dense layer moved from the first layer to the last |
 | `mhc_init.bux`, `factorial_mhc.bux` | the 2021 reference; the 2026 hybrid | mHC's start, three ways to set its streams apart; mHC in place of `hc` in the candidate |
 | `western.bux`, `gdn2_hybrid.bux` | the 2026 frontier; the 2026 hybrid | the frontier's global layers with partial RoPE or MLA; GDN-2 in place of KDA, alone and with the candidate's add-ons |
-| `lfm2.bux` | the 2021 reference; the candidate (step 8) | LFM2's gated short conv in three layers of four, as `mixers.bux`'s arms; in place of the candidate's KDA, at its 3:1 and at LFM2-1.2B's 3 global layers in 8 |
+| `lfm2.bux` | the 2021 reference; the candidate (step 8) | LFM2's gated short conv in three layers of four, as `mixers.bux`'s arms; in place of the candidate's KDA, at its 3:1, at LFM2-1.2B's 3 global layers in 8, and with RoPE on the global layers as LFM2's |
 
 Some changes are not arms. Zero-centered gains train as plain ones, since bux's
 weight decay leaves every gain alone. ALiBi has no layer in bux.
@@ -981,6 +981,44 @@ Sparse attention costs the candidate 0.14% to 0.27% at 16-24k, where it serves f
 sessions, and nothing at 256k. There QSA predicts what the candidate does, 0.47%
 under the hybrid, and DSA 0.12% less. Index sharing matches the candidate from 64k
 on, and leads it by 0.12% at 128k, the noisiest point.
+
+### A short conv in place of KDA
+
+`lfm2.bux` tries LFM2's double-gated short conv (`short_conv` of 3 taps) as the
+linear-time mixer. It mixes a token with the two before it, and its state is those
+two inputs. On the 2021 reference it takes three layers of four, as `mixers.bux`'s
+mixers do (`conv`). On the candidate it takes the KDA layers' place (`conv_c`), with
+LFM2-1.2B's share of 3 global layers in 8 too (`conv_lfm`), and with RoPE at LFM2's
+base on the global layers (`conv_rope`), whose attention otherwise has no positions.
+Each pairs with its parent by seed.
+
+- **It serves more at the same width.** In FP8 on one GPU, `conv_c` serves 1.75 to
+  1.83 times the candidate's sessions at 16-24k, and 1.2 to 2.2 times from 64k to
+  256k. At the same width it has a fifth fewer active parameters, and its state is
+  0.9 MB a sequence, against KDA's 82 MB. `conv_lfm` caches 1.5 times the
+  candidate's keys and values: it serves 1.46 to 1.63 times the candidate's sessions
+  at 16-24k, and 0.89 to 1.39 times from 64k.
+- **At equal cost that buys little more model.** At 16-24k `conv_c`'s target holds
+  10.4B parameters per token, against the candidate's 9.13B. From 64k to 256k it
+  holds 10.7B to 12.5B, about the candidate's. Its targets sit at one GPU's memory:
+  at `d4096` its weights leave no room for the KV cache.
+- **It costs far more quality.** `conv_c` is 11.5% worse than the candidate at
+  `d512` over three seeds and 8.3% worse at `d768` over two, and 21.8% and 14.4%
+  worse on repositories past 8k. With 3 global layers in 8 it is 8.5% and 6.5% worse.
+  RoPE on the global layers recovers a third of the loss: `conv_rope` is 7.4% worse
+  at `d512`, and 5.8% worse at `d768`.
+- **On the reference the conv loses to attention itself**: 2.1% at `d512` over three
+  seeds, 2.3% at `d768` over two. It is 6.1% worse than KDA and 3.7% worse than
+  Mamba-2 at `d512`. It serves 1.51 to 1.60 times KDA's sessions at the same width
+  at 16-24k, and 1.34 to 1.50 times from 64k; at equal cost at 16-24k its target holds
+  17.0B parameters per token, against KDA's 13.3B.
+
+A short conv sees two tokens back, and KDA's state carries the whole document: on
+the hybrid the global layers alone cannot make up for it. At equal FP8 serving cost
+on 1T tokens, the fit puts `conv_c` 1.4% behind the candidate at every context from
+16-24k to 256k, `conv_lfm` 1.1% to 1.3% behind and `conv_rope` 0.9% behind. On the
+reference, the conv's target ends 2.1% behind KDA's and 1.0% behind Mamba-2's. A
+short conv does not replace KDA in the hybrid.
 
 ## 9. Results and caveats
 
