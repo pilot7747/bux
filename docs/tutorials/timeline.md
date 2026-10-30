@@ -259,6 +259,7 @@ curriculum = base: yarn_phase | rope: yarn_phase | rope_500k: yarn_phase | ...
 | `stack5_dl.bux` | `stack5_d0.bux` | stack5's one dense layer moved from the first layer to the last |
 | `mhc_init.bux`, `factorial_mhc.bux` | the 2021 reference; the 2026 hybrid | mHC's start, three ways to set its streams apart; mHC in place of `hc` in the candidate |
 | `western.bux`, `gdn2_hybrid.bux` | the 2026 frontier; the 2026 hybrid | the frontier's global layers with partial RoPE or MLA; GDN-2 in place of KDA, alone and with the candidate's add-ons |
+| `lfm2.bux` | the 2021 reference; the candidate (step 8) | LFM2's gated short conv in three layers of four, as `mixers.bux`'s arms; in place of the candidate's KDA, at its 3:1 and at LFM2-1.2B's 3 global layers in 8 |
 
 Some changes are not arms. Zero-centered gains train as plain ones, since bux's
 weight decay leaves every gain alone. ALiBi has no layer in bux.
