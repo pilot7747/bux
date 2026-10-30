@@ -408,6 +408,17 @@ CASES = {
     + "mix = short_conv(conv_size=3, bias=true)\n"
     + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " [rmsnorm mix] [rmsnorm ffn] rmsnorm head",
+    # The short conv in the timeline hybrid's KDA layers (lfm2.bux's conv_c): under
+    # hc, beside global layers with QK-norm, a gate, the conv on keys and values and
+    # the value residual, so that two convs of other widths keep states side by side.
+    "short-conv-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\n"
+    + "mix = short_conv(conv_size=3)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm mix] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
     "dyt": HEAD
     + ATTN
     + FFN

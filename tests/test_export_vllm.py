@@ -456,6 +456,8 @@ def test_a_conv_layer_keeps_a_conv_state() -> None:
     assert c.layer_types == ["full_attention", "conv", "conv", "full_attention", "conv"]
     c = bux_config(vllm_parity.CASES["short-conv"])
     assert c.layer_types == ["conv", "full_attention", "conv"]
+    c = bux_config(vllm_parity.CASES["short-conv-hybrid"])
+    assert c.layer_types == ["conv", "full_attention", "conv"] * 2
 
 
 def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:

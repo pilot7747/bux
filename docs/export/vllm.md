@@ -907,7 +907,8 @@ their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 were measured the same way on 2026-10-29, and so were the sparse `gqa` and `mla`
 rows (all but `csa`'s), with each `gqa` indexer's projections in one GEMM, and the
 shared picks on vLLM's sparse GQA attention (`dsa-share-native` and its `-plain`
-case). A case beside KDA has no float32 column: vLLM's KDA kernels are not exact in
+case). The `short-conv-hybrid` row and `short-conv`'s TP=2 column were measured
+the same way on 2026-10-30. A case beside KDA has no float32 column: vLLM's KDA kernels are not exact in
 float32.
 
 The table gives the largest difference of a log-probability, over every position of
@@ -941,7 +942,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `diff` | differential attention (DIFF V2): pairs of query heads in a kv head's group, sinks for each query head, a window; a gate, QK-norm of all heads, fused projections | 1.1e-5 | 0.11 (0.15) | 0.13 |
 | `diff-hybrid` | `xsa-hybrid`'s global layers differential, without XSA | - | 0.33 (0.30) | 0.32 |
 | `conv` | Inkling's shortcut, a conv on branch outputs, `y + conv(y)` | 5.7e-6 | 0.055 (0.085) | - |
-| `short-conv` | LFM2's double-gated short conv beside attention | 6.7e-6 | 0.11 (0.13) | - |
+| `short-conv` | LFM2's double-gated short conv beside attention | 6.7e-6 | 0.11 (0.13) | 0.098 |
+| `short-conv-hybrid` | the short conv in the timeline hybrid's KDA layers, under `hc`, beside global layers with QK-norm, a gate, the conv on keys and values and the `v` port | 9.1e-6 | 0.13 (0.14) | 0.12 |
 | `kv-share` | Hymba's cross-layer KV sharing: a windowed layer's keys and values read by the next one or two, a full layer's by one with a window of its own | 1.1e-5 | 0.13 (0.19) | 0.20 |
 | `relbias` | Inkling's attention: a relative bias, a conv on keys and values, a length scale, window-only layers biased over their window | 6.2e-6 | 0.080 (0.10) | 0.075 |
 | `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 7.6e-6 | 2.4 (2.0) | 2.4 |

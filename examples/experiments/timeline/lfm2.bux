@@ -1,0 +1,55 @@
+# LFM2's double-gated short convolution (Liquid AI, 2025) as the linear-time mixer, in
+# place of the others. The input projects to B, C and u, each as wide as the stream,
+# and the output is C * conv(B * u) over 3 taps, projected back: it mixes only a token
+# and the two before it, and its state is the last two inputs. LFM2 puts it in most of
+# its layers and grouped-query attention in the rest: 3 in 4 in its MoE models
+# (8B-A1B, 24B-A2B), 5 in 8 in its small dense ones (350M to 1.2B).
+#   conv      pairs with mixers.bux's arms and the 2021 reference (gpt3_rope.bux) by
+#             seed: the conv in three layers of four, the fourth the reference's.
+#   conv_c    pairs with the candidate (factorial.bux's r1v1k1f0p0s0) by seed: its KDA
+#             layers the conv, everything else the candidate's.
+#   conv_lfm  is conv_c with LFM2-1.2B's share of global layers, 3 in 8 rounded down:
+#             every third layer, then every second, as LFM2 lays them out.
+# Arms: era, source, what it was claimed for.
+use gpt3_rope
+use m2026_hybrid
+use timeline_code
+use rungs
+
+short = short_conv(conv_size=3)
+
+# mixers.bux's hybrid: m in three layers of four, the fourth the reference's.
+layer(m)  = [norm m] [norm ffn]
+hybrid(m) = embed (layer(m)^3 layer(attn(rope=rope())))^(layers // 4) norm head(tied=true)
+
+# factorial.bux's vres(g_k, fr_experts) with m in place of KDA.
+g_k     = fr_global(kv_conv_size=4)
+cand(m) = embed
+          fr_layer(m, fr_dense) fr_layer(m)^2 fr_layer(g_k(v=@v1))
+          (fr_layer(m)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+          fr_norm @h fr_out hy_mtp
+
+# cand(m) with n_global global layers: groups of m m g, then of m g. Its layers are
+# 5:3 at 8 layers, 8:4 at 12 and LFM2-1.2B's 10:6 at 16.
+n_global   = 3 * layers // 8
+lfm_net(m) = embed
+             fr_layer(m, fr_dense) fr_layer(m) fr_layer(g_k(v=@v1))
+             (fr_layer(m)^2 fr_layer(g_k(v=$v1)))^(layers - 2 * n_global - 1)
+             (fr_layer(m) fr_layer(g_k(v=$v1)))^(3 * n_global - layers)
+             fr_norm @h fr_out hy_mtp
+
+model = # 2025 LFM2 (gated short conv): a short conv beside attention; on-device
+        # throughput, a state of two tokens
+        conv:     hybrid(short)
+      # 2025 LFM2-8B-A1B, 2026 LFM2-24B-A2B: the conv in the candidate's KDA layers;
+      # throughput, a state of two tokens
+      | conv_c:   cand(short)
+      # 2025 LFM2-350M to LFM2-1.2B: conv_c with 3 global layers in 8; quality at
+      # the conv's cost
+      | conv_lfm: lfm_net(short)
+
+residual = conv: none | conv_c: hc(expansion=4) | conv_lfm: hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), as the candidate's; conv's runs
+# take theirs from their own scan, as mixers.bux's.
+optimizer.lr = 2e-3
