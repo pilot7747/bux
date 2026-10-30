@@ -378,6 +378,11 @@ projected back. `conv_size` defaults to 3.
 mixer = short_conv(conv_size=3)
 ```
 
+Its state is a sequence's last `conv_size - 1` inputs, so it serves fast, but it
+sees no further back. In the late-2026 hybrid, in place of KDA, it serves 1.75 times
+the sessions at the same width and loses 8% of quality at `d768`
+([A short conv in place of KDA](../tutorials/timeline.md#a-short-conv-in-place-of-kda)).
+
 ## Hybrids
 
 A hybrid is a pattern of one-letter blocks ([Definitions](../language/definitions.md)).
